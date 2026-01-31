@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
-import 'package:speech_to_text/speech_recognition_error.dart';
-import 'package:speech_to_text/speech_recognition_result.dart';
-import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:http/http.dart' as http;
+import 'package:record/record.dart';
 
 enum CommandSttStatus { idle, listening, error }
 
@@ -34,11 +36,11 @@ class CommandSttService {
     ),
   );
 
-  final stt.SpeechToText _stt = stt.SpeechToText();
+  final AudioRecorder _recorder = AudioRecorder();
   Timer? _timeoutTimer;
   Completer<String?>? _completer;
   bool _finishing = false;
-  String? _localeId;
+  String? _currentPath;
 
   bool get isListening => state.value.isListening;
 
@@ -54,36 +56,28 @@ class CommandSttService {
       clearError: true,
     );
 
-    final available = await _stt.initialize(
-      onError: _handleError,
-      onStatus: _handleStatus,
-      debugLogging: kDebugMode,
-      options: [
-        stt.SpeechToText.androidIntentLookup,
-        stt.SpeechToText.androidAlwaysUseStop,
-        stt.SpeechToText.androidNoBluetooth,
-      ],
-    );
-
-    if (!available) {
-      _setError('STT недоступен на этом устройстве');
-      _complete(null);
-      return completer.future;
-    }
-
-    await _ensureLocale();
-
     try {
-      await _stt.listen(
-        localeId: _localeId ?? 'ru_RU',
-        listenMode: stt.ListenMode.confirmation,
-        partialResults: true,
-        listenFor: Duration(seconds: durationSeconds),
-        pauseFor: const Duration(seconds: 2),
-        onResult: _handleResult,
+      final canRecord = await _recorder.hasPermission();
+      if (!canRecord) {
+        _setError('Нет доступа к микрофону для записи');
+        _complete(null);
+        return completer.future;
+      }
+
+      final path =
+          '${Directory.systemTemp.path}/janarym_stt_${DateTime.now().millisecondsSinceEpoch}.m4a';
+      _currentPath = path;
+
+      await _recorder.start(
+        const RecordConfig(
+          encoder: AudioEncoder.aacLc,
+          bitRate: 128000,
+          sampleRate: 16000,
+        ),
+        path: path,
       );
 
-      _timeoutTimer = Timer(Duration(seconds: durationSeconds + 1), () async {
+      _timeoutTimer = Timer(Duration(seconds: durationSeconds), () async {
         await stop();
       });
     } catch (e) {
@@ -102,45 +96,6 @@ class CommandSttService {
     await _finish();
   }
 
-  void _handleResult(SpeechRecognitionResult result) {
-    if (result.recognizedWords.isEmpty) return;
-    if (result.finalResult) {
-      _setState(finalWords: result.recognizedWords, liveWords: '');
-      stop();
-    } else {
-      _setState(liveWords: result.recognizedWords);
-    }
-  }
-
-  void _handleError(SpeechRecognitionError error) {
-    _setError('STT error: ${error.errorMsg}');
-  }
-
-  void _handleStatus(String status) {
-    if (status == 'done' || status == 'notListening') {
-      stop();
-    }
-  }
-
-  Future<void> _ensureLocale() async {
-    if (_localeId != null) return;
-    try {
-      final locales = await _stt.locales();
-      final ruLocale = locales.firstWhere(
-        (l) => l.localeId.toLowerCase().startsWith('ru'),
-        orElse: () => locales.isNotEmpty ? locales.first : stt.LocaleName('ru_RU', 'Russian'),
-      );
-      _localeId = ruLocale.localeId;
-    } catch (_) {
-      try {
-        final sys = await _stt.systemLocale();
-        _localeId = sys?.localeId ?? 'ru_RU';
-      } catch (_) {
-        _localeId = 'ru_RU';
-      }
-    }
-  }
-
   Future<void> _finish() async {
     if (_finishing) return;
     _finishing = true;
@@ -149,11 +104,26 @@ class CommandSttService {
     _timeoutTimer = null;
 
     try {
-      await _stt.stop();
+      if (await _recorder.isRecording()) {
+        await _recorder.stop();
+      }
     } catch (_) {}
 
-    if (state.value.finalWords.isEmpty && state.value.liveWords.isNotEmpty) {
-      _setState(finalWords: state.value.liveWords, liveWords: '');
+    final path = _currentPath;
+    _currentPath = null;
+    if (path != null) {
+      final file = File(path);
+      if (await file.exists()) {
+        try {
+          final text = await _transcribeFile(file);
+          _setState(finalWords: text ?? '', liveWords: '');
+        } catch (e) {
+          _setError('STT error: $e');
+        }
+        try {
+          await file.delete();
+        } catch (_) {}
+      }
     }
 
     _setState(status: CommandSttStatus.idle, liveWords: '');
@@ -189,5 +159,34 @@ class CommandSttService {
     if (!completer.isCompleted) {
       completer.complete(text);
     }
+  }
+
+  Future<String?> _transcribeFile(File file) async {
+    final apiKey = (dotenv.env['OPENAI_API_KEY'] ?? '').trim();
+    if (apiKey.isEmpty) {
+      throw Exception('OPENAI_API_KEY не задан (проверь .env)');
+    }
+
+    final model =
+        (dotenv.env['OPENAI_STT_MODEL'] ?? 'gpt-4o-mini-transcribe').trim();
+    final uri = Uri.parse('https://api.openai.com/v1/audio/transcriptions');
+    final request = http.MultipartRequest('POST', uri)
+      ..headers['Authorization'] = 'Bearer $apiKey'
+      ..fields['model'] = model
+      ..fields['language'] = 'ru'
+      ..fields['response_format'] = 'json'
+      ..files.add(await http.MultipartFile.fromPath('file', file.path));
+
+    final streamed = await request.send();
+    final response = await http.Response.fromStream(streamed);
+    final rawBody = utf8.decode(response.bodyBytes);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('OpenAI STT HTTP ${response.statusCode}: $rawBody');
+    }
+
+    final data = jsonDecode(rawBody) as Map<String, dynamic>;
+    final text = (data['text'] as String?)?.trim();
+    if (text == null || text.isEmpty) return null;
+    return text;
   }
 }

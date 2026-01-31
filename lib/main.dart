@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 
+import 'package:audioplayers/audioplayers.dart';
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -45,6 +46,7 @@ class JanarymHome extends StatefulWidget {
 class _JanarymHomeState extends State<JanarymHome>
     with WidgetsBindingObserver {
   final FlutterTts _tts = FlutterTts();
+  final AudioPlayer _sfxPlayer = AudioPlayer();
   final CommandRouter _router = CommandRouter();
   final OpenAiClient _openAi = OpenAiClient();
   late final CommandSttService _sttService;
@@ -69,6 +71,9 @@ class _JanarymHomeState extends State<JanarymHome>
   bool _commandInFlight = false;
   String _lastLoggedFinal = '';
   static const int _maxFrameAgeMs = 8000;
+  bool _followUpActive = false;
+  bool _wakeHandling = false;
+  bool _thinkingSoundPlayed = false;
 
   @override
   void initState() {
@@ -92,6 +97,7 @@ class _JanarymHomeState extends State<JanarymHome>
     _wakeService.dispose();
     _openAi.dispose();
     _disposeCamera();
+    _sfxPlayer.dispose();
     _tts.stop();
     super.dispose();
   }
@@ -100,6 +106,28 @@ class _JanarymHomeState extends State<JanarymHome>
     await _tts.setLanguage('ru-RU');
     await _tts.setSpeechRate(0.45);
     await _tts.setPitch(1.0);
+    await _tts.awaitSpeakCompletion(true);
+  }
+
+  Future<void> _playStartCue() async {
+    try {
+      await _sfxPlayer.stop();
+      await _sfxPlayer.play(AssetSource('sounds/start.wav'), volume: 0.7);
+    } catch (_) {}
+  }
+
+  Future<void> _playEndCue() async {
+    try {
+      await _sfxPlayer.stop();
+      await _sfxPlayer.play(AssetSource('sounds/end.wav'), volume: 0.7);
+    } catch (_) {}
+  }
+
+  Future<void> _playThinkingCue() async {
+    try {
+      await _sfxPlayer.stop();
+      await _sfxPlayer.play(AssetSource('sounds/thinking.wav'), volume: 0.6);
+    } catch (_) {}
   }
 
   Future<void> _initMicAndWake() async {
@@ -283,10 +311,19 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   Future<void> _handleWakeDetected() async {
-    if (_commandInFlight) return;
+    if (_wakeHandling) return;
+    _wakeHandling = true;
     debugPrint('[Wake] detected');
     setState(() => _lastWakeAt = DateTime.now());
+    await _tts.stop();
+    await _playStartCue();
+    if (_followUpActive) {
+      await _sttService.stop();
+      _followUpActive = false;
+    }
+    _commandInFlight = false;
     await _runCommandFlow(reason: 'wake');
+    _wakeHandling = false;
   }
 
   Future<void> _runCommandFlow({required String reason}) async {
@@ -305,6 +342,8 @@ class _JanarymHomeState extends State<JanarymHome>
       final cleaned = (text ?? '').trim();
       if (cleaned.isNotEmpty) {
         await _handleUserText(cleaned);
+      } else {
+        await _playEndCue();
       }
     } finally {
       await _wakeService.start();
@@ -319,14 +358,10 @@ class _JanarymHomeState extends State<JanarymHome>
       await _repeatLastAnswer();
       return;
     }
-    if (decision.isDescribe) {
-      final describeText = decision.directionRu == null
-          ? userText
-          : 'Опиши что ${decision.directionRu}';
-      await _describeWithVision(describeText);
-      return;
-    }
-    await _askGpt(userText);
+    final describeText = decision.directionRu == null
+        ? userText
+        : 'Опиши что ${decision.directionRu}';
+    await _describeWithVision(describeText);
   }
 
   Future<void> _askGpt(String text, {String? systemPrompt}) async {
@@ -335,6 +370,10 @@ class _JanarymHomeState extends State<JanarymHome>
       _gptError = '';
     });
     debugPrint('[GPT] start');
+    if (!_thinkingSoundPlayed) {
+      _thinkingSoundPlayed = true;
+      await _playThinkingCue();
+    }
 
     try {
       final answer = await _openAi.askTextOnly(
@@ -348,6 +387,7 @@ class _JanarymHomeState extends State<JanarymHome>
       });
       debugPrint('[GPT] ok');
       await _speak(answer);
+      await _startFollowUpWindow();
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -356,6 +396,7 @@ class _JanarymHomeState extends State<JanarymHome>
       });
       debugPrint('[GPT] error: $e');
     }
+    _thinkingSoundPlayed = false;
   }
 
   Future<void> _askGptWithImage(
@@ -368,6 +409,10 @@ class _JanarymHomeState extends State<JanarymHome>
       _gptError = '';
     });
     debugPrint('[GPT] vision start');
+    if (!_thinkingSoundPlayed) {
+      _thinkingSoundPlayed = true;
+      await _playThinkingCue();
+    }
 
     try {
       final answer = await _openAi.askWithImage(
@@ -382,6 +427,7 @@ class _JanarymHomeState extends State<JanarymHome>
       });
       debugPrint('[GPT] vision ok');
       await _speak(answer);
+      await _startFollowUpWindow();
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -390,6 +436,7 @@ class _JanarymHomeState extends State<JanarymHome>
       });
       debugPrint('[GPT] vision error: $e');
     }
+    _thinkingSoundPlayed = false;
   }
 
   Future<void> _describeWithVision(String text) async {
@@ -433,6 +480,44 @@ class _JanarymHomeState extends State<JanarymHome>
     await _speak(_lastAnswer);
   }
 
+  bool _isNegativeResponse(String text) {
+    final t = text.toLowerCase().trim();
+    if (t.isEmpty) return false;
+    return t == 'нет' ||
+        t.startsWith('нет ') ||
+        t.contains('не нужно') ||
+        t.contains('не надо') ||
+        t.contains('спасибо') ||
+        t.contains('не хочу');
+  }
+
+  Future<void> _startFollowUpWindow() async {
+    if (_followUpActive) return;
+    if (!_micGranted) return;
+    _followUpActive = true;
+
+    try {
+      await _wakeService.stop();
+      await _playStartCue();
+      await _speak('Нужно еще что-то?');
+      debugPrint('[STT] follow-up start');
+      final text = await _sttService.startCommandListening(durationSeconds: 5);
+      final cleaned = (text ?? '').trim();
+      if (cleaned.isNotEmpty) {
+        if (_isNegativeResponse(cleaned)) {
+          await _playEndCue();
+        } else {
+          await _handleUserText(cleaned);
+        }
+      } else {
+        await _playEndCue();
+      }
+    } finally {
+      _followUpActive = false;
+      await _wakeService.start();
+    }
+  }
+
   Future<void> _speak(String text) async {
     final t = text.trim();
     if (t.isEmpty) return;
@@ -445,6 +530,8 @@ class _JanarymHomeState extends State<JanarymHome>
     debugPrint('[Stop] pressed');
     await _sttService.stop();
     await _tts.stop();
+    _followUpActive = false;
+    await _playEndCue();
     if (_micGranted) {
       await _wakeService.start();
     }
