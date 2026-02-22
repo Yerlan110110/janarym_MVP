@@ -1,0 +1,203 @@
+{
+  "@@locale": "ru",
+  "appName": "Janarym",
+  "languagePickerLabel": "Язык",
+  "languageRu": "Русский",
+  "languageKk": "Қазақша",
+  "languageShortRu": "RU",
+  "languageShortKk": "KZ",
+  "checkingMic": "Проверяю микрофон...",
+  "checkingCamera": "Проверяю камеру...",
+  "micAvailable": "Микрофон доступен.",
+  "micAccessDenied": "Доступ к микрофону запрещён. Разрешите в настройках приложения.",
+  "micAccessRequired": "Нужен доступ к микрофону для голосовых команд.",
+  "cameraAvailable": "Камера доступна.",
+  "cameraAccessDenied": "Доступ к камере запрещён. Разрешите в настройках приложения.",
+  "cameraAccessRequired": "Нужен доступ к камере для описания окружения.",
+  "cameraNotFound": "Камера не найдена.",
+  "cameraLiveOn": "Камера: включена",
+  "cameraLiveOff": "Камера: выключена",
+  "cameraStartFailed": "Не удалось запустить камеру: {error}",
+  "@cameraStartFailed": {
+    "placeholders": {
+      "error": {}
+    }
+  },
+  "errorOpenAiKeyMissing": "OPENAI_API_KEY не задан (проверь .env)",
+  "errorEmptyImageFrame": "Пустой кадр изображения.",
+  "errorExtractTextFailed": "Не удалось извлечь текст ответа.",
+  "sttNoMicPermission": "Нет доступа к микрофону для записи",
+  "sttStartFailed": "Не удалось запустить распознавание речи: {error}",
+  "@sttStartFailed": {
+    "placeholders": {
+      "error": {}
+    }
+  },
+  "sttGenericError": "Ошибка распознавания речи: {error}",
+  "@sttGenericError": {
+    "placeholders": {
+      "error": {}
+    }
+  },
+  "modeNavigation": "Режим маршрута",
+  "modeGeneral": "Обычный режим",
+  "statusWaitingReply": "Жду вашего ответа",
+  "embeddedMapDisabled": "Встроенная карта временно отключена для стабильности. Навигация и голосовые инструкции работают.",
+  "panelStatusPrefix": "Статус",
+  "panelTargetPrefix": "Цель",
+  "panelErrorPrefix": "Ошибка",
+  "navStatusIdle": "ожидание",
+  "navStatusResolvingDestination": "поиск адреса",
+  "navStatusAwaitingChoice": "ожидание выбора",
+  "navStatusBuildingRoute": "построение маршрута",
+  "navStatusNavigating": "в пути",
+  "navStatusRerouting": "перестроение",
+  "navStatusCompleted": "завершен",
+  "navStatusError": "ошибка",
+  "markerFinish": "Финиш",
+  "markerYou": "Вы",
+  "circleLabelWake": "Скажите «Жанарым»",
+  "circleLabelListening": "Слушаю",
+  "circleLabelThinking": "Думаю",
+  "circleLabelSpeaking": "Говорю",
+  "circleLabelReady": "Готов к работе",
+  "circleStatusWake": "ОЖИДАНИЕ",
+  "circleStatusListening": "СЛУШАЮ",
+  "circleStatusThinking": "ДУМАЮ",
+  "circleStatusSpeaking": "ГОВОРЮ",
+  "circleStatusReady": "ГОТОВО",
+  "commandProcessingFailed": "Не удалось обработать команду. Попробуйте снова.",
+  "enableRouteModeFirst": "Сначала включите режим маршрута.",
+  "routeModeDescribeBlocked": "Сейчас включен режим маршрута. Выйдите из режима маршрута для команд описания.",
+  "didntHearCommandRepeat": "Не расслышала команду. Повторите, пожалуйста.",
+  "sayAddressAfterRoutePhrase": "Скажите адрес после слов: маршрут до...",
+  "unknownRouteCommandHelp": "Не поняла команду. Скажите адрес назначения или: что дальше, статус маршрута, стоп маршрут.",
+  "followUpNeedAnythingElse": "Нужно ли еще что-нибудь?",
+  "routeModeAlreadyEnabled": "Режим маршрута уже включен.",
+  "routeModeNotEnabled": "Режим маршрута не включен.",
+  "noCameraAccess": "Нет доступа к камере.",
+  "fastFrameUnavailable": "Не удалось быстро получить кадр. Повторите команду.",
+  "frameUnavailable": "Не удалось получить кадр с камеры. Повторите команду.",
+  "staleFrameUnavailable": "Камера не дала свежий кадр. Повторите команду.",
+  "noAnswerToRepeat": "Пока нет ответа, который можно повторить.",
+  "describeDirectionFrontPrompt": "Опиши что впереди",
+  "describeDirectionLeftPrompt": "Опиши что слева",
+  "describeDirectionRightPrompt": "Опиши что справа",
+  "describeDirectionBackPrompt": "Опиши что сзади",
+  "describeDirectionAroundPrompt": "Опиши что вокруг",
+  "navModeAlreadyEnabled": "Режим маршрута уже включен.",
+  "navNoLocationPermission": "Нет доступа к геопозиции. Разрешите локацию.",
+  "navModeEnabled": "Режим маршрута включен.",
+  "navModeDisabled": "Режим маршрута выключен.",
+  "navEnableFirst": "Сначала включите режим маршрута.",
+  "navSayDestinationAfterRouteWords": "Скажите адрес назначения после слов маршрут до.",
+  "navConfirmAddressQuestion": "Правильно ли адрес: {address}?",
+  "@navConfirmAddressQuestion": {
+    "placeholders": {
+      "address": {}
+    }
+  },
+  "navSayCorrectAddressNow": "Продиктуйте правильный адрес.",
+  "navAnswerYesOrNoOrAddress": "Скажите: да, правильно. Или нет и продиктуйте правильный адрес.",
+  "navLocationUnavailable": "Не удалось получить вашу геопозицию.",
+  "navAddressNotFoundAstana": "Не нашла адрес в Астане. Назовите другой адрес.",
+  "navFoundMultipleVariantsIntro": "Нашла несколько вариантов.",
+  "navSayOptionFirstSecondThird": "Скажите: первый, второй или третий.",
+  "navNoVariantsToChoose": "Сейчас нет вариантов адреса для выбора.",
+  "navInvalidVariantNumber": "Такого номера нет. Скажите первый, второй или третий.",
+  "navNoVariantsToCancel": "Сейчас нет списка вариантов для отмены.",
+  "navDictateAnotherAddress": "Хорошо. Продиктуйте другой адрес в Астане.",
+  "navRouteStopped": "Маршрут остановлен.",
+  "navNoActiveRoute": "Сейчас нет активного маршрута.",
+  "navRouteNotStarted": "Маршрут не запущен.",
+  "navRouteAlmostCompleted": "Маршрут почти завершен.",
+  "navRouteBuilt": "Маршрут построен.",
+  "navRouteBuildFailedOpenExternal": "Не удалось построить встроенный маршрут. Открываю внешний навигатор.",
+  "navRouteBuildFailed": "Не удалось построить маршрут. Проверьте интернет или повторите запрос.",
+  "navArrivedDestination": "Вы прибыли в точку назначения.",
+  "navRouteRerouted": "Маршрут перестроен.",
+  "navKeepCurrentRoute": "Двигайтесь по текущему маршруту.",
+  "navSummaryDistanceInstruction": "До цели {distance}. {instruction}",
+  "@navSummaryDistanceInstruction": {
+    "placeholders": {
+      "distance": {},
+      "instruction": {}
+    }
+  },
+  "navRouteBuiltWithEta": "Маршрут построен. Дистанция {distance}{etaPart}",
+  "@navRouteBuiltWithEta": {
+    "placeholders": {
+      "distance": {},
+      "etaPart": {}
+    }
+  },
+  "navEtaPart": ", примерно {minutes} минут.",
+  "@navEtaPart": {
+    "placeholders": {
+      "minutes": {
+        "type": "int"
+      }
+    }
+  },
+  "navVariantItem": "{number}: {label}.",
+  "@navVariantItem": {
+    "placeholders": {
+      "number": {
+        "type": "int"
+      },
+      "label": {}
+    }
+  },
+  "distanceFullMeters": "{value} метров",
+  "@distanceFullMeters": {
+    "placeholders": {
+      "value": {}
+    }
+  },
+  "distanceFullKilometers": "{value} километра",
+  "@distanceFullKilometers": {
+    "placeholders": {
+      "value": {}
+    }
+  },
+  "distanceShortMeters": "{value} м",
+  "@distanceShortMeters": {
+    "placeholders": {
+      "value": {}
+    }
+  },
+  "distanceShortKilometers": "{value} км",
+  "@distanceShortKilometers": {
+    "placeholders": {
+      "value": {}
+    }
+  },
+  "instructionArrive": "Вы на месте.",
+  "instructionArrivedToDestination": "Вы прибыли в точку назначения.",
+  "instructionDistanceToDestination": "До точки назначения осталось {distance}.",
+  "@instructionDistanceToDestination": {
+    "placeholders": {
+      "distance": {}
+    }
+  },
+  "instructionInDistance": "Через {distance} {instruction}",
+  "@instructionInDistance": {
+    "placeholders": {
+      "distance": {},
+      "instruction": {}
+    }
+  },
+  "instructionTurnLeft": "Поверните налево.",
+  "instructionTurnRight": "Поверните направо.",
+  "instructionUTurn": "Развернитесь, когда это будет безопасно.",
+  "instructionGoStraight": "Двигайтесь прямо.",
+  "routeTitleFallback": "Адрес",
+  "routeAstanaOnly": "Сейчас поддерживаются только маршруты по Астане.",
+  "routeNotFound": "Маршрут не найден",
+  "routeInsufficientData": "Недостаточно данных маршрута",
+  "routeCityAstana": "Астана",
+  "blindSystemPromptRu": "Ты ассистент для незрячего пользователя. Отвечай коротко и по делу. Не задавай уточняющих вопросов. Если не хватает данных — честно скажи что без камеры не видишь и предложи включить камеру позже.",
+  "blindSystemPromptKk": "Сен көру қабілеті шектеулі адамға арналған ассистентсің. Қысқа әрі нақты жауап бер. Қосымша сұрақ қойма. Дерек жетпесе, камерасыз көрмейтініңді ашық айт және камераны кейін қосуды ұсын.",
+  "visionSystemPromptRu": "Ты ассистент для незрячего пользователя. Опиши изображение по делу, дружелюбно и понятно. Ответ не длиннее 2 коротких предложений. Если пользователь просит, можно коротко или подробнее. Не задавай уточняющих вопросов. Если что-то не видно, честно скажи об этом.",
+  "visionSystemPromptKk": "Сен көру қабілеті шектеулі адамға арналған ассистентсің. Көріністі нақты, түсінікті және жылы түрде сипатта. Жауап 2 қысқа сөйлемнен аспасын. Пайдаланушы сұраса, қысқа не толығырақ айтуға болады. Қосымша сұрақ қойма. Бірдеңе көрінбесе, оны ашық айт."
+}

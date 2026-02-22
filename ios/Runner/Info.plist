@@ -49,5 +49,7 @@
 	<string>Нужен доступ к микрофону для голосовых команд.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Нужен доступ к камере для описания окружения.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Нужен доступ к геопозиции для построения и ведения маршрута.</string>
 </dict>
 </plist>

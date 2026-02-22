@@ -1,0 +1,203 @@
+{
+  "@@locale": "kk",
+  "appName": "Janarym",
+  "languagePickerLabel": "Тіл",
+  "languageRu": "Русский",
+  "languageKk": "Қазақша",
+  "languageShortRu": "RU",
+  "languageShortKk": "KZ",
+  "checkingMic": "Микрофон тексерілуде...",
+  "checkingCamera": "Камера тексерілуде...",
+  "micAvailable": "Микрофон қолжетімді.",
+  "micAccessDenied": "Микрофонға рұқсат берілмеген. Қолданба баптауларынан рұқсат беріңіз.",
+  "micAccessRequired": "Дауыстық командалар үшін микрофонға рұқсат қажет.",
+  "cameraAvailable": "Камера қолжетімді.",
+  "cameraAccessDenied": "Камераға рұқсат берілмеген. Қолданба баптауларынан рұқсат беріңіз.",
+  "cameraAccessRequired": "Айналаны сипаттау үшін камераға рұқсат қажет.",
+  "cameraNotFound": "Камера табылмады.",
+  "cameraLiveOn": "Камера: қосулы",
+  "cameraLiveOff": "Камера: өшірулі",
+  "cameraStartFailed": "Камераны іске қосу мүмкін болмады: {error}",
+  "@cameraStartFailed": {
+    "placeholders": {
+      "error": {}
+    }
+  },
+  "errorOpenAiKeyMissing": "OPENAI_API_KEY берілмеген (.env файлын тексеріңіз)",
+  "errorEmptyImageFrame": "Кадр бос.",
+  "errorExtractTextFailed": "Жауап мәтінін алу мүмкін болмады.",
+  "sttNoMicPermission": "Жазу үшін микрофонға рұқсат жоқ",
+  "sttStartFailed": "Сөйлеуді тануды іске қосу мүмкін болмады: {error}",
+  "@sttStartFailed": {
+    "placeholders": {
+      "error": {}
+    }
+  },
+  "sttGenericError": "Сөйлеуді тану қатесі: {error}",
+  "@sttGenericError": {
+    "placeholders": {
+      "error": {}
+    }
+  },
+  "modeNavigation": "Маршрут режимі",
+  "modeGeneral": "Қалыпты режим",
+  "statusWaitingReply": "Жауабыңызды күтемін",
+  "embeddedMapDisabled": "Тұрақтылық үшін кірістірілген карта уақытша өшірілген. Навигация мен дауыстық нұсқаулар жұмыс істейді.",
+  "panelStatusPrefix": "Күйі",
+  "panelTargetPrefix": "Мақсат",
+  "panelErrorPrefix": "Қате",
+  "navStatusIdle": "күту",
+  "navStatusResolvingDestination": "мекенжайды іздеу",
+  "navStatusAwaitingChoice": "таңдауды күту",
+  "navStatusBuildingRoute": "маршрут құру",
+  "navStatusNavigating": "жолда",
+  "navStatusRerouting": "қайта құру",
+  "navStatusCompleted": "аяқталды",
+  "navStatusError": "қате",
+  "markerFinish": "Мәреге",
+  "markerYou": "Сіз",
+  "circleLabelWake": "«Жанарым» деп айтыңыз",
+  "circleLabelListening": "Тыңдап тұрмын",
+  "circleLabelThinking": "Ойланып тұрмын",
+  "circleLabelSpeaking": "Сөйлеп тұрмын",
+  "circleLabelReady": "Жұмысқа дайын",
+  "circleStatusWake": "КҮТУ",
+  "circleStatusListening": "ТЫҢДАУ",
+  "circleStatusThinking": "ОЙЛАУ",
+  "circleStatusSpeaking": "СӨЙЛЕУ",
+  "circleStatusReady": "ДАЙЫН",
+  "commandProcessingFailed": "Команданы өңдеу мүмкін болмады. Қайта көріңіз.",
+  "enableRouteModeFirst": "Алдымен маршрут режимін қосыңыз.",
+  "routeModeDescribeBlocked": "Қазір маршрут режимі қосулы. Сипаттау командалары үшін режимнен шығыңыз.",
+  "didntHearCommandRepeat": "Команданы естімедім. Қайталап айтыңыз.",
+  "sayAddressAfterRoutePhrase": "Мекенжайды «маршрут до...» сөздерінен кейін айтыңыз.",
+  "unknownRouteCommandHelp": "Команданы түсінбедім. Мекенжай айтыңыз немесе: әрі қарай не, маршрут күйі, маршрутты тоқтат.",
+  "followUpNeedAnythingElse": "Тағы бірдеңе керек пе?",
+  "routeModeAlreadyEnabled": "Маршрут режимі әлдеқашан қосулы.",
+  "routeModeNotEnabled": "Маршрут режимі қосылмаған.",
+  "noCameraAccess": "Камераға рұқсат жоқ.",
+  "fastFrameUnavailable": "Кадрды жылдам алу мүмкін болмады. Команданы қайталаңыз.",
+  "frameUnavailable": "Камерадан кадр алу мүмкін болмады. Команданы қайталаңыз.",
+  "staleFrameUnavailable": "Камера жаңа кадр бермеді. Команданы қайталаңыз.",
+  "noAnswerToRepeat": "Қайталайтын жауап әлі жоқ.",
+  "describeDirectionFrontPrompt": "Алдыңдағыны сипатта",
+  "describeDirectionLeftPrompt": "Сол жақтағыны сипатта",
+  "describeDirectionRightPrompt": "Оң жақтағыны сипатта",
+  "describeDirectionBackPrompt": "Арттағыны сипатта",
+  "describeDirectionAroundPrompt": "Айналаны сипатта",
+  "navModeAlreadyEnabled": "Маршрут режимі әлдеқашан қосулы.",
+  "navNoLocationPermission": "Геолокацияға рұқсат жоқ. Локацияға рұқсат беріңіз.",
+  "navModeEnabled": "Маршрут режимі қосылды.",
+  "navModeDisabled": "Маршрут режимі өшірілді.",
+  "navEnableFirst": "Алдымен маршрут режимін қосыңыз.",
+  "navSayDestinationAfterRouteWords": "«маршрут до» сөздерінен кейін мекенжай айтыңыз.",
+  "navConfirmAddressQuestion": "Мекенжай дұрыс па: {address}?",
+  "@navConfirmAddressQuestion": {
+    "placeholders": {
+      "address": {}
+    }
+  },
+  "navSayCorrectAddressNow": "Дұрыс мекенжайды айтыңыз.",
+  "navAnswerYesOrNoOrAddress": "Айтыңыз: иә, дұрыс. Немесе жоқ деп, дұрыс мекенжайды айтыңыз.",
+  "navLocationUnavailable": "Сіздің геопозицияңызды алу мүмкін болмады.",
+  "navAddressNotFoundAstana": "Астанадан мұндай мекенжай табылмады. Басқа мекенжай айтыңыз.",
+  "navFoundMultipleVariantsIntro": "Бірнеше нұсқа табылды.",
+  "navSayOptionFirstSecondThird": "Біріншісі, екіншісі немесе үшіншісі деп айтыңыз.",
+  "navNoVariantsToChoose": "Таңдайтын мекенжай нұсқалары қазір жоқ.",
+  "navInvalidVariantNumber": "Мұндай нөмір жоқ. Біріншісі, екіншісі немесе үшіншісі деп айтыңыз.",
+  "navNoVariantsToCancel": "Бас тартатын нұсқалар тізімі қазір жоқ.",
+  "navDictateAnotherAddress": "Жақсы. Астанадағы басқа мекенжайды айтыңыз.",
+  "navRouteStopped": "Маршрут тоқтатылды.",
+  "navNoActiveRoute": "Қазір белсенді маршрут жоқ.",
+  "navRouteNotStarted": "Маршрут іске қосылмаған.",
+  "navRouteAlmostCompleted": "Маршрут аяқталуға жақын.",
+  "navRouteBuilt": "Маршрут құрылды.",
+  "navRouteBuildFailedOpenExternal": "Кірістірілген маршрутты құру мүмкін болмады. Сыртқы навигаторды ашамын.",
+  "navRouteBuildFailed": "Маршрутты құру мүмкін болмады. Интернетті тексеріңіз немесе сұрауды қайталаңыз.",
+  "navArrivedDestination": "Сіз межеге жеттіңіз.",
+  "navRouteRerouted": "Маршрут қайта құрылды.",
+  "navKeepCurrentRoute": "Қазіргі маршрутпен жүре беріңіз.",
+  "navSummaryDistanceInstruction": "Мақсатқа дейін {distance}. {instruction}",
+  "@navSummaryDistanceInstruction": {
+    "placeholders": {
+      "distance": {},
+      "instruction": {}
+    }
+  },
+  "navRouteBuiltWithEta": "Маршрут құрылды. Қашықтық {distance}{etaPart}",
+  "@navRouteBuiltWithEta": {
+    "placeholders": {
+      "distance": {},
+      "etaPart": {}
+    }
+  },
+  "navEtaPart": ", шамамен {minutes} минут.",
+  "@navEtaPart": {
+    "placeholders": {
+      "minutes": {
+        "type": "int"
+      }
+    }
+  },
+  "navVariantItem": "{number}: {label}.",
+  "@navVariantItem": {
+    "placeholders": {
+      "number": {
+        "type": "int"
+      },
+      "label": {}
+    }
+  },
+  "distanceFullMeters": "{value} метр",
+  "@distanceFullMeters": {
+    "placeholders": {
+      "value": {}
+    }
+  },
+  "distanceFullKilometers": "{value} км",
+  "@distanceFullKilometers": {
+    "placeholders": {
+      "value": {}
+    }
+  },
+  "distanceShortMeters": "{value} м",
+  "@distanceShortMeters": {
+    "placeholders": {
+      "value": {}
+    }
+  },
+  "distanceShortKilometers": "{value} км",
+  "@distanceShortKilometers": {
+    "placeholders": {
+      "value": {}
+    }
+  },
+  "instructionArrive": "Межеге жеттіңіз.",
+  "instructionArrivedToDestination": "Сіз межеге жеттіңіз.",
+  "instructionDistanceToDestination": "Межеге дейін {distance} қалды.",
+  "@instructionDistanceToDestination": {
+    "placeholders": {
+      "distance": {}
+    }
+  },
+  "instructionInDistance": "{distance} кейін {instruction}",
+  "@instructionInDistance": {
+    "placeholders": {
+      "distance": {},
+      "instruction": {}
+    }
+  },
+  "instructionTurnLeft": "Солға бұрылыңыз.",
+  "instructionTurnRight": "Оңға бұрылыңыз.",
+  "instructionUTurn": "Қауіпсіз болғанда кері бұрылыңыз.",
+  "instructionGoStraight": "Тура жүріңіз.",
+  "routeTitleFallback": "Мекенжай",
+  "routeAstanaOnly": "Қазір тек Астана бойынша маршруттар қолдау табады.",
+  "routeNotFound": "Маршрут табылмады",
+  "routeInsufficientData": "Маршрут деректері жеткіліксіз",
+  "routeCityAstana": "Астана",
+  "blindSystemPromptRu": "Ты ассистент для незрячего пользователя. Отвечай коротко и по делу. Не задавай уточняющих вопросов. Если не хватает данных — честно скажи что без камеры не видишь и предложи включить камеру позже.",
+  "blindSystemPromptKk": "Сен көру қабілеті шектеулі адамға арналған ассистентсің. Қысқа әрі нақты жауап бер. Қосымша сұрақ қойма. Дерек жетпесе, камерасыз көрмейтініңді ашық айт және камераны кейін қосуды ұсын.",
+  "visionSystemPromptRu": "Ты ассистент для незрячего пользователя. Опиши изображение по делу, дружелюбно и понятно. Ответ не длиннее 2 коротких предложений. Если пользователь просит, можно коротко или подробнее. Не задавай уточняющих вопросов. Если что-то не видно, честно скажи об этом.",
+  "visionSystemPromptKk": "Сен көру қабілеті шектеулі адамға арналған ассистентсің. Көріністі нақты, түсінікті және жылы түрде сипатта. Жауап 2 қысқа сөйлемнен аспасын. Пайдаланушы сұраса, қысқа не толығырақ айтуға болады. Қосымша сұрақ қойма. Бірдеңе көрінбесе, оны ашық айт."
+}

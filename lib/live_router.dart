@@ -6,7 +6,21 @@ class LiveCommand {
 }
 
 class LiveRouter {
-  static const _wakeWords = ['жанарым', 'жаным', 'janarym', 'zhanarym'];
+  static const _wakeWords = [
+    'жанарым',
+    'жанарим',
+    'жанарум',
+    'жан арым',
+    'жан а рым',
+    'жаным',
+    'janarym',
+    'janarim',
+    'zhanarym',
+    'zhanarim',
+    'zhanarum',
+    'zhan a rym',
+    'zhan-a-rym',
+  ];
 
   bool hasWakeWord(String text) {
     final t = text.toLowerCase();

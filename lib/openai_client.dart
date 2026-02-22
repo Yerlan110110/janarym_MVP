@@ -4,18 +4,33 @@ import 'dart:typed_data';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:http/http.dart' as http;
 
+import 'l10n/app_locale_controller.dart';
+import 'l10n/app_localizations.dart';
+
 class OpenAiClient {
-  OpenAiClient({http.Client? httpClient})
-      : _httpClient = httpClient ?? http.Client();
+  OpenAiClient({http.Client? httpClient, AppLanguage language = AppLanguage.ru})
+    : _httpClient = httpClient ?? http.Client(),
+      _language = language;
 
   static const String _defaultModel = 'gpt-4.1-mini';
 
   final http.Client _httpClient;
+  AppLanguage _language;
 
-  Future<String> askTextOnly(String userText, {String? systemPrompt}) async {
+  AppLocalizations get _l10n => lookupAppLocalizations(_language.locale);
+
+  void setLanguage(AppLanguage language) {
+    _language = language;
+  }
+
+  Future<String> askTextOnly(
+    String userText, {
+    String? systemPrompt,
+    int maxOutputTokens = 300,
+  }) async {
     final apiKey = (dotenv.env['OPENAI_API_KEY'] ?? '').trim();
     if (apiKey.isEmpty) {
-      throw Exception('OPENAI_API_KEY не задан (проверь .env)');
+      throw Exception(_l10n.errorOpenAiKeyMissing);
     }
 
     final model = (dotenv.env['OPENAI_MODEL'] ?? _defaultModel).trim();
@@ -40,7 +55,7 @@ class OpenAiClient {
     final body = {
       'model': model,
       'input': input,
-      'max_output_tokens': 350,
+      'max_output_tokens': maxOutputTokens.clamp(64, 1200),
     };
 
     final res = await _httpClient.post(
@@ -63,19 +78,21 @@ class OpenAiClient {
     String userText,
     Uint8List imageBytes, {
     String? systemPrompt,
+    int maxOutputTokens = 120,
   }) async {
     final apiKey = (dotenv.env['OPENAI_API_KEY'] ?? '').trim();
     if (apiKey.isEmpty) {
-      throw Exception('OPENAI_API_KEY не задан (проверь .env)');
+      throw Exception(_l10n.errorOpenAiKeyMissing);
     }
     if (imageBytes.isEmpty) {
-      throw Exception('Пустой кадр изображения.');
+      throw Exception(_l10n.errorEmptyImageFrame);
     }
 
-    final model = (dotenv.env['OPENAI_VISION_MODEL'] ??
-            dotenv.env['OPENAI_MODEL'] ??
-            _defaultModel)
-        .trim();
+    final model =
+        (dotenv.env['OPENAI_VISION_MODEL'] ??
+                dotenv.env['OPENAI_MODEL'] ??
+                _defaultModel)
+            .trim();
     final input = <Map<String, dynamic>>[];
 
     if (systemPrompt != null && systemPrompt.trim().isNotEmpty) {
@@ -102,7 +119,7 @@ class OpenAiClient {
     final body = {
       'model': model,
       'input': input,
-      'max_output_tokens': 350,
+      'max_output_tokens': maxOutputTokens.clamp(64, 1200),
     };
 
     final res = await _httpClient.post(
@@ -150,7 +167,7 @@ class OpenAiClient {
       }
     }
 
-    return 'Не удалось извлечь текст ответа.';
+    return _l10n.errorExtractTextFailed;
   }
 
   void dispose() {
