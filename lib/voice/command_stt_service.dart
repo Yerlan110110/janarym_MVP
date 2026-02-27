@@ -164,6 +164,9 @@ class CommandSttService {
     if (_finishing) return;
     _finishing = true;
 
+    final hadVoice = _voiceDetected;
+    final startedAt = _recordingStartedAt;
+
     _timeoutTimer?.cancel();
     _timeoutTimer = null;
     _silenceTimer?.cancel();
@@ -185,9 +188,21 @@ class CommandSttService {
     if (path != null) {
       final file = File(path);
       if (await file.exists()) {
+        final listenMs = startedAt == null
+            ? 0
+            : DateTime.now().difference(startedAt).inMilliseconds;
+        final skipNoVoice = _readBoolEnv('STT_SKIP_NO_VOICE_TRANSCRIBE', true);
+        final minForceMs = _readIntEnv(
+          'STT_TRANSCRIBE_FORCE_MS',
+          7000,
+        ).clamp(1000, 30000);
+        final shouldTranscribe =
+            !skipNoVoice || hadVoice || listenMs >= minForceMs;
         try {
-          final text = await _transcribeFile(file);
-          _setState(finalWords: text ?? '', liveWords: '');
+          if (shouldTranscribe) {
+            final text = await _transcribeFile(file);
+            _setState(finalWords: text ?? '', liveWords: '');
+          }
         } catch (e) {
           _setError(_l10n.sttGenericError('$e'));
         }
@@ -298,23 +313,35 @@ class CommandSttService {
   }
 
   Future<String?> _transcribeFile(File file) async {
-    final apiKey = (dotenv.env['OPENAI_API_KEY'] ?? '').trim();
+    final apiKey = _resolveOpenAiApiKey();
     if (apiKey.isEmpty) {
       throw Exception(_l10n.errorOpenAiKeyMissing);
     }
 
-    final model = (dotenv.env['OPENAI_STT_MODEL'] ?? 'gpt-4o-mini-transcribe')
-        .trim();
-    final language = (dotenv.env['OPENAI_STT_LANGUAGE'] ?? 'auto').trim();
-    final uri = Uri.parse('https://api.openai.com/v1/audio/transcriptions');
-    final request = http.MultipartRequest('POST', uri)
-      ..headers['Authorization'] = 'Bearer $apiKey'
-      ..fields['model'] = model
-      ..fields['response_format'] = 'json'
-      ..files.add(await http.MultipartFile.fromPath('file', file.path));
-    if (language.isNotEmpty && language.toLowerCase() != 'auto') {
+    final model =
+        (dotenv.env['OPENAI_STT_MODEL'] ?? 'gpt-4o-mini-transcribe')
+            .trim();
+    final language =
+        (dotenv.env['OPENAI_STT_LANGUAGE'] ??
+                dotenv.env['STT_LANGUAGE'] ??
+                'auto')
+            .trim()
+            .toLowerCase();
+
+    final audioSize = await file.length();
+    if (audioSize <= 0) return null;
+
+    final request = http.MultipartRequest(
+      'POST',
+      _buildOpenAiTranscriptionUri(),
+    );
+    request.headers['Authorization'] = 'Bearer $apiKey';
+    request.fields['model'] = model.isEmpty ? 'gpt-4o-mini-transcribe' : model;
+    request.fields['response_format'] = 'json';
+    if (language.isNotEmpty && language != 'auto') {
       request.fields['language'] = language;
     }
+    request.files.add(await http.MultipartFile.fromPath('file', file.path));
 
     final streamed = await request.send();
     final response = await http.Response.fromStream(streamed);
@@ -323,10 +350,42 @@ class CommandSttService {
       throw Exception('OpenAI STT HTTP ${response.statusCode}: $rawBody');
     }
 
-    final data = jsonDecode(rawBody) as Map<String, dynamic>;
-    final text = (data['text'] as String?)?.trim();
-    if (text == null || text.isEmpty) return null;
+    final dynamic data = jsonDecode(rawBody);
+    final text = _extractOpenAiTranscriptionText(data);
+    if (text.isEmpty) return null;
     return text;
+  }
+
+  Uri _buildOpenAiTranscriptionUri() {
+    return Uri.https('api.openai.com', '/v1/audio/transcriptions');
+  }
+
+  String _resolveOpenAiApiKey() {
+    final candidates = [
+      dotenv.env['OPENAI_API_KEY'],
+      dotenv.env['OPENAI_KEY'],
+    ];
+    for (final candidate in candidates) {
+      final value = _sanitizeApiKey(candidate);
+      if (value.isNotEmpty) {
+        return value;
+      }
+    }
+    return '';
+  }
+
+  String _sanitizeApiKey(String? raw) {
+    if (raw == null) return '';
+    return raw.replaceAll(RegExp(r'[^\x20-\x7E]'), '').trim();
+  }
+
+  String _extractOpenAiTranscriptionText(dynamic decoded) {
+    if (decoded is! Map<String, dynamic>) return '';
+    final text = decoded['text'];
+    if (text is String && text.trim().isNotEmpty) {
+      return text.trim();
+    }
+    return '';
   }
 
   AudioEncoder _readEncoderEnv() {

@@ -73,6 +73,8 @@
   "sayAddressAfterRoutePhrase": "Скажите адрес после слов: маршрут до...",
   "unknownRouteCommandHelp": "Не поняла команду. Скажите адрес назначения или: что дальше, статус маршрута, стоп маршрут.",
   "followUpNeedAnythingElse": "Нужно ли еще что-нибудь?",
+  "wakeReplyListening": "Слушаю. Что хотите?",
+  "dialogContextCleared": "Контекст очищен. Начинаем заново.",
   "routeModeAlreadyEnabled": "Режим маршрута уже включен.",
   "routeModeNotEnabled": "Режим маршрута не включен.",
   "noCameraAccess": "Нет доступа к камере.",

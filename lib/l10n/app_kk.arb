@@ -73,6 +73,8 @@
   "sayAddressAfterRoutePhrase": "Мекенжайды «маршрут до...» сөздерінен кейін айтыңыз.",
   "unknownRouteCommandHelp": "Команданы түсінбедім. Мекенжай айтыңыз немесе: әрі қарай не, маршрут күйі, маршрутты тоқтат.",
   "followUpNeedAnythingElse": "Тағы бірдеңе керек пе?",
+  "wakeReplyListening": "Тыңдап тұрмын. Не қалайсыз?",
+  "dialogContextCleared": "Контекст тазартылды. Қайта бастаймыз.",
   "routeModeAlreadyEnabled": "Маршрут режимі әлдеқашан қосулы.",
   "routeModeNotEnabled": "Маршрут режимі қосылмаған.",
   "noCameraAccess": "Камераға рұқсат жоқ.",

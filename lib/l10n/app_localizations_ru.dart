@@ -199,6 +199,12 @@ class AppLocalizationsRu extends AppLocalizations {
   String get followUpNeedAnythingElse => 'Нужно ли еще что-нибудь?';
 
   @override
+  String get wakeReplyListening => 'Слушаю. Что хотите?';
+
+  @override
+  String get dialogContextCleared => 'Контекст очищен. Начинаем заново.';
+
+  @override
   String get routeModeAlreadyEnabled => 'Режим маршрута уже включен.';
 
   @override

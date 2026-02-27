@@ -446,6 +446,18 @@ abstract class AppLocalizations {
   /// **'Нужно ли еще что-нибудь?'**
   String get followUpNeedAnythingElse;
 
+  /// No description provided for @wakeReplyListening.
+  ///
+  /// In ru, this message translates to:
+  /// **'Слушаю. Что хотите?'**
+  String get wakeReplyListening;
+
+  /// No description provided for @dialogContextCleared.
+  ///
+  /// In ru, this message translates to:
+  /// **'Контекст очищен. Начинаем заново.'**
+  String get dialogContextCleared;
+
   /// No description provided for @routeModeAlreadyEnabled.
   ///
   /// In ru, this message translates to:

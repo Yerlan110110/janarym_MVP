@@ -94,5 +94,36 @@ void main() {
       final third = router.route('үшінші');
       expect(third.candidateChoiceIndex, 2);
     });
+
+    test('parses yes/no confirmation intents', () {
+      final yes = router.route('да правильно');
+      expect(yes.modeIntent, AssistantModeIntent.confirmYes);
+      expect(yes.isAffirmative, isTrue);
+
+      final no = router.route('жоқ қате');
+      expect(no.modeIntent, AssistantModeIntent.confirmNo);
+      expect(no.isNegative, isTrue);
+    });
+
+    test('parses label and fear intents', () {
+      final label = router.route('поставь метку дом адрес абая 10');
+      expect(label.modeIntent, AssistantModeIntent.setPlaceLabel);
+      expect(label.placeLabelName, contains('дом'));
+      expect(label.freeAddressText, contains('абая 10'));
+
+      final fear = router.route('я боюсь пешеходных переходов');
+      expect(fear.modeIntent, AssistantModeIntent.updateUserFear);
+      expect(fear.fearText, contains('пешеходных переходов'));
+    });
+
+    test('parses onboarding intent', () {
+      final intent = router.route('давай пройти персонализацию');
+      expect(intent.modeIntent, AssistantModeIntent.startOnboarding);
+    });
+
+    test('parses restart onboarding intent', () {
+      final intent = router.route('начать сначала');
+      expect(intent.modeIntent, AssistantModeIntent.restartOnboarding);
+    });
   });
 }

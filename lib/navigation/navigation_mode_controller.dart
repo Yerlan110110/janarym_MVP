@@ -14,6 +14,23 @@ import 'services/navigation_utils.dart';
 
 typedef NavigationSpeakFn = Future<void> Function(String text);
 typedef NavigationLogFn = void Function(String message);
+typedef NavigationInstructionAdapter = String Function(String text);
+typedef NavigationRouteBuiltCallback =
+    Future<void> Function(NavigationRouteBuiltEvent event);
+
+class NavigationRouteBuiltEvent {
+  const NavigationRouteBuiltEvent({
+    required this.queryText,
+    required this.source,
+    required this.resolvedAddress,
+    required this.destination,
+  });
+
+  final String queryText;
+  final String source;
+  final String resolvedAddress;
+  final NavPoint destination;
+}
 
 class NavigationModeController {
   NavigationModeController({
@@ -24,6 +41,8 @@ class NavigationModeController {
     InstructionEngine? instructionEngine,
     Future<bool> Function(Uri uri, {LaunchMode mode})? launchUrlFn,
     AppLanguage language = AppLanguage.ru,
+    NavigationInstructionAdapter? instructionAdapter,
+    NavigationRouteBuiltCallback? onRouteBuilt,
   }) : _speak = speak,
        _log = log ?? debugPrint,
        _routeService = routeService ?? YandexNavigationRouteService(),
@@ -31,6 +50,8 @@ class NavigationModeController {
            locationProvider ?? const GeolocatorNavigationLocationProvider(),
        _instructionEngine = instructionEngine ?? InstructionEngine(),
        _launchUrlFn = launchUrlFn ?? launchUrl,
+       _instructionAdapter = instructionAdapter,
+       _onRouteBuilt = onRouteBuilt,
        _rerouteDistanceMeters = _parseDoubleEnv(
          'NAV_REROUTE_DISTANCE_METERS',
          40,
@@ -49,6 +70,8 @@ class NavigationModeController {
   final NavigationLocationProvider _locationProvider;
   final InstructionEngine _instructionEngine;
   final Future<bool> Function(Uri uri, {LaunchMode mode}) _launchUrlFn;
+  NavigationInstructionAdapter? _instructionAdapter;
+  final NavigationRouteBuiltCallback? _onRouteBuilt;
   final double _rerouteDistanceMeters;
   final Duration _rerouteCooldown;
   final Duration _offRouteConfirmation = const Duration(seconds: 3);
@@ -63,6 +86,7 @@ class NavigationModeController {
   DateTime? _lastRerouteAt;
   bool _rerouteInProgress = false;
   String _lastRouteQuery = '';
+  String _lastRouteSource = 'manual';
 
   AppLocalizations get _l10n => lookupAppLocalizations(_language.locale);
 
@@ -71,6 +95,10 @@ class NavigationModeController {
     _language = language;
     _instructionEngine.setLanguage(language);
     _routeService.setLanguage(language);
+  }
+
+  void setInstructionAdapter(NavigationInstructionAdapter? adapter) {
+    _instructionAdapter = adapter;
   }
 
   Future<void> enterMode() async {
@@ -133,7 +161,7 @@ class NavigationModeController {
     await _speak(_l10n.navModeDisabled);
   }
 
-  Future<void> startRoute(String query) async {
+  Future<void> startRoute(String query, {String source = 'manual'}) async {
     if (!state.value.modeEnabled) {
       await _speak(_l10n.navEnableFirst);
       return;
@@ -146,6 +174,7 @@ class NavigationModeController {
     }
 
     _lastRouteQuery = cleanQuery;
+    _lastRouteSource = source.trim().isEmpty ? 'manual' : source.trim();
     final origin = await _ensureCurrentLocation();
     if (origin == null) {
       await _speak(_l10n.navLocationUnavailable);
@@ -285,11 +314,13 @@ class NavigationModeController {
         ? destinationDistance
         : distanceMeters(current, route.polyline[nextStep.polylineIndex]);
 
-    final summary = _l10n.navSummaryDistanceInstruction(
-      _formatDistance(destinationDistance),
-      nextStep == null
-          ? _l10n.navKeepCurrentRoute
-          : _instructionEngine.formatDistancePrompt(nextStep, stepDistance),
+    final summary = _adaptInstruction(
+      _l10n.navSummaryDistanceInstruction(
+        _formatDistance(destinationDistance),
+        nextStep == null
+            ? _l10n.navKeepCurrentRoute
+            : _instructionEngine.formatDistancePrompt(nextStep, stepDistance),
+      ),
     );
     await _speak(summary);
   }
@@ -308,9 +339,29 @@ class NavigationModeController {
     }
     final stepPoint = route.polyline[step.polylineIndex];
     final distance = distanceMeters(current, stepPoint);
-    final prompt = _instructionEngine.formatDistancePrompt(step, distance);
+    final prompt = _adaptInstruction(
+      _instructionEngine.formatDistancePrompt(step, distance),
+    );
     _setState(state.value.copyWith(lastInstruction: prompt));
     await _speak(prompt);
+  }
+
+  Future<DestinationCandidate?> resolveDestinationCandidate(
+    String query,
+  ) async {
+    final cleanQuery = query.trim();
+    if (cleanQuery.isEmpty) return null;
+    final hasPermission = await _locationProvider.ensurePermission();
+    if (!hasPermission) return null;
+    final origin = await _ensureCurrentLocation();
+    if (origin == null) return null;
+    final candidates = await _routeService.searchCandidates(
+      query: cleanQuery,
+      origin: origin,
+      limit: 1,
+    );
+    if (candidates.isEmpty) return null;
+    return candidates.first;
   }
 
   Future<void> dispose() async {
@@ -365,11 +416,24 @@ class NavigationModeController {
 
       final etaMinutes = route.estimatedDuration.inMinutes;
       final etaPart = etaMinutes > 0 ? _l10n.navEtaPart(etaMinutes) : '.';
-      final intro = _l10n.navRouteBuiltWithEta(
-        _formatDistance(route.totalDistanceMeters),
-        etaPart,
+      final intro = _adaptInstruction(
+        _l10n.navRouteBuiltWithEta(
+          _formatDistance(route.totalDistanceMeters),
+          etaPart,
+        ),
       );
       await _speak(intro);
+      final onRouteBuilt = _onRouteBuilt;
+      if (onRouteBuilt != null) {
+        await onRouteBuilt(
+          NavigationRouteBuiltEvent(
+            queryText: _lastRouteQuery,
+            source: _lastRouteSource,
+            resolvedAddress: destination.displayLabel,
+            destination: destination.point,
+          ),
+        );
+      }
       await speakNextStep();
     } catch (error) {
       _log('[NAV] build error: $error');
@@ -489,9 +553,8 @@ class NavigationModeController {
       final stepDistance = distanceMeters(point, stepPoint);
       if (stepDistance <= 55 &&
           updatedRoute.announcedStepIndex != nextStep.index) {
-        final prompt = _instructionEngine.formatDistancePrompt(
-          nextStep,
-          stepDistance,
+        final prompt = _adaptInstruction(
+          _instructionEngine.formatDistancePrompt(nextStep, stepDistance),
         );
         _setState(
           state.value.copyWith(
@@ -620,5 +683,13 @@ class NavigationModeController {
         ? '${subtitle.substring(0, 56)}...'
         : subtitle;
     return '$title, $shortSubtitle';
+  }
+
+  String _adaptInstruction(String text) {
+    final adapter = _instructionAdapter;
+    if (adapter == null) return text;
+    final adapted = adapter(text).trim();
+    if (adapted.isEmpty) return text;
+    return adapted;
   }
 }

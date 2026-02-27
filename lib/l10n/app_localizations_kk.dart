@@ -199,6 +199,12 @@ class AppLocalizationsKk extends AppLocalizations {
   String get followUpNeedAnythingElse => 'Тағы бірдеңе керек пе?';
 
   @override
+  String get wakeReplyListening => 'Тыңдап тұрмын. Не қалайсыз?';
+
+  @override
+  String get dialogContextCleared => 'Контекст тазартылды. Қайта бастаймыз.';
+
+  @override
   String get routeModeAlreadyEnabled => 'Маршрут режимі әлдеқашан қосулы.';
 
   @override
