@@ -1,15 +1,17 @@
 import 'dart:async';
+import 'dart:ui' show ImageFilter;
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show DeviceOrientation;
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_tts/flutter_tts.dart';
-import 'package:image/image.dart' as img;
+import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:vibration/vibration.dart';
-import 'package:yandex_mapkit/yandex_mapkit.dart';
+import 'package:yandex_mapkit/yandex_mapkit.dart' hide BoundingBox;
 
 import 'l10n/app_locale_controller.dart';
 import 'l10n/app_localizations.dart';
@@ -18,10 +20,26 @@ import 'navigation/navigation_mode_controller.dart';
 import 'navigation/models/navigation_mode_state.dart';
 import 'openai_client.dart';
 import 'personalization/data/personalization_database.dart';
+import 'personalization/data/secure_payload_codec.dart';
 import 'personalization/models/personalization_models.dart';
 import 'personalization/personalization_controller.dart';
 import 'personalization/personalization_repository.dart';
+import 'reflex/reflex_engine.dart';
+import 'runtime/android_runtime_service.dart';
+import 'runtime/app_log.dart';
+import 'runtime/feature_flags.dart';
+import 'runtime/mode_orchestrator.dart';
+import 'runtime/perception_event_bus.dart';
+import 'services/camera_frame_service.dart';
+import 'services/on_device_text_reader_service.dart';
+import 'services/open_meteo_service.dart';
+import 'services/scene_memory_service.dart';
+import 'services/shopping_mode_service.dart';
+import 'services/text_reader_decision_helper.dart';
+import 'services/text_reading_normalizer.dart';
+import 'widgets/bbox_painter.dart';
 import 'voice/command_stt_service.dart';
+import 'voice/spoken_language_detector.dart';
 import 'voice/wake_word_service.dart';
 
 bool _readEnvBool(String key, {required bool fallback}) {
@@ -139,11 +157,26 @@ enum GptStatus { idle, loading, ok, error }
 
 enum CircleState { idle, wake, listening, thinking, speaking, end }
 
-enum AssistantMode { general, navigation }
+enum AssistantMode {
+  general,
+  navigation,
+  safety,
+  shopping,
+  cooking,
+  dressCode,
+  antiFraud,
+  textReader,
+  memory,
+  find,
+}
 
 enum _OnboardingTurnResult { advanced, retry, paused, completed }
 
 enum _DialogBrevityMode { auto, short, detailed }
+
+enum _TextReaderReadSource { voice, tap, auto }
+
+enum _TextReaderSessionState { idle, preparing, scanning, speaking, failed }
 
 class _LabelCorrectionDraft {
   const _LabelCorrectionDraft({this.labelName, this.addressText});
@@ -173,6 +206,22 @@ class _DialogTurn {
   final String assistantText;
 }
 
+class _ModeMenuEntry {
+  const _ModeMenuEntry({
+    required this.label,
+    required this.icon,
+    this.mode,
+    this.actionId,
+  });
+
+  final String label;
+  final IconData icon;
+  final AssistantMode? mode;
+  final String? actionId;
+
+  bool get isMode => mode != null;
+}
+
 class JanarymHome extends StatefulWidget {
   const JanarymHome({
     super.key,
@@ -188,19 +237,30 @@ class JanarymHome extends StatefulWidget {
 }
 
 class _JanarymHomeState extends State<JanarymHome>
-    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
+    with WidgetsBindingObserver, TickerProviderStateMixin {
   final FlutterTts _tts = FlutterTts();
   final AudioPlayer _sfxPlayer = AudioPlayer();
   final CommandRouter _router = CommandRouter();
   final OpenAiClient _openAi = OpenAiClient();
   final PersonalizationDatabase _personalizationDatabase =
       PersonalizationDatabase();
+  final SecurePayloadCodec _securePayloadCodec = SecurePayloadCodec();
+  final CameraFrameStore _cameraFrameStore = CameraFrameStore();
   late final PersonalizationRepository _personalizationRepository;
   late final PersonalizationController _personalizationController;
   late AppLocalizations _l10n;
+  late AppLanguage _interactionLanguage;
   late final NavigationModeController _navigationController;
   late final CommandSttService _sttService;
   late final WakeWordService _wakeService;
+  late final RuntimeFeatureFlags _featureFlags;
+  late final ModeOrchestrator _modeOrchestrator;
+  late final PerceptionEventBus _perceptionEventBus;
+  late final ReflexEngine _reflexEngine;
+  late final OnDeviceTextReaderService _textReaderService;
+  late final OpenMeteoService _openMeteoService;
+  late final SceneMemoryService _sceneMemoryService;
+  late final ShoppingModeService _shoppingModeService;
   YandexMapController? _yandexMapController;
 
   DateTime? _lastWakeAt;
@@ -209,14 +269,33 @@ class _JanarymHomeState extends State<JanarymHome>
   CameraController? _cameraController;
   bool _cameraGranted = false;
   bool _cameraStreaming = false;
+  bool _modePickerOpen = false;
   bool _cameraInitInProgress = false;
   bool _cameraStartInProgress = false;
   String _cameraMessage = '';
   String _cameraError = '';
+  bool _runtimeServiceRunning = false;
+  int _lastPerceptionEventMs = 0;
+  String _latestHazardHint = '';
+  List<BBoxOverlayEntry> _reflexBBoxes = const <BBoxOverlayEntry>[];
+  List<ReflexDetection> _latestReflexDetections = const <ReflexDetection>[];
   List<CameraDescription>? _cachedCameras;
   DateTime? _lastFrameAt;
-  _YuvFrame? _lastFrame;
+  CameraFrameSnapshot? _lastFrame;
   int _lastFrameMs = 0;
+  int _cameraProcessedFrames = 0;
+  int _cameraDroppedFrames = 0;
+  int _cameraPreviewFps = 0;
+  int _cameraFpsWindowStartedMs = 0;
+  int _reflexInferenceLatencyMs = 0;
+  int _reflexDetectionsCount = 0;
+  bool _voicePriorityWindowActive = false;
+  bool _interactionLanguagePinned = false;
+  DateTime? _interactionLanguageUpdatedAt;
+  DateTime? _wakeErrorSince;
+  int _lastWakeDetectedMs = 0;
+  int _lastWakeAckDoneMs = 0;
+  int _lastWakeSttOpenedMs = 0;
   GptStatus _gptStatus = GptStatus.idle;
   String _gptError = '';
   String _lastAnswer = '';
@@ -228,6 +307,11 @@ class _JanarymHomeState extends State<JanarymHome>
   bool _showOnboardingOverlay = true;
   bool _onboardingDialogInProgress = false;
   static const int _maxFrameAgeMs = 8000;
+  static const double _manualTextReadAcceptScore = 35.0;
+  static const int _manualTextReadAttempts = 3;
+  static const int _manualTextReadFirstTimeoutMs = 850;
+  static const int _manualTextReadRetryTimeoutMs = 550;
+  static const int _manualTextReadInterAttemptDelayMs = 90;
   bool _followUpActive = false;
   bool _followUpPending = false;
   bool _wakeHandling = false;
@@ -238,13 +322,28 @@ class _JanarymHomeState extends State<JanarymHome>
   DateTime? _llmRateLimitedUntil;
   late final AnimationController _circleController;
   late final Animation<double> _circlePulse;
+  late final AnimationController _modeFabController;
+  late final Animation<double> _modeFabPulse;
   CircleState _circleState = CircleState.idle;
   Timer? _cameraKeepAliveTimer;
+  Timer? _modePickerAutoCloseTimer;
+  Timer? _textReaderLoopTimer;
+  Timer? _wakeFallbackEscalationTimer;
+  Timer? _wakeRecoveryTimer;
   bool _wakeFallbackActive = false;
   bool _wakeFallbackLoopRunning = false;
   bool _wakeFallbackStopRequested = false;
+  bool _wakeRecoveryInProgress = false;
   bool _wakeWordOnlyMode = false;
+  int _wakeRecoveryAttempts = 0;
+  bool _textReaderLoopBusy = false;
+  bool _manualTextReadInProgress = false;
+  bool _textReaderAutoPaused = false;
+  bool _textReaderSessionCancelRequested = false;
   AssistantMode _assistantMode = AssistantMode.general;
+  _TextReaderSessionState _textReaderSessionState =
+      _TextReaderSessionState.idle;
+  String _lastTextReaderFailureReason = '';
   _DialogBrevityMode _dialogBrevityMode = _DialogBrevityMode.auto;
   final List<_DialogTurn> _dialogHistory = <_DialogTurn>[];
   NavPoint? _lastNavCameraTarget;
@@ -258,7 +357,7 @@ class _JanarymHomeState extends State<JanarymHome>
   );
   final bool _wakeReplyEnabled = _readEnvBool(
     'ASSISTANT_WAKE_REPLY_ENABLED',
-    fallback: true,
+    fallback: false,
   );
   final int _dialogContextTurns = _readEnvInt(
     'DIALOG_CONTEXT_TURNS',
@@ -283,11 +382,33 @@ class _JanarymHomeState extends State<JanarymHome>
     max: 1.3,
   );
   final String _ttsPreferredVoiceRu = _readEnvString('TTS_PREFERRED_VOICE_RU');
-  final String _wakeReplyTextRu = _readEnvString(
-    'ASSISTANT_WAKE_REPLY_TEXT_RU',
+  AppLanguage _ttsConfiguredLanguage = AppLanguage.ru;
+  String _ttsConfiguredLocaleCode = 'ru-RU';
+  final String _wakeAckTextRu = _readEnvString(
+    'WAKE_ACK_TEXT_RU',
+    fallback: 'Что нужно?',
   );
-  final String _wakeReplyTextKk = _readEnvString(
-    'ASSISTANT_WAKE_REPLY_TEXT_KK',
+  final String _wakeAckTextKk = _readEnvString(
+    'WAKE_ACK_TEXT_KK',
+    fallback: 'Не қалайсыз?',
+  );
+  final String _wakeRecallModeRaw = _readEnvString(
+    'WAKE_RECALL_MODE',
+    fallback: 'max_recall',
+  ).toLowerCase();
+  final bool _wakeTemplateVerificationEnabled = _readEnvBool(
+    'WAKE_TEMPLATE_VERIFICATION_ENABLED',
+    fallback: false,
+  );
+  final bool _ownerVerificationEnabled = _readEnvBool(
+    'OWNER_VOICE_PROFILE_ENABLED',
+    fallback: false,
+  );
+  final double _wakeAckSpeechRate = _readEnvDouble(
+    'WAKE_ACK_SPEECH_RATE',
+    fallback: 0.62,
+    min: 0.45,
+    max: 0.85,
   );
   final bool _embeddedMapEnabled = _readEnvBool(
     'NAV_EMBEDDED_MAP_ENABLED',
@@ -298,6 +419,41 @@ class _JanarymHomeState extends State<JanarymHome>
     fallback: false,
   );
   final bool _wakeCueEnabled = _readEnvBool('WAKE_CUE_ENABLED', fallback: true);
+  final int _frameCaptureThrottleMs = _readEnvInt(
+    'FRAME_CAPTURE_THROTTLE_MS',
+    fallback: 400,
+    min: 300,
+    max: 500,
+  );
+  final int _textReaderFrameIntervalMs = _readEnvInt(
+    'TEXT_READER_FRAME_INTERVAL_MS',
+    fallback: 550,
+    min: 450,
+    max: 1000,
+  );
+  final int _textReaderSpeechCooldownMs = _readEnvInt(
+    'TEXT_READER_SPEECH_COOLDOWN_MS',
+    fallback: 900,
+    min: 700,
+    max: 5000,
+  );
+  final int _textReaderStableFramesRequired = _readEnvInt(
+    'TEXT_READER_STABLE_FRAMES',
+    fallback: 2,
+    min: 2,
+    max: 3,
+  );
+  String _lastAutoTextReaderSignature = '';
+  int _lastAutoTextReaderSpeakMs = 0;
+  String _lastAutoTextReaderExactSignature = '';
+  int _lastAutoTextReaderExactMs = 0;
+  String _pendingAutoTextReaderSignature = '';
+  int _pendingAutoTextReaderSeenCount = 0;
+  String _lastAutoTextReaderVisionFallbackSignature = '';
+  int _lastAutoTextReaderVisionFallbackMs = 0;
+  bool get _wakeDebugOverlayEnabled =>
+      _featureFlags.developerDiagnosticsEnabled &&
+      _readEnvBool('WAKE_DEBUG_OVERLAY', fallback: true);
   static const Duration _wakeFallbackIdleWait = Duration(milliseconds: 520);
   static const Duration _wakeFallbackAfterListenWait = Duration(
     milliseconds: 520,
@@ -305,11 +461,41 @@ class _JanarymHomeState extends State<JanarymHome>
   static const Duration _wakeFallbackNoSpeechWait = Duration(
     milliseconds: 1200,
   );
+  static const Duration _wakeFallbackErrorGrace = Duration(milliseconds: 1200);
+  static const Duration _wakeRecoveryRetryCooldown = Duration(
+    milliseconds: 240,
+  );
+  static const int _wakeRecoveryMaxAttempts = 2;
+  static const int _textReaderAutoExactCooldownMs = 6000;
+  static const int _textReaderAutoVisionFallbackCooldownMs = 6000;
+  DateTime? _lastWakeRecoveryAttemptAt;
 
   @override
   void initState() {
     super.initState();
     _l10n = lookupAppLocalizations(widget.appLanguage.locale);
+    _interactionLanguage = widget.appLanguage;
+    _featureFlags = RuntimeFeatureFlags.fromEnv();
+    _modeOrchestrator = ModeOrchestrator(flags: _featureFlags);
+    _perceptionEventBus = PerceptionEventBus();
+    _reflexEngine = ReflexEngine(
+      eventBus: _perceptionEventBus,
+      captureLatestFrame: _captureLatestFrameForReflex,
+      onOverlayChanged: _handleReflexOverlayChanged,
+      onAlert: _handleReflexAlert,
+      onMetrics: _handleReflexMetrics,
+      enabled: _featureFlags.reflexEnabled,
+    );
+    _textReaderService = OnDeviceTextReaderService();
+    _openMeteoService = OpenMeteoService();
+    _sceneMemoryService = SceneMemoryService(
+      database: _personalizationDatabase,
+      codec: _securePayloadCodec,
+    );
+    _shoppingModeService = ShoppingModeService(
+      database: _personalizationDatabase,
+      codec: _securePayloadCodec,
+    );
     WidgetsBinding.instance.addObserver(this);
     _circleController = AnimationController(
       vsync: this,
@@ -317,6 +503,13 @@ class _JanarymHomeState extends State<JanarymHome>
     )..repeat(reverse: true);
     _circlePulse = Tween<double>(begin: 0.95, end: 1.15).animate(
       CurvedAnimation(parent: _circleController, curve: Curves.easeInOutQuad),
+    );
+    _modeFabController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1150),
+    )..repeat(reverse: true);
+    _modeFabPulse = Tween<double>(begin: 0.95, end: 1.03).animate(
+      CurvedAnimation(parent: _modeFabController, curve: Curves.easeInOut),
     );
     _personalizationRepository = PersonalizationRepository(
       database: _personalizationDatabase,
@@ -326,27 +519,25 @@ class _JanarymHomeState extends State<JanarymHome>
     );
     _navigationController = NavigationModeController(
       speak: _speak,
-      log: debugPrint,
-      language: widget.appLanguage,
+      log: appLog,
+      language: _interactionLanguage,
       instructionAdapter: _adaptNavigationInstruction,
       onRouteBuilt: _handleRouteBuilt,
     );
-    _sttService = CommandSttService(language: widget.appLanguage);
+    _sttService = CommandSttService(language: _interactionLanguage);
     _wakeService = WakeWordService(onWakeWordDetected: _handleWakeDetected);
-    _openAi.setLanguage(widget.appLanguage);
+    _openAi.setLanguage(_interactionLanguage);
     _dialogBrevityMode = _parseInitialBrevityMode(_dialogBrevityDefaultRaw);
     _micMessage = _l10n.checkingMic;
     _cameraMessage = _l10n.checkingCamera;
     _navigationController.state.addListener(_handleNavigationStateChange);
     _sttService.state.addListener(_handleSttStateChange);
     _wakeService.state.addListener(_handleWakeStateChange);
+    _modeOrchestrator.addListener(_handleModeOrchestratorChange);
     _personalizationController.addListener(_handlePersonalizationChange);
-    _initTts();
-    _initVibration();
-    _initMicAndWake();
-    _startCameraKeepAlive();
-    unawaited(_initCameraLive());
-    unawaited(_initPersonalization());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_bootstrapRuntime());
+    });
   }
 
   @override
@@ -360,10 +551,13 @@ class _JanarymHomeState extends State<JanarymHome>
     super.didUpdateWidget(oldWidget);
     if (oldWidget.appLanguage != widget.appLanguage) {
       _l10n = lookupAppLocalizations(widget.appLanguage.locale);
-      _openAi.setLanguage(widget.appLanguage);
-      _sttService.setLanguage(widget.appLanguage);
-      _navigationController.setLanguage(widget.appLanguage);
-      unawaited(_configureTtsForLanguage(widget.appLanguage));
+      if (!_interactionLanguagePinned) {
+        _applyInteractionLanguage(
+          widget.appLanguage,
+          reason: 'ui_language_changed',
+        );
+        unawaited(_configureTtsForLanguage(_interactionLanguage));
+      }
     }
   }
 
@@ -374,37 +568,151 @@ class _JanarymHomeState extends State<JanarymHome>
     _navigationController.state.removeListener(_handleNavigationStateChange);
     _sttService.state.removeListener(_handleSttStateChange);
     _wakeService.state.removeListener(_handleWakeStateChange);
+    _modeOrchestrator.removeListener(_handleModeOrchestratorChange);
     _personalizationController.removeListener(_handlePersonalizationChange);
     unawaited(_navigationController.dispose());
     unawaited(_personalizationRepository.close());
     _personalizationController.dispose();
     _sttService.dispose();
     _wakeService.dispose();
+    unawaited(_textReaderService.dispose());
+    _openMeteoService.dispose();
+    _modeOrchestrator.dispose();
+    unawaited(_reflexEngine.dispose());
+    unawaited(_perceptionEventBus.dispose());
     _openAi.dispose();
     _cameraKeepAliveTimer?.cancel();
     _cameraKeepAliveTimer = null;
+    _modePickerAutoCloseTimer?.cancel();
+    _modePickerAutoCloseTimer = null;
+    _textReaderLoopTimer?.cancel();
+    _textReaderLoopTimer = null;
+    _wakeFallbackEscalationTimer?.cancel();
+    _wakeFallbackEscalationTimer = null;
+    _wakeRecoveryTimer?.cancel();
+    _wakeRecoveryTimer = null;
     _disposeCamera();
     _sfxPlayer.dispose();
     _tts.stop();
+    _modeFabController.dispose();
     _circleController.dispose();
     super.dispose();
   }
 
+  Future<void> _bootstrapRuntime() async {
+    await _initTts();
+    await _initVibration();
+    await _initMicAndWake();
+    if (!mounted) return;
+    _startCameraKeepAlive();
+    if (_modeNeedsLiveCamera(_assistantMode)) {
+      await _initCameraLive();
+    }
+    await _syncHeavyServices();
+    await _initPersonalization();
+    if (!mounted) return;
+    await _announceModesOnStartup();
+  }
+
+  AppLocalizations get _voiceL10n =>
+      lookupAppLocalizations(_interactionLanguage.locale);
+  AppLanguage get _voiceLanguage => _interactionLanguage;
+  bool get _voiceIsKazakh => _voiceLanguage == AppLanguage.kk;
+
+  String _voiceText({required String ru, required String kk}) {
+    return _voiceIsKazakh ? kk : ru;
+  }
+
+  void _applyInteractionLanguage(
+    AppLanguage language, {
+    required String reason,
+  }) {
+    if (_interactionLanguage == language) {
+      _openAi.setLanguage(language);
+      _sttService.setLanguage(language);
+      _navigationController.setLanguage(language);
+      return;
+    }
+    _interactionLanguage = language;
+    _interactionLanguageUpdatedAt = DateTime.now();
+    _openAi.setLanguage(language);
+    _sttService.setLanguage(language);
+    _navigationController.setLanguage(language);
+    appLog('[OpenAI] interaction_language=${language.name}');
+    appLog('[VoiceLang] pinned=${language.name} reason=$reason');
+    if (mounted) {
+      unawaited(_configureTtsForLanguage(language));
+    }
+  }
+
+  void _applyDetectedInteractionLanguage(
+    SpokenLanguageDetectionResult result,
+    String transcript, {
+    required bool forDialogSession,
+  }) {
+    appLog('[VoiceLang] transcript="${_truncateForLog(transcript)}"');
+    appLog(
+      '[VoiceLang] detected=${result.language.name} '
+      'confidence=${result.confidence.name} reason=${result.reason}',
+    );
+
+    var shouldApply = false;
+    switch (result.confidence) {
+      case SpokenLanguageConfidence.high:
+        shouldApply = true;
+        break;
+      case SpokenLanguageConfidence.medium:
+        shouldApply =
+            result.language == _interactionLanguage ||
+            _router.route(transcript).modeIntent !=
+                AssistantModeIntent.unknown ||
+            _detectModeSwitchByText(transcript) != null;
+        break;
+      case SpokenLanguageConfidence.low:
+        shouldApply = false;
+        break;
+    }
+
+    if (!shouldApply && !result.explicitSwitch) {
+      return;
+    }
+
+    if (forDialogSession) {
+      _interactionLanguagePinned = true;
+    }
+    _applyInteractionLanguage(
+      result.language,
+      reason: result.explicitSwitch ? 'explicit_switch' : result.reason,
+    );
+  }
+
+  String _voiceLanguageSwitchAck() {
+    return _voiceText(
+      ru: 'Хорошо, буду отвечать по-русски.',
+      kk: 'Жақсы, қазақша жауап беремін.',
+    );
+  }
+
   Future<void> _initTts() async {
-    await _configureTtsForLanguage(widget.appLanguage);
+    await _configureTtsForLanguage(_interactionLanguage);
     await _tts.setSpeechRate(_ttsSpeechRate);
     await _tts.setPitch(_ttsPitch);
     await _tts.awaitSpeakCompletion(true);
   }
 
   Future<void> _configureTtsForLanguage(AppLanguage language) async {
-    await _applyTtsLanguage(language);
-    await _applyPreferredVoice(language);
+    final localeCode = language == AppLanguage.kk ? 'kk-KZ' : 'ru-RU';
+    await _configureTtsForLocaleCode(localeCode);
   }
 
-  Future<void> _applyTtsLanguage(AppLanguage language) async {
+  Future<void> _configureTtsForLocaleCode(String localeCode) async {
+    final appliedLocale = await _applyTtsLocaleCode(localeCode);
+    await _applyPreferredVoiceForLocaleCode(appliedLocale);
+  }
+
+  Future<String> _applyTtsLocaleCode(String localeCode) async {
     const fallback = 'ru-RU';
-    final preferred = language == AppLanguage.kk ? 'kk-KZ' : 'ru-RU';
+    final preferred = localeCode.trim().isEmpty ? fallback : localeCode.trim();
     try {
       final rawLanguages = await _tts.getLanguages;
       final available = <String>{};
@@ -417,21 +725,38 @@ class _JanarymHomeState extends State<JanarymHome>
         }
       }
       final preferredLower = preferred.toLowerCase();
-      final hasPreferred =
-          available.isEmpty ||
-          available.any(
-            (value) =>
-                value == preferredLower || value.startsWith(preferredLower),
-          );
-      await _tts.setLanguage(hasPreferred ? preferred : fallback);
+      final preferredPrefix = preferredLower.split(RegExp('[-_]')).first;
+      String applied = fallback;
+      if (available.isEmpty) {
+        applied = preferred;
+      } else if (available.contains(preferredLower)) {
+        applied = preferred;
+      } else {
+        final prefixMatch = available.cast<String?>().firstWhere(
+          (value) => value != null && value.startsWith(preferredPrefix),
+          orElse: () => null,
+        );
+        if (prefixMatch != null) {
+          applied = prefixMatch;
+        }
+      }
+      await _tts.setLanguage(applied);
+      _ttsConfiguredLocaleCode = applied;
+      _ttsConfiguredLanguage = applied.toLowerCase().startsWith('kk')
+          ? AppLanguage.kk
+          : AppLanguage.ru;
+      return applied;
     } catch (_) {
       try {
         await _tts.setLanguage(fallback);
+        _ttsConfiguredLanguage = AppLanguage.ru;
+        _ttsConfiguredLocaleCode = fallback;
       } catch (_) {}
+      return fallback;
     }
   }
 
-  Future<void> _applyPreferredVoice(AppLanguage language) async {
+  Future<void> _applyPreferredVoiceForLocaleCode(String localeCode) async {
     try {
       final raw = await _tts.getVoices;
       if (raw is! List || raw.isEmpty) return;
@@ -445,13 +770,87 @@ class _JanarymHomeState extends State<JanarymHome>
       }
       if (voices.isEmpty) return;
 
-      final selected = _selectBestVoice(voices, language);
+      final selected = _selectBestVoiceForLocaleCode(voices, localeCode);
       if (selected == null) return;
       await _tts.setVoice(selected);
-      debugPrint(
+      appLog(
         '[TTS] voice selected: ${selected['name']} (${selected['locale']})',
       );
     } catch (_) {}
+  }
+
+  Future<void> _ensureTtsLocaleForCurrentMode({bool force = false}) async {
+    final desiredLocaleCode =
+        _assistantMode == AssistantMode.textReader &&
+            _voiceLanguage == AppLanguage.ru
+        ? 'ru-RU'
+        : (_voiceLanguage == AppLanguage.kk ? 'kk-KZ' : 'ru-RU');
+    if (!force &&
+        _ttsConfiguredLocaleCode.toLowerCase() ==
+            desiredLocaleCode.toLowerCase()) {
+      return;
+    }
+    await _configureTtsForLocaleCode(desiredLocaleCode);
+    if (_voiceLanguage == AppLanguage.kk &&
+        !_ttsConfiguredLocaleCode.toLowerCase().startsWith('kk')) {
+      appLog('[TTS] kk fallback -> ru');
+    }
+    appLog('[TTS] locale ensured: ${desiredLocaleCode.split('-').first}');
+  }
+
+  Future<void> _ensureTtsLocaleForReadResult(
+    OnDeviceTextReadResult result, {
+    required bool autoRead,
+  }) async {
+    final resolvedText = _resolveManualSpeechText(result);
+    await _ensureTtsLocaleForSpokenText(resolvedText, autoRead: autoRead);
+  }
+
+  Future<void> _ensureTtsLocaleForSpokenText(
+    String spokenText, {
+    required bool autoRead,
+  }) async {
+    final useEnglishTts =
+        !autoRead && TextReadingNormalizer.shouldUseEnglishTts(spokenText);
+    if (useEnglishTts) {
+      await _configureTtsForLocaleCode('en-US');
+      appLog('[TTS] locale ensured: en');
+      return;
+    }
+    await _ensureTtsLocaleForCurrentMode(force: true);
+  }
+
+  Map<String, String>? _selectBestVoiceForLocaleCode(
+    List<Map<String, String>> voices,
+    String localeCode,
+  ) {
+    final localePrefix = localeCode.toLowerCase().split(RegExp('[-_]')).first;
+    if (localePrefix == 'ru' || localePrefix == 'kk') {
+      return _selectBestVoice(
+        voices,
+        localePrefix == 'kk' ? AppLanguage.kk : AppLanguage.ru,
+      );
+    }
+
+    Map<String, String>? best;
+    var bestScore = -1 << 20;
+    for (final voice in voices) {
+      final locale = (voice['locale'] ?? '').toLowerCase();
+      final name = (voice['name'] ?? '').toLowerCase();
+      if (locale.isEmpty || name.isEmpty) continue;
+
+      var score = 0;
+      if (locale.startsWith(localePrefix)) score += 160;
+      if (locale == localeCode.toLowerCase()) score += 40;
+      if (_looksLikeFemaleVoiceName(name)) score += 12;
+      if (!name.contains('network')) score += 4;
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = voice;
+      }
+    }
+    return best;
   }
 
   Map<String, String>? _selectBestVoice(
@@ -603,6 +1002,24 @@ class _JanarymHomeState extends State<JanarymHome>
   void _setCircleState(CircleState state) {
     if (_circleState == state) return;
     setState(() => _circleState = state);
+    switch (state) {
+      case CircleState.wake:
+        _modeOrchestrator.setSubState('wake');
+        break;
+      case CircleState.listening:
+        _modeOrchestrator.setSubState('listening');
+        break;
+      case CircleState.thinking:
+        _modeOrchestrator.setSubState('thinking');
+        break;
+      case CircleState.speaking:
+        _modeOrchestrator.setSubState('speaking');
+        break;
+      case CircleState.end:
+      case CircleState.idle:
+        _modeOrchestrator.setSubState('idle');
+        break;
+    }
   }
 
   void _restoreWakeStateIfIdle() {
@@ -619,7 +1036,52 @@ class _JanarymHomeState extends State<JanarymHome>
         _gptStatus == GptStatus.loading) {
       return;
     }
+    _interactionLanguagePinned = false;
     _setCircleState(CircleState.wake);
+  }
+
+  Future<bool> _ensureNotificationPermission() async {
+    if (defaultTargetPlatform != TargetPlatform.android) return true;
+    var status = await Permission.notification.status;
+    if (status.isGranted || status.isLimited) return true;
+    status = await Permission.notification.request();
+    return status.isGranted || status.isLimited;
+  }
+
+  Future<bool> _ensureLocationPermission() async {
+    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) return false;
+    var permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+    }
+    return permission == LocationPermission.always ||
+        permission == LocationPermission.whileInUse;
+  }
+
+  Future<bool> _ensureMicPermission() async {
+    var status = await Permission.microphone.status;
+    if (!mounted) return false;
+    if (!status.isGranted) {
+      status = await Permission.microphone.request();
+    }
+    if (!mounted) return false;
+
+    if (status.isGranted) {
+      setState(() {
+        _micGranted = true;
+        _micMessage = _l10n.micAvailable;
+      });
+      return true;
+    }
+
+    setState(() {
+      _micGranted = false;
+      _micMessage = status.isPermanentlyDenied
+          ? _l10n.micAccessDenied
+          : _l10n.micAccessRequired;
+    });
+    return false;
   }
 
   Future<void> _initMicAndWake() async {
@@ -627,11 +1089,17 @@ class _JanarymHomeState extends State<JanarymHome>
     if (!mounted) return;
 
     if (status.isGranted) {
+      unawaited(_ensureNotificationPermission());
       setState(() {
         _micGranted = true;
         _micMessage = _l10n.micAvailable;
       });
-      if (_alwaysDialogMode) {
+      if (_requireWakeWord) {
+        _wakeWordOnlyMode = true;
+        _stopWakeFallbackLoop();
+        _setCircleState(CircleState.wake);
+        await _wakeService.start();
+      } else if (_alwaysDialogMode) {
         await _wakeService.stop();
         _startWakeFallbackLoop();
       } else {
@@ -639,6 +1107,7 @@ class _JanarymHomeState extends State<JanarymHome>
         await _wakeService.start();
       }
       _maybeStartOnboardingDialog();
+      unawaited(_announceModesOnStartup());
     } else if (status.isPermanentlyDenied) {
       setState(() {
         _micGranted = false;
@@ -653,6 +1122,10 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   Future<void> _initCameraLive() async {
+    if (!_modeNeedsLiveCamera(_assistantMode)) {
+      await _stopCameraStream(reason: 'mode_without_camera');
+      return;
+    }
     if (_cameraInitInProgress) return;
     _cameraInitInProgress = true;
     try {
@@ -710,7 +1183,8 @@ class _JanarymHomeState extends State<JanarymHome>
             _cameraMessage = _l10n.cameraLiveOn;
             _cameraError = '';
           });
-          debugPrint('[Camera] stream already running (reason=$reason)');
+          appLog('[Camera] stream already running (reason=$reason)');
+          unawaited(_syncHeavyServices());
           return;
         }
         if (existing.value.isInitialized) {
@@ -722,18 +1196,19 @@ class _JanarymHomeState extends State<JanarymHome>
               _cameraMessage = _l10n.cameraLiveOn;
               _cameraError = '';
             });
-            debugPrint(
+            appLog(
               '[Camera] stream started on existing controller (reason=$reason)',
             );
+            unawaited(_syncHeavyServices());
             return;
           } catch (e) {
-            debugPrint(
+            appLog(
               '[Camera] existing controller start failed; recreating '
               '(reason=$reason): $e',
             );
           }
         } else {
-          debugPrint(
+          appLog(
             '[Camera] existing controller not initialized; recreating '
             '(reason=$reason)',
           );
@@ -774,10 +1249,15 @@ class _JanarymHomeState extends State<JanarymHome>
       _lastFrame = null;
       _lastFrameAt = null;
       _lastFrameMs = 0;
+      _cameraProcessedFrames = 0;
+      _cameraDroppedFrames = 0;
+      _cameraPreviewFps = 0;
+      _cameraFpsWindowStartedMs = 0;
       createdController = CameraController(
         back,
-        ResolutionPreset.medium,
+        ResolutionPreset.high,
         enableAudio: false,
+        fps: 30,
         imageFormatGroup: ImageFormatGroup.yuv420,
       );
 
@@ -792,7 +1272,8 @@ class _JanarymHomeState extends State<JanarymHome>
         _cameraMessage = _l10n.cameraLiveOn;
         _cameraError = '';
       });
-      debugPrint('[Camera] stream started on new controller (reason=$reason)');
+      appLog('[Camera] stream started on new controller (reason=$reason)');
+      unawaited(_syncHeavyServices());
     } catch (e) {
       final stale = createdController;
       if (stale != null) {
@@ -811,7 +1292,8 @@ class _JanarymHomeState extends State<JanarymHome>
         _cameraError = _l10n.cameraStartFailed('$e');
         _cameraMessage = _l10n.cameraLiveOff;
       });
-      debugPrint('[Camera] stream start failed (reason=$reason): $e');
+      appLog('[Camera] stream start failed (reason=$reason): $e');
+      unawaited(_syncHeavyServices());
     } finally {
       _cameraStartInProgress = false;
     }
@@ -824,9 +1306,9 @@ class _JanarymHomeState extends State<JanarymHome>
       if (controller.value.isStreamingImages) {
         await controller.stopImageStream();
       }
-      debugPrint('[Camera] stream stopped (reason=$reason)');
+      appLog('[Camera] stream stopped (reason=$reason)');
     } catch (e) {
-      debugPrint('[Camera] stream stop error (reason=$reason): $e');
+      appLog('[Camera] stream stop error (reason=$reason): $e');
     }
     if (mounted) {
       setState(() {
@@ -834,6 +1316,7 @@ class _JanarymHomeState extends State<JanarymHome>
         _cameraMessage = _l10n.cameraLiveOff;
       });
     }
+    unawaited(_syncHeavyServices());
   }
 
   Future<void> _disposeCamera() async {
@@ -844,6 +1327,10 @@ class _JanarymHomeState extends State<JanarymHome>
     _lastFrame = null;
     _lastFrameAt = null;
     _lastFrameMs = 0;
+    _cameraProcessedFrames = 0;
+    _cameraDroppedFrames = 0;
+    _cameraPreviewFps = 0;
+    _cameraFpsWindowStartedMs = 0;
     if (controller == null) return;
     try {
       if (controller.value.isStreamingImages) {
@@ -853,13 +1340,17 @@ class _JanarymHomeState extends State<JanarymHome>
     try {
       await controller.dispose();
     } catch (_) {}
+    unawaited(_syncHeavyServices());
   }
 
   void _startCameraKeepAlive() {
     _cameraKeepAliveTimer?.cancel();
     _cameraKeepAliveTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       if (!mounted) return;
-      if (_assistantMode != AssistantMode.general) return;
+      if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+        return;
+      }
+      if (!_modeNeedsLiveCamera(_assistantMode)) return;
       if (!_cameraGranted) return;
       if (_cameraStreaming || _cameraStartInProgress || _cameraInitInProgress) {
         return;
@@ -871,42 +1362,100 @@ class _JanarymHomeState extends State<JanarymHome>
   void _onCameraImage(CameraImage image) {
     final now = DateTime.now().millisecondsSinceEpoch;
     if (image.planes.length < 3) return;
-
-    // ── Existing vision/LLM frame capture (400ms throttle) ────────────
-    if (now - _lastFrameMs < 400) return;
+    if (now - _lastFrameMs < _frameCaptureThrottleMs) {
+      if (_featureFlags.developerDiagnosticsEnabled) {
+        _cameraDroppedFrames++;
+      }
+      return;
+    }
     _lastFrameMs = now;
-
-    final yPlane = Uint8List.fromList(image.planes[0].bytes);
-    final uPlane = Uint8List.fromList(image.planes[1].bytes);
-    final vPlane = Uint8List.fromList(image.planes[2].bytes);
-
-    _lastFrame = _YuvFrame(
-      width: image.width,
-      height: image.height,
-      y: yPlane,
-      u: uPlane,
-      v: vPlane,
-      yRowStride: image.planes[0].bytesPerRow,
-      uvRowStride: image.planes[1].bytesPerRow,
-      uvPixelStride: image.planes[1].bytesPerPixel ?? 1,
+    _lastFrame = _cameraFrameStore.update(
+      image,
+      rotationDegrees: _cameraImageRotationDegrees(),
     );
+    if (_lastFrame == null) return;
     _lastFrameAt = DateTime.now();
+    if (_featureFlags.developerDiagnosticsEnabled) {
+      _cameraProcessedFrames++;
+      if (_cameraFpsWindowStartedMs == 0) {
+        _cameraFpsWindowStartedMs = now;
+      }
+      final elapsed = now - _cameraFpsWindowStartedMs;
+      if (elapsed >= 1000) {
+        if (mounted) {
+          setState(() {
+            _cameraPreviewFps = ((_cameraProcessedFrames * 1000) / elapsed)
+                .round();
+          });
+        } else {
+          _cameraPreviewFps = ((_cameraProcessedFrames * 1000) / elapsed)
+              .round();
+        }
+        _cameraProcessedFrames = 0;
+        _cameraFpsWindowStartedMs = now;
+      }
+    }
+
+    if (now - _lastPerceptionEventMs >= 900) {
+      _lastPerceptionEventMs = now;
+      _perceptionEventBus.publish(
+        PerceptionEvent(
+          id: 'frame_$now',
+          type: PerceptionEventType.detection,
+          timestampMs: now,
+          confidence: 1,
+          label: 'live_frame',
+          meta: <String, Object?>{
+            'mode': _assistantMode.name,
+            'width': image.width,
+            'height': image.height,
+          },
+        ),
+      );
+    }
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      if ((_alwaysDialogMode ||
-              _wakeService.state.value.status == WakeWordStatus.error) &&
-          _micGranted) {
-        _startWakeFallbackLoop();
+      unawaited(_syncHeavyServices());
+      if (_micGranted) {
+        if (_requireWakeWord &&
+            _wakeService.state.value.status != WakeWordStatus.error) {
+          unawaited(_wakeService.start());
+          _stopWakeFallbackLoop();
+        } else if (_wakeService.state.value.status == WakeWordStatus.error) {
+          _scheduleWakeRecoveryIfNeeded(_wakeService.state.value);
+          _syncWakeFallbackMode(_wakeService.state.value);
+        } else if (_alwaysDialogMode) {
+          _startWakeFallbackLoop();
+        }
       }
-      unawaited(_initCameraLive());
+      if (_modeNeedsLiveCamera(_assistantMode)) {
+        unawaited(_initCameraLive());
+      }
+      if (_featureFlags.aggressiveBackgroundCamera) {
+        unawaited(_startRuntimeServiceBestEffort(reason: 'lifecycle_resumed'));
+      }
     } else if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
       unawaited(_stopCameraStream(reason: 'lifecycle_${state.name}'));
       _stopWakeFallbackLoop();
+      _wakeRecoveryTimer?.cancel();
+      _wakeRecoveryTimer = null;
+      if (_featureFlags.aggressiveBackgroundCamera) {
+        unawaited(
+          _startRuntimeServiceBestEffort(reason: 'lifecycle_${state.name}'),
+        );
+      } else {
+        unawaited(
+          _stopRuntimeServiceBestEffort(reason: 'lifecycle_${state.name}'),
+        );
+      }
     } else if (state == AppLifecycleState.inactive) {
+      _textReaderLoopTimer?.cancel();
+      _textReaderLoopTimer = null;
+      unawaited(_syncReflexLoop());
       _stopWakeFallbackLoop();
     }
   }
@@ -916,7 +1465,7 @@ class _JanarymHomeState extends State<JanarymHome>
     if (current.finalWords.isNotEmpty &&
         current.finalWords != _lastLoggedFinal) {
       _lastLoggedFinal = current.finalWords;
-      debugPrint('[STT] final: ${current.finalWords}');
+      appLog('[STT] final: ${current.finalWords}');
     }
     if (mounted) {
       setState(() {});
@@ -925,11 +1474,26 @@ class _JanarymHomeState extends State<JanarymHome>
 
   void _handleWakeStateChange() {
     final wake = _wakeService.state.value;
+    if (wake.status == WakeWordStatus.error) {
+      _wakeErrorSince ??= DateTime.now();
+      _scheduleWakeRecoveryIfNeeded(wake);
+      _wakeFallbackEscalationTimer ??= Timer(_wakeFallbackErrorGrace, () {
+        _wakeFallbackEscalationTimer = null;
+        if (!mounted) return;
+        _syncWakeFallbackMode(_wakeService.state.value);
+      });
+    } else {
+      _wakeErrorSince = null;
+      _wakeFallbackEscalationTimer?.cancel();
+      _wakeFallbackEscalationTimer = null;
+      _wakeRecoveryAttempts = 0;
+      _lastWakeRecoveryAttemptAt = null;
+    }
     final signature =
         '${wake.status}|${wake.keywordMode}|${wake.keywordLabel}|${wake.lastError ?? ''}';
     if (signature != _lastLoggedWakeSignature) {
       _lastLoggedWakeSignature = signature;
-      debugPrint(
+      appLog(
         '[Wake] state=${wake.status.name} mode=${wake.keywordMode} '
         'keywords=${wake.keywordLabel} error=${wake.lastError ?? '-'}',
       );
@@ -938,6 +1502,260 @@ class _JanarymHomeState extends State<JanarymHome>
     if (mounted) {
       setState(() {});
     }
+  }
+
+  bool _shouldPreferWakeRecovery(WakeWordState wake) {
+    if (!_micGranted || _onboardingDialogInProgress) return false;
+    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return false;
+    }
+    if (wake.status != WakeWordStatus.error) return false;
+    return _requireWakeWord || _wakeWordOnlyMode;
+  }
+
+  void _scheduleWakeRecoveryIfNeeded(WakeWordState wake) {
+    if (!_shouldPreferWakeRecovery(wake)) return;
+    if (_wakeRecoveryInProgress || _wakeRecoveryTimer != null) return;
+    if (_wakeRecoveryAttempts >= _wakeRecoveryMaxAttempts) return;
+    if (_lastWakeRecoveryAttemptAt != null &&
+        DateTime.now().difference(_lastWakeRecoveryAttemptAt!) <
+            _wakeRecoveryRetryCooldown) {
+      return;
+    }
+    appLog(
+      '[WakeRecovery] scheduled attempt=${_wakeRecoveryAttempts + 1} '
+      'in=${_wakeRecoveryRetryCooldown.inMilliseconds}ms',
+    );
+    _wakeRecoveryTimer = Timer(_wakeRecoveryRetryCooldown, () {
+      _wakeRecoveryTimer = null;
+      unawaited(_attemptWakeRecovery());
+    });
+  }
+
+  Future<void> _attemptWakeRecovery() async {
+    if (_wakeRecoveryInProgress || !mounted) return;
+    final wake = _wakeService.state.value;
+    if (!_shouldPreferWakeRecovery(wake)) return;
+    if (_wakeRecoveryAttempts >= _wakeRecoveryMaxAttempts) {
+      _syncWakeFallbackMode(wake);
+      return;
+    }
+    _wakeRecoveryInProgress = true;
+    _wakeRecoveryAttempts += 1;
+    _lastWakeRecoveryAttemptAt = DateTime.now();
+    final restartListening =
+        !_wakeHandling &&
+        !_commandInFlight &&
+        !_followUpActive &&
+        !_sttService.isListening;
+    appLog(
+      '[WakeRecovery] attempt=$_wakeRecoveryAttempts '
+      'restart=$restartListening',
+    );
+    try {
+      final recovered = await _wakeService.recover(
+        restartListening: restartListening,
+      );
+      if (!mounted) return;
+      if (recovered) {
+        _wakeErrorSince = null;
+        _wakeFallbackEscalationTimer?.cancel();
+        _wakeFallbackEscalationTimer = null;
+        _wakeRecoveryAttempts = 0;
+        _lastWakeRecoveryAttemptAt = null;
+        appLog('[WakeRecovery] recovered');
+        if ((_requireWakeWord || _wakeWordOnlyMode) &&
+            !_sttService.isListening) {
+          _setCircleState(CircleState.wake);
+        }
+        _stopWakeFallbackLoop();
+        return;
+      }
+      appLog('[WakeRecovery] failed attempt=$_wakeRecoveryAttempts');
+      final currentWake = _wakeService.state.value;
+      if (currentWake.status == WakeWordStatus.error &&
+          _wakeRecoveryAttempts < _wakeRecoveryMaxAttempts) {
+        _scheduleWakeRecoveryIfNeeded(currentWake);
+      }
+      _syncWakeFallbackMode(currentWake);
+    } finally {
+      _wakeRecoveryInProgress = false;
+    }
+  }
+
+  void _handleModeOrchestratorChange() {
+    if (!mounted) return;
+    setState(() {});
+    unawaited(_syncHeavyServices());
+  }
+
+  Future<void> _syncHeavyServices() async {
+    await _reflexEngine.setVoicePriority(_voicePriorityWindowActive);
+    _syncTextReaderLoop();
+    await _syncReflexLoop();
+  }
+
+  void _enterVoicePriorityWindow({required String reason}) {
+    if (_voicePriorityWindowActive) return;
+    _voicePriorityWindowActive = true;
+    appLog('[VoicePriority] enter reason=$reason');
+    unawaited(_syncHeavyServices());
+  }
+
+  void _exitVoicePriorityWindow({required String reason}) {
+    if (!_voicePriorityWindowActive) return;
+    _voicePriorityWindowActive = false;
+    appLog('[VoicePriority] exit reason=$reason');
+    unawaited(_syncHeavyServices());
+  }
+
+  Future<void> _syncReflexLoop() async {
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    final shouldRun =
+        lifecycle == AppLifecycleState.resumed &&
+        _featureFlags.reflexEnabled &&
+        _featureFlags.safetyEnabled &&
+        _cameraGranted &&
+        _cameraStreaming;
+    if (shouldRun) {
+      await _reflexEngine.setSafetyLevel(_currentReflexSafetyLevel());
+      await _reflexEngine.start();
+    } else {
+      await _reflexEngine.stop();
+    }
+  }
+
+  void _handleReflexOverlayChanged(List<ReflexDetection> detections) {
+    if (!mounted) return;
+    final entries = detections
+        .map(
+          (detection) => BBoxOverlayEntry(
+            bbox: detection.bbox,
+            label: _reflexDisplayLabel(detection.hazardLabel),
+            confidence: detection.confidence,
+            severity: switch (detection.severity) {
+              ReflexSeverity.high => BBoxSeverity.danger,
+              ReflexSeverity.medium => BBoxSeverity.medium,
+              ReflexSeverity.safe => BBoxSeverity.safe,
+            },
+            distanceM: detection.distanceM,
+          ),
+        )
+        .toList(growable: false);
+    ReflexDetection? latestHazard;
+    for (final detection in detections) {
+      if (detection.severity != ReflexSeverity.safe) {
+        latestHazard = detection;
+        break;
+      }
+    }
+    setState(() {
+      _latestReflexDetections = detections;
+      _reflexBBoxes = entries;
+      _latestHazardHint = latestHazard == null
+          ? ''
+          : _reflexDisplayLabel(latestHazard.hazardLabel);
+    });
+  }
+
+  Future<void> _handleReflexAlert(ReflexAlert alert) async {
+    if (_voicePriorityWindowActive ||
+        _wakeHandling ||
+        _commandInFlight ||
+        _followUpActive ||
+        _isSpeaking) {
+      return;
+    }
+    final hazard = _reflexDisplayLabel(alert.hazardLabel).toLowerCase();
+    final direction = switch (alert.direction) {
+      'left' => _voiceText(ru: 'слева', kk: 'сол жақта'),
+      'right' => _voiceText(ru: 'справа', kk: 'оң жақта'),
+      _ => _voiceText(ru: 'прямо перед вами', kk: 'тура алдында'),
+    };
+    final action = switch (alert.recommendedAction) {
+      'step_right' => _voiceText(ru: 'шаг вправо', kk: 'оңға қадам жасаңыз'),
+      'step_left' => _voiceText(ru: 'шаг влево', kk: 'солға қадам жасаңыз'),
+      _ => _voiceText(ru: 'шаг назад', kk: 'артқа шегініңіз'),
+    };
+    final line = _voiceText(
+      ru: 'Опасность $direction, $action.',
+      kk: 'Қауіп $direction, $action.',
+    );
+    _latestHazardHint = hazard;
+    await _speak(line);
+  }
+
+  void _handleReflexMetrics(ReflexRuntimeMetrics metrics) {
+    if (!_featureFlags.developerDiagnosticsEnabled || !mounted) return;
+    setState(() {
+      _reflexInferenceLatencyMs = metrics.inferenceLatencyMs;
+      _reflexDetectionsCount = metrics.detections;
+    });
+  }
+
+  ReflexSafetyLevel _currentReflexSafetyLevel() {
+    final perception = _currentModeDescriptor().perception;
+    return perception.safetyMax
+        ? ReflexSafetyLevel.max
+        : ReflexSafetyLevel.normal;
+  }
+
+  String _reflexDisplayLabel(String hazardLabel) {
+    switch (hazardLabel) {
+      case 'car':
+        return _voiceText(ru: 'машина', kk: 'көлік');
+      case 'bike':
+        return _voiceText(ru: 'велосипед', kk: 'велосипед');
+      case 'hot_surface':
+        return _voiceText(ru: 'плита', kk: 'пеш');
+      case 'sharp_object':
+        return _voiceText(ru: 'острый предмет', kk: 'өткір зат');
+      case 'stairs_edge':
+        return _voiceText(ru: 'край лестницы', kk: 'баспалдақ жиегі');
+      default:
+        return hazardLabel.replaceAll('_', ' ');
+    }
+  }
+
+  Future<CameraFrameSnapshot?> _captureLatestFrameForReflex() async {
+    final frame = _lastFrame;
+    final frameAt = _lastFrameAt;
+    if (!_cameraStreaming || frame == null || frameAt == null) return null;
+    final ageMs = DateTime.now().difference(frameAt).inMilliseconds;
+    if (ageMs > 900) return null;
+    return frame;
+  }
+
+  Future<void> _startRuntimeServiceBestEffort({required String reason}) async {
+    await _ensureNotificationPermission();
+    final started = await AndroidRuntimeService.start(reason: reason);
+    if (!mounted) return;
+    _runtimeServiceRunning = started || _runtimeServiceRunning;
+    if (started) {
+      appLog('[RuntimeService] started (reason=$reason)');
+    }
+  }
+
+  Future<void> _stopRuntimeServiceBestEffort({required String reason}) async {
+    final stopped = await AndroidRuntimeService.stop(reason: reason);
+    if (!mounted) return;
+    if (stopped) {
+      _runtimeServiceRunning = false;
+      appLog('[RuntimeService] stopped (reason=$reason)');
+    }
+  }
+
+  Future<void> _announceModesOnStartup() async {
+    if (!_micGranted) return;
+    if (_followUpActive || _commandInFlight || _isSpeaking) return;
+    if (_featureFlags.mostlySilentNarration) return;
+    final available = _availableModes().map(_spokenModeDisplayName).join(', ');
+    if (available.isEmpty) return;
+    final line = _voiceText(
+      ru: 'Доступные режимы: $available.',
+      kk: 'Қолжетімді режимдер: $available.',
+    );
+    await _speak(line);
   }
 
   Future<void> _initPersonalization() async {
@@ -952,7 +1770,7 @@ class _JanarymHomeState extends State<JanarymHome>
         _maybeStartOnboardingDialog();
       }
     } catch (e) {
-      debugPrint('[Personalization] init error: $e');
+      appLog('[Personalization] init error: $e');
     }
   }
 
@@ -976,7 +1794,7 @@ class _JanarymHomeState extends State<JanarymHome>
         ),
       );
     } catch (e) {
-      debugPrint('[Personalization] route record error: $e');
+      appLog('[Personalization] route record error: $e');
     }
   }
 
@@ -989,21 +1807,23 @@ class _JanarymHomeState extends State<JanarymHome>
     final intensity = snapshot.profile.warningIntensity;
     final firstFear = fears.first;
     if (intensity >= 3) {
-      if (widget.appLanguage == AppLanguage.kk) {
-        return 'Абай болыңыз, $firstFear қа байланысты: $text';
-      }
-      return 'Внимание, учитываю ваш риск "$firstFear": $text';
+      return _voiceText(
+        ru: 'Внимание, учитываю ваш риск "$firstFear": $text',
+        kk: 'Абай болыңыз, $firstFear қа байланысты: $text',
+      );
     }
-    if (widget.appLanguage == AppLanguage.kk) {
-      return 'Ескерту: $text';
-    }
-    return 'Предупреждение: $text';
+    return _voiceText(ru: 'Предупреждение: $text', kk: 'Ескерту: $text');
   }
 
   void _handleNavigationStateChange() {
     final navState = _navigationController.state.value;
     if (_assistantMode == AssistantMode.navigation && !navState.modeEnabled) {
       _assistantMode = AssistantMode.general;
+      _modeOrchestrator.transitionTo(
+        _toJanarymMode(_assistantMode),
+        subState: 'active',
+        autoTriggeredBy: 'nav_mode_disabled',
+      );
       unawaited(_initCameraLive());
     }
     _syncNavigationCamera(navState);
@@ -1068,11 +1888,13 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   void _startWakeFallbackLoop() {
-    if (_wakeFallbackActive || !_micGranted || _wakeWordOnlyMode) return;
+    if (_wakeFallbackActive || !_micGranted || _wakeWordOnlyMode) {
+      return;
+    }
     _wakeFallbackActive = true;
     _wakeFallbackStopRequested = false;
     _setCircleState(CircleState.wake);
-    debugPrint('[WakeFallback] start');
+    appLog('[WakeFallback] start');
     unawaited(_runWakeFallbackLoop());
   }
 
@@ -1080,6 +1902,7 @@ class _JanarymHomeState extends State<JanarymHome>
     if (!_wakeFallbackActive && !_wakeFallbackLoopRunning) return;
     _wakeFallbackActive = false;
     _wakeFallbackStopRequested = true;
+    appLog('[WakeFallback] stop');
   }
 
   Future<void> _runWakeFallbackLoop() async {
@@ -1092,27 +1915,36 @@ class _JanarymHomeState extends State<JanarymHome>
             _followUpActive ||
             _wakeHandling ||
             _onboardingDialogInProgress ||
+            _isSpeaking ||
             _sttService.isListening) {
           await Future.delayed(_wakeFallbackIdleWait);
           continue;
         }
         _setCircleState(CircleState.wake);
 
-        final text = await _sttService.startCommandListening(
-          durationSeconds: _isSpeaking
-              ? 3
-              : (_assistantMode == AssistantMode.navigation ? 11 : 7),
-          minListenMs: _isSpeaking
-              ? 280
-              : (_assistantMode == AssistantMode.navigation ? 1100 : 420),
-          silenceHoldMs: _isSpeaking
-              ? 520
-              : (_assistantMode == AssistantMode.navigation ? 1800 : 850),
-          ampPollMs: _isSpeaking ? 95 : 115,
-          restartCooldownMs: _isSpeaking
-              ? 180
-              : (_assistantMode == AssistantMode.navigation ? 320 : 220),
-        );
+        final fallbackWakeOnly = _requireWakeWord || _wakeWordOnlyMode;
+        final text = fallbackWakeOnly
+            ? await _sttService.startCommandListening(
+                profile: CommandListenProfile.quickWake,
+                allowAutoLanguage: true,
+                maxNoSpeechMs: 1200,
+              )
+            : await _sttService.startCommandListening(
+                allowAutoLanguage: true,
+                durationSeconds: _isSpeaking
+                    ? 3
+                    : (_assistantMode == AssistantMode.navigation ? 11 : 7),
+                minListenMs: _isSpeaking
+                    ? 280
+                    : (_assistantMode == AssistantMode.navigation ? 1100 : 420),
+                silenceHoldMs: _isSpeaking
+                    ? 520
+                    : (_assistantMode == AssistantMode.navigation ? 1800 : 850),
+                ampPollMs: _isSpeaking ? 95 : 115,
+                restartCooldownMs: _isSpeaking
+                    ? 180
+                    : (_assistantMode == AssistantMode.navigation ? 320 : 220),
+              );
         if (!mounted || _wakeFallbackStopRequested) break;
         final heard = (text ?? '').trim();
         if (heard.isEmpty) {
@@ -1122,11 +1954,11 @@ class _JanarymHomeState extends State<JanarymHome>
 
         if (_isSpeaking) {
           if (_containsWakeWordCandidate(heard)) {
-            debugPrint('[Dialog] wake phrase during speaking: $heard');
+            appLog('[Dialog] wake phrase during speaking: $heard');
             await _handleWakeDetected();
           } else if (!_requireWakeWord &&
               _shouldProcessSpeechInterruption(heard)) {
-            debugPrint('[Dialog] nav interruption: $heard');
+            appLog('[Dialog] nav interruption: $heard');
             await _handleDirectFallbackCommand(heard);
           }
           await Future.delayed(_wakeFallbackAfterListenWait);
@@ -1134,7 +1966,7 @@ class _JanarymHomeState extends State<JanarymHome>
         }
 
         if (_containsWakeWordCandidate(heard)) {
-          debugPrint('[Dialog] wake phrase: $heard');
+          appLog('[Dialog] wake phrase: $heard');
           await _handleWakeDetected();
           await Future.delayed(_wakeFallbackAfterListenWait);
           continue;
@@ -1143,7 +1975,7 @@ class _JanarymHomeState extends State<JanarymHome>
         if (!_requireWakeWord &&
             _alwaysDialogMode &&
             _isDirectFallbackCommand(heard)) {
-          debugPrint('[Dialog] direct command: $heard');
+          appLog('[Dialog] direct command: $heard');
           await _handleDirectFallbackCommand(heard);
         }
 
@@ -1152,7 +1984,7 @@ class _JanarymHomeState extends State<JanarymHome>
     } finally {
       _wakeFallbackLoopRunning = false;
       if (_wakeFallbackStopRequested) {
-        debugPrint('[WakeFallback] stop');
+        appLog('[WakeFallback] stop');
       }
     }
   }
@@ -1160,6 +1992,12 @@ class _JanarymHomeState extends State<JanarymHome>
   bool _containsWakeWordCandidate(String text) {
     final normalized = _router.normalize(text).replaceAll('-', ' ');
     final compact = normalized.replaceAll(' ', '');
+    final wakeRootPattern = RegExp(
+      r'\b(жанар(?:ым|им|ум|ом|ам|а)?|janar(?:ym|im|um|a)?|zhanar(?:ym|im|um|a)?)\b',
+    );
+    if (wakeRootPattern.hasMatch(normalized)) {
+      return true;
+    }
     for (final wake in CommandRouter.wakeWordVariants) {
       final wakeNormalized = _router.normalize(wake).replaceAll('-', ' ');
       final wakeCompact = wakeNormalized.replaceAll(' ', '');
@@ -1198,6 +2036,8 @@ class _JanarymHomeState extends State<JanarymHome>
       case AssistantModeIntent.startOnboarding:
       case AssistantModeIntent.restartOnboarding:
       case AssistantModeIntent.updateUserFear:
+      case AssistantModeIntent.readText:
+      case AssistantModeIntent.switchVoiceLanguage:
         return true;
       case AssistantModeIntent.unknown:
         return _looksLikeFreeDestination(text);
@@ -1219,14 +2059,17 @@ class _JanarymHomeState extends State<JanarymHome>
     ).hasMatch(normalized)) {
       return false;
     }
-    if (CommandRouter.exitNavModeTriggers.any(normalized.contains))
+    if (CommandRouter.exitNavModeTriggers.any(normalized.contains)) {
       return false;
+    }
     if (CommandRouter.navStopTriggers.any(normalized.contains)) return false;
     if (CommandRouter.navStatusTriggers.any(normalized.contains)) return false;
-    if (CommandRouter.navNextStepTriggers.any(normalized.contains))
+    if (CommandRouter.navNextStepTriggers.any(normalized.contains)) {
       return false;
-    if (CommandRouter.navRejectChoiceTriggers.any(normalized.contains))
+    }
+    if (CommandRouter.navRejectChoiceTriggers.any(normalized.contains)) {
       return false;
+    }
     if (CommandRouter.repeatTriggers.any(normalized.contains)) return false;
     if (CommandRouter.describeTriggers.any(normalized.contains)) return false;
     return true;
@@ -1265,6 +2108,8 @@ class _JanarymHomeState extends State<JanarymHome>
         case AssistantModeIntent.startOnboarding:
         case AssistantModeIntent.restartOnboarding:
         case AssistantModeIntent.updateUserFear:
+        case AssistantModeIntent.readText:
+        case AssistantModeIntent.switchVoiceLanguage:
           return true;
         case AssistantModeIntent.unknown:
           if (_looksLikeFreeDestination(normalized)) {
@@ -1279,7 +2124,8 @@ class _JanarymHomeState extends State<JanarymHome>
 
     final hasIntentKeyword =
         CommandRouter.describeTriggers.any(normalized.contains) ||
-        CommandRouter.repeatTriggers.any(normalized.contains);
+        CommandRouter.repeatTriggers.any(normalized.contains) ||
+        CommandRouter.readTextTriggers.any(normalized.contains);
     if (hasIntentKeyword) return true;
 
     final words = normalized.split(' ').where((w) => w.isNotEmpty).length;
@@ -1298,8 +2144,8 @@ class _JanarymHomeState extends State<JanarymHome>
       _setCircleState(CircleState.listening);
       await _handleUserText(text);
     } catch (e) {
-      debugPrint('[WakeFallback] direct command failed: $e');
-      await _speak(_l10n.commandProcessingFailed);
+      appLog('[WakeFallback] direct command failed: $e');
+      await _speak(_voiceL10n.commandProcessingFailed);
     } finally {
       _commandInFlight = false;
       _restoreWakeStateIfIdle();
@@ -1311,50 +2157,86 @@ class _JanarymHomeState extends State<JanarymHome>
         _isSpeaking || _gptStatus == GptStatus.loading || _followUpActive;
     if (_wakeHandling && !canBargeIn) return;
     _wakeHandling = true;
+    _lastWakeDetectedMs = DateTime.now().millisecondsSinceEpoch;
+    _lastWakeAckDoneMs = _lastWakeDetectedMs;
+    _lastWakeSttOpenedMs = _lastWakeDetectedMs;
     _setCircleState(CircleState.listening);
     try {
-      _wakeWordOnlyMode = false;
-      debugPrint('[Wake] detected');
-      setState(() => _lastWakeAt = DateTime.now());
-      _requestId++;
-      await _tts.stop();
-      unawaited(_playWakeCue());
-      unawaited(_vibrateStart());
-      final wakeReply = _resolvedWakeReplyText();
-      if (wakeReply.isNotEmpty) {
-        await _speakWakeReply(wakeReply);
-      }
-      if (_followUpActive) {
-        await _sttService.stop();
-        _followUpActive = false;
-      }
-      _commandInFlight = false;
-      await _runCommandFlow(reason: 'wake');
+      await _runWakeAcknowledgeThenListen();
     } finally {
       _wakeHandling = false;
       _restoreWakeStateIfIdle();
     }
   }
 
-  String _resolvedWakeReplyText() {
-    if (!_wakeReplyEnabled) return '';
-    if (widget.appLanguage == AppLanguage.kk) {
-      if (_wakeReplyTextKk.trim().isNotEmpty) return _wakeReplyTextKk.trim();
-      return _l10n.wakeReplyListening;
+  void _openModePickerFromWake() {
+    if (!mounted) return;
+    _modePickerAutoCloseTimer?.cancel();
+    if (!_modePickerOpen) {
+      setState(() => _modePickerOpen = true);
     }
-    if (_wakeReplyTextRu.trim().isNotEmpty) return _wakeReplyTextRu.trim();
-    return _l10n.wakeReplyListening;
+    _modePickerAutoCloseTimer = Timer(const Duration(seconds: 4), () {
+      if (!mounted) return;
+      if (_modePickerOpen) {
+        setState(() => _modePickerOpen = false);
+      }
+    });
   }
 
-  Future<void> _speakWakeReply(String text) async {
+  String _resolvedWakeAckText() {
+    if (!_wakeReplyEnabled) return '';
+    if (_voiceIsKazakh) {
+      return _wakeAckTextKk.trim();
+    }
+    return _wakeAckTextRu.trim();
+  }
+
+  Future<void> _runWakeAcknowledgeThenListen() async {
+    _openModePickerFromWake();
+    _wakeWordOnlyMode = false;
+    _stopWakeFallbackLoop();
+    appLog('[WakeFlow] detected');
+    _enterVoicePriorityWindow(reason: 'wake_detected');
+    if (mounted) {
+      setState(() => _lastWakeAt = DateTime.now());
+    }
+    _requestId++;
+    await _tts.stop();
+    await _wakeService.stop();
+    if (_followUpActive) {
+      await _sttService.stop();
+      _followUpActive = false;
+    }
+    _commandInFlight = false;
+    unawaited(_playWakeCue());
+    unawaited(_vibrateStart());
+    final ack = _resolvedWakeAckText();
+    if (ack.isNotEmpty) {
+      appLog('[WakeFlow] ack_start');
+      await _speakWakeAckFast(ack);
+      _lastWakeAckDoneMs = DateTime.now().millisecondsSinceEpoch;
+      appLog('[WakeFlow] ack_done');
+    } else {
+      _lastWakeAckDoneMs = DateTime.now().millisecondsSinceEpoch;
+      appLog('[WakeFlow] ack_skip');
+    }
+    await _runCommandFlow(reason: 'wake');
+  }
+
+  Future<void> _speakWakeAckFast(String text) async {
     final line = text.trim();
     if (line.isEmpty) return;
     _setCircleState(CircleState.listening);
     _isSpeaking = true;
     try {
+      await _ensureTtsLocaleForCurrentMode(force: true);
       await _tts.stop();
+      await _tts.setSpeechRate(_wakeAckSpeechRate);
+      await _tts.setPitch(_ttsPitch);
       await _tts.speak(line);
     } finally {
+      await _tts.setSpeechRate(_ttsSpeechRate);
+      await _tts.setPitch(_ttsPitch);
       _isSpeaking = false;
       _setCircleState(CircleState.listening);
     }
@@ -1362,6 +2244,18 @@ class _JanarymHomeState extends State<JanarymHome>
 
   Future<void> _armWakeWordWaiting() async {
     if (!_micGranted) return;
+    if (_requireWakeWord) {
+      _wakeWordOnlyMode = true;
+      _stopWakeFallbackLoop();
+      _setCircleState(CircleState.wake);
+      if (_wakeService.state.value.status != WakeWordStatus.error) {
+        await _wakeService.start();
+      } else {
+        _scheduleWakeRecoveryIfNeeded(_wakeService.state.value);
+        _syncWakeFallbackMode(_wakeService.state.value);
+      }
+      return;
+    }
     if (_alwaysDialogMode) {
       _wakeWordOnlyMode = false;
       _startWakeFallbackLoop();
@@ -1374,8 +2268,8 @@ class _JanarymHomeState extends State<JanarymHome>
     if (_wakeService.state.value.status != WakeWordStatus.error) {
       await _wakeService.start();
     } else {
-      _wakeWordOnlyMode = false;
-      _startWakeFallbackLoop();
+      _scheduleWakeRecoveryIfNeeded(_wakeService.state.value);
+      _syncWakeFallbackMode(_wakeService.state.value);
     }
   }
 
@@ -1386,40 +2280,65 @@ class _JanarymHomeState extends State<JanarymHome>
     _commandInFlight = true;
     final localRequestId = _requestId;
     final wakeHealthy =
-        (_wakeWordOnlyMode || !_alwaysDialogMode) &&
+        _requireWakeWord &&
         _wakeService.state.value.status != WakeWordStatus.error;
     try {
+      _enterVoicePriorityWindow(reason: 'command_$reason');
       if (wakeHealthy) {
         await _wakeService.stop();
       }
-      debugPrint('[STT] start ($reason)');
+      final listenProfile = _assistantMode == AssistantMode.navigation
+          ? CommandListenProfile.navigation
+          : (reason == 'wake'
+                ? CommandListenProfile.quickWake
+                : CommandListenProfile.normal);
+      appLog(
+        reason == 'wake'
+            ? '[WakeFlow] stt_open profile=${listenProfile.name}'
+            : '[STT] start ($reason) profile=${listenProfile.name}',
+      );
+      _lastWakeSttOpenedMs = DateTime.now().millisecondsSinceEpoch;
+      if (reason != 'wake') {
+        await _playStartCue();
+        await _vibrateStart();
+      }
       _setCircleState(CircleState.listening);
 
-      final navMode = _assistantMode == AssistantMode.navigation;
       final text = await _sttService.startCommandListening(
-        durationSeconds: navMode ? 10 : 7,
-        minListenMs: navMode ? 1100 : 420,
-        silenceHoldMs: navMode ? 1700 : 820,
-        ampPollMs: navMode ? 120 : 100,
-        restartCooldownMs: navMode ? 300 : 200,
+        profile: listenProfile,
+        languageHint: _interactionLanguage,
+        allowAutoLanguage: reason == 'wake',
       );
 
-      // Restart wake-word immediately after STT to allow barge-in
+      // Re-arm dedicated wake engine immediately after command capture.
       if (wakeHealthy) {
         await _wakeService.start();
       }
 
       if (localRequestId != _requestId) return;
       final cleaned = (text ?? '').trim();
+      _modePickerAutoCloseTimer?.cancel();
+      if (_modePickerOpen && mounted) {
+        setState(() => _modePickerOpen = false);
+      }
       final normalized = _router.normalize(cleaned);
       final strippedWake = _router.stripWakeWords(normalized);
       final wakeOnlyPhrase =
           cleaned.isNotEmpty &&
           _containsWakeWordCandidate(cleaned) &&
           strippedWake.isEmpty;
+      if (reason == 'wake') {
+        final sttDoneAt = DateTime.now().millisecondsSinceEpoch;
+        appLog(
+          '[WakeFlow] stt_done text="$cleaned" '
+          'wake_to_ack=${_lastWakeAckDoneMs - _lastWakeDetectedMs}ms '
+          'ack_to_stt=${_lastWakeSttOpenedMs - _lastWakeAckDoneMs}ms '
+          'stt_total=${sttDoneAt - _lastWakeSttOpenedMs}ms',
+        );
+      }
 
       if (wakeOnlyPhrase) {
-        debugPrint('[STT] ignore wake-only phrase after activation: $cleaned');
+        appLog('[STT] ignore wake-only phrase after activation: $cleaned');
         await _playEndCue();
         await _vibrateEnd();
         _setCircleState(CircleState.wake);
@@ -1432,6 +2351,7 @@ class _JanarymHomeState extends State<JanarymHome>
       }
     } finally {
       _commandInFlight = false;
+      _exitVoicePriorityWindow(reason: 'command_$reason');
       _restoreWakeStateIfIdle();
     }
   }
@@ -1441,17 +2361,66 @@ class _JanarymHomeState extends State<JanarymHome>
     final userText = directive.cleanedText.isEmpty
         ? text.trim()
         : directive.cleanedText;
+    final languageDetection = SpokenLanguageDetector.detect(
+      userText,
+      fallbackLanguage: _interactionLanguage,
+    );
+    _applyDetectedInteractionLanguage(
+      languageDetection,
+      userText,
+      forDialogSession: true,
+    );
     if (directive.onlyDirective) {
       await _speak(_dialogStyleConfirmationText());
       return;
     }
     if (_isContextResetCommand(userText)) {
       _clearDialogHistory();
-      await _speak(_l10n.dialogContextCleared);
+      await _speak(_voiceL10n.dialogContextCleared);
+      return;
+    }
+
+    final requestedMode = _detectModeSwitchByText(userText);
+    if (requestedMode != null) {
+      appLog(
+        '[WakeFlow] command_routed_at=${DateTime.now().millisecondsSinceEpoch} '
+        'mode=${requestedMode.name} text="${userText.trim()}"',
+      );
+      final changed = await _switchAssistantMode(
+        requestedMode,
+        reason: 'voice_mode_switch',
+      );
+      if (changed) {
+        _triggerFastModeFeedback();
+      } else {
+        await _speak(_modeUnavailableMessage(requestedMode));
+      }
+      return;
+    }
+
+    final autoTriggeredMode = _detectContextTriggeredMode(userText);
+    if (autoTriggeredMode != null && autoTriggeredMode != _assistantMode) {
+      await _switchAssistantMode(
+        autoTriggeredMode,
+        reason: 'context_trigger',
+        autoTriggered: true,
+      );
+    }
+
+    if (_isGoHomeRouteCommand(userText)) {
+      await _handleGoHomeShortcut(userText);
+      return;
+    }
+
+    if (await _maybeHandleTextReaderControlCommand(userText)) {
       return;
     }
 
     final decision = _router.route(userText);
+    if (decision.modeIntent == AssistantModeIntent.switchVoiceLanguage) {
+      await _speak(_voiceLanguageSwitchAck());
+      return;
+    }
     if (_personalizationReady) {
       if (decision.modeIntent == AssistantModeIntent.startOnboarding) {
         await _startOnboardingFlow();
@@ -1488,13 +2457,164 @@ class _JanarymHomeState extends State<JanarymHome>
       await _exitNavigationMode();
       return;
     }
+    if (await _handleGlobalNavigationIntent(userText, decision)) {
+      return;
+    }
 
     if (_assistantMode == AssistantMode.general) {
       await _handleGeneralModeCommand(userText, decision);
       return;
     }
+    if (_assistantMode == AssistantMode.navigation) {
+      await _handleNavigationModeCommand(userText, decision);
+      return;
+    }
+    await _handleTaskModeCommand(userText, decision);
+  }
 
-    await _handleNavigationModeCommand(userText, decision);
+  AssistantMode? _detectContextTriggeredMode(String text) {
+    final normalized = _router.normalize(text);
+    if (normalized.isEmpty) return null;
+
+    bool hasAny(List<String> variants) =>
+        variants.any((value) => normalized.contains(value));
+
+    if (hasAny([
+      'цена',
+      'ценник',
+      'калории',
+      'этикетка',
+      'документ',
+      'текст',
+    ])) {
+      return AssistantMode.textReader;
+    }
+    if (hasAny(['сдача', 'купюра', 'банкнота', 'фальшив', 'мошен'])) {
+      return AssistantMode.antiFraud;
+    }
+    if (hasAny(['что надеть', 'погода', 'дрескод', 'киім', 'dress'])) {
+      return AssistantMode.dressCode;
+    }
+    if (hasAny(['список покупок', 'купить', 'магазин', 'шопинг', 'shopping'])) {
+      return AssistantMode.shopping;
+    }
+    if (hasAny(['готовк', 'рецепт', 'плита', 'холодильник', 'cook'])) {
+      return AssistantMode.cooking;
+    }
+    if (hasAny(['запомни', 'память', 'помни это', 'есте сақта'])) {
+      return AssistantMode.memory;
+    }
+    if (hasAny(['найди', 'отыщи', 'find'])) {
+      return AssistantMode.find;
+    }
+    return null;
+  }
+
+  Future<bool> _handleGlobalNavigationIntent(
+    String rawText,
+    CommandDecision decision,
+  ) async {
+    switch (decision.modeIntent) {
+      case AssistantModeIntent.navStart:
+      case AssistantModeIntent.routeToPlaceLabel:
+      case AssistantModeIntent.navStop:
+      case AssistantModeIntent.navStatus:
+      case AssistantModeIntent.navNextStep:
+      case AssistantModeIntent.navRejectChoice:
+      case AssistantModeIntent.confirmYes:
+      case AssistantModeIntent.confirmNo:
+        if (_assistantMode != AssistantMode.navigation) {
+          await _enterNavigationMode();
+          if (_assistantMode != AssistantMode.navigation) {
+            return true;
+          }
+        }
+        await _handleNavigationModeCommand(rawText, decision);
+        return true;
+      case AssistantModeIntent.enterNavMode:
+      case AssistantModeIntent.exitNavMode:
+      case AssistantModeIntent.setPlaceLabel:
+      case AssistantModeIntent.startOnboarding:
+      case AssistantModeIntent.restartOnboarding:
+      case AssistantModeIntent.updateUserFear:
+      case AssistantModeIntent.readText:
+      case AssistantModeIntent.visionDescribe:
+      case AssistantModeIntent.repeat:
+      case AssistantModeIntent.switchVoiceLanguage:
+      case AssistantModeIntent.unknown:
+        return false;
+    }
+  }
+
+  bool _isGoHomeRouteCommand(String text) {
+    final normalized = _router.normalize(text);
+    if (normalized.isEmpty) return false;
+    const exactMatches = <String>{
+      'домой',
+      'веди домой',
+      'маршрут домой',
+      'проведи домой',
+      'до дома',
+      'домға',
+      'үйге',
+      'үйге апар',
+      'үйге жол сал',
+      'маршрут үйге',
+    };
+    if (exactMatches.contains(normalized)) return true;
+    const containsMatches = <String>[
+      'домой пожалуйста',
+      'проведи меня домой',
+      'маршрут до дома',
+      'отведи домой',
+      'апар үйге',
+      'үйге апарып жібер',
+      'үйге апаршы',
+    ];
+    return containsMatches.any(normalized.contains);
+  }
+
+  Future<void> _handleGoHomeShortcut(String rawText) async {
+    if (!_personalizationReady) {
+      await _speak(
+        _voiceText(
+          ru: 'Сначала сохраните домашнюю метку.',
+          kk: 'Әуелі үй меткасын сақтап алыңыз.',
+        ),
+      );
+      return;
+    }
+
+    final fallback = _voiceText(ru: 'домой', kk: 'үйге');
+    final decision = CommandDecision(
+      cleanedText: rawText.trim(),
+      modeIntent: AssistantModeIntent.routeToPlaceLabel,
+      destinationQuery: fallback,
+      placeLabelName: fallback,
+    );
+
+    final label = await _findPlaceLabelForRouteCommand(
+      decision,
+      fallbackDestination: fallback,
+    );
+    if (label == null) {
+      await _speak(
+        _voiceText(
+          ru: 'Домашняя метка не найдена. Сначала сохраните дом как метку.',
+          kk: 'Үй меткасы табылмады. Әуелі үйді метка ретінде сақтаңыз.',
+        ),
+      );
+      return;
+    }
+
+    if (_assistantMode != AssistantMode.navigation) {
+      await _enterNavigationMode();
+      if (_assistantMode != AssistantMode.navigation) {
+        return;
+      }
+    }
+
+    await _startRouteWithConfirmation(label.addressText, routeSource: 'label');
   }
 
   Future<void> _startOnboardingFlow() async {
@@ -1515,9 +2635,10 @@ class _JanarymHomeState extends State<JanarymHome>
     });
     await _personalizationController.restartOnboardingFromScratch();
     await _speakOnboardingLine(
-      widget.appLanguage == AppLanguage.kk
-          ? 'Жақсы, опрос қайта басталды.'
-          : 'Хорошо, начинаем опрос заново.',
+      _voiceText(
+        ru: 'Хорошо, начинаем опрос заново.',
+        kk: 'Жақсы, опрос қайта басталды.',
+      ),
     );
     _maybeStartOnboardingDialog();
   }
@@ -1538,9 +2659,10 @@ class _JanarymHomeState extends State<JanarymHome>
         _showOnboardingOverlay = false;
       });
       await _speakOnboardingLine(
-        widget.appLanguage == AppLanguage.kk
-            ? 'Жақсы, кейін жалғастырамыз.'
-            : 'Хорошо, продолжим позже.',
+        _voiceText(
+          ru: 'Хорошо, продолжим позже.',
+          kk: 'Жақсы, кейін жалғастырамыз.',
+        ),
       );
       return _OnboardingTurnResult.paused;
     }
@@ -1549,7 +2671,7 @@ class _JanarymHomeState extends State<JanarymHome>
         ? rawText.trim()
         : decision.cleanedText.trim();
     if (answer.isEmpty) {
-      await _speakOnboardingLine(_l10n.didntHearCommandRepeat);
+      await _speakOnboardingLine(_voiceL10n.didntHearCommandRepeat);
       return _OnboardingTurnResult.retry;
     }
 
@@ -1559,15 +2681,16 @@ class _JanarymHomeState extends State<JanarymHome>
         _showOnboardingOverlay = false;
       });
       await _speakOnboardingLine(
-        widget.appLanguage == AppLanguage.kk
-            ? 'Персонализация аяқталды. Енді дайынмын.'
-            : 'Персонализация завершена. Я готова к работе.',
+        _voiceText(
+          ru: 'Персонализация завершена. Я готова к работе.',
+          kk: 'Персонализация аяқталды. Енді дайынмын.',
+        ),
       );
       return _OnboardingTurnResult.completed;
     }
     if (promptNextQuestion) {
       final nextQuestion = _personalizationController.currentQuestionText(
-        widget.appLanguage,
+        _interactionLanguage,
       );
       if (nextQuestion.isNotEmpty) {
         await _speakOnboardingLine(nextQuestion);
@@ -1608,7 +2731,7 @@ class _JanarymHomeState extends State<JanarymHome>
           _personalizationController.onboardingRequired &&
           _personalizationController.onboardingActive) {
         final question = _personalizationController.currentQuestionText(
-          widget.appLanguage,
+          _interactionLanguage,
         );
         if (question.isEmpty) break;
         await _speakOnboardingLine(question);
@@ -1616,6 +2739,8 @@ class _JanarymHomeState extends State<JanarymHome>
 
         _setCircleState(CircleState.listening);
         final heard = await _sttService.startCommandListening(
+          languageHint: _interactionLanguage,
+          allowAutoLanguage: false,
           durationSeconds: 8,
           minListenMs: 240,
           silenceHoldMs: 720,
@@ -1630,9 +2755,10 @@ class _JanarymHomeState extends State<JanarymHome>
         if (decision.modeIntent == AssistantModeIntent.restartOnboarding) {
           await _personalizationController.restartOnboardingFromScratch();
           await _speakOnboardingLine(
-            widget.appLanguage == AppLanguage.kk
-                ? 'Жақсы, опрос қайта басталды.'
-                : 'Хорошо, начинаем опрос заново.',
+            _voiceText(
+              ru: 'Хорошо, начинаем опрос заново.',
+              kk: 'Жақсы, опрос қайта басталды.',
+            ),
           );
           continue;
         }
@@ -1649,8 +2775,11 @@ class _JanarymHomeState extends State<JanarymHome>
     } finally {
       _onboardingDialogInProgress = false;
       if (_micGranted) {
-        if (_alwaysDialogMode ||
-            _wakeService.state.value.status == WakeWordStatus.error) {
+        if (_wakeService.state.value.status == WakeWordStatus.error) {
+          _wakeWordOnlyMode = false;
+          _scheduleWakeRecoveryIfNeeded(_wakeService.state.value);
+          _syncWakeFallbackMode(_wakeService.state.value);
+        } else if (_alwaysDialogMode) {
           _wakeWordOnlyMode = false;
           _startWakeFallbackLoop();
         } else {
@@ -1676,17 +2805,19 @@ class _JanarymHomeState extends State<JanarymHome>
         : rawText.trim();
     if (fearText.isEmpty) {
       await _speak(
-        widget.appLanguage == AppLanguage.kk
-            ? 'Неден қорқатыныңызды айтыңыз.'
-            : 'Скажите, чего вы боитесь, и я запомню.',
+        _voiceText(
+          ru: 'Скажите, чего вы боитесь, и я запомню.',
+          kk: 'Неден қорқатыныңызды айтыңыз.',
+        ),
       );
       return;
     }
     await _personalizationController.updateFromDirectUserFact(fearText);
     await _speak(
-      widget.appLanguage == AppLanguage.kk
-          ? 'Жақсы, сақтап қойдым.'
-          : 'Поняла, запомнила это как важный риск.',
+      _voiceText(
+        ru: 'Поняла, запомнила это как важный риск.',
+        kk: 'Жақсы, сақтап қойдым.',
+      ),
     );
   }
 
@@ -1705,9 +2836,10 @@ class _JanarymHomeState extends State<JanarymHome>
 
     if (labelName.isEmpty) {
       await _speak(
-        widget.appLanguage == AppLanguage.kk
-            ? 'Қандай атаумен сақтау керек? Мысалы: үй.'
-            : 'Скажите название метки. Например: дом.',
+        _voiceText(
+          ru: 'Скажите название метки. Например: дом.',
+          kk: 'Қандай атаумен сақтау керек? Мысалы: үй.',
+        ),
       );
       return;
     }
@@ -1715,12 +2847,15 @@ class _JanarymHomeState extends State<JanarymHome>
     while (mounted) {
       if (addressText.isEmpty) {
         await _speak(
-          widget.appLanguage == AppLanguage.kk
-              ? '"$labelName" меткасы үшін мекенжайды айтыңыз.'
-              : 'Продиктуйте адрес для метки "$labelName".',
+          _voiceText(
+            ru: 'Продиктуйте адрес для метки "$labelName".',
+            kk: '"$labelName" меткасы үшін мекенжайды айтыңыз.',
+          ),
         );
         _setCircleState(CircleState.listening);
         final answer = await _sttService.startCommandListening(
+          languageHint: _interactionLanguage,
+          allowAutoLanguage: false,
           durationSeconds: 10,
           minListenMs: 320,
           silenceHoldMs: 1100,
@@ -1731,7 +2866,7 @@ class _JanarymHomeState extends State<JanarymHome>
         if (!mounted) return;
         addressText = _extractDestinationCandidate((answer ?? '').trim());
         if (addressText.isEmpty) {
-          await _speak(_l10n.didntHearCommandRepeat);
+          await _speak(_voiceL10n.didntHearCommandRepeat);
           continue;
         }
       }
@@ -1741,12 +2876,15 @@ class _JanarymHomeState extends State<JanarymHome>
       );
       if (candidate == null) {
         await _speak(
-          widget.appLanguage == AppLanguage.kk
-              ? 'Бұл мекенжайды таба алмадым. Қалай дұрыс сақтау керегін айтыңыз.'
-              : 'Не смогла найти этот адрес. Скажите, как сохранить правильно.',
+          _voiceText(
+            ru: 'Не смогла найти этот адрес. Скажите, как сохранить правильно.',
+            kk: 'Бұл мекенжайды таба алмадым. Қалай дұрыс сақтау керегін айтыңыз.',
+          ),
         );
         _setCircleState(CircleState.listening);
         final corrected = await _sttService.startCommandListening(
+          languageHint: _interactionLanguage,
+          allowAutoLanguage: false,
           durationSeconds: 10,
           minListenMs: 320,
           silenceHoldMs: 1100,
@@ -1760,7 +2898,7 @@ class _JanarymHomeState extends State<JanarymHome>
           currentLabelName: labelName,
         );
         if (!correction.hasAny) {
-          await _speak(_l10n.didntHearCommandRepeat);
+          await _speak(_voiceL10n.didntHearCommandRepeat);
           continue;
         }
         labelName = (correction.labelName ?? labelName).trim();
@@ -1769,12 +2907,15 @@ class _JanarymHomeState extends State<JanarymHome>
       }
 
       await _speak(
-        widget.appLanguage == AppLanguage.kk
-            ? '"$labelName" меткасын "${candidate.displayLabel}" мекенжайымен сақтайын ба?'
-            : 'Сохранить метку "$labelName" с адресом "${candidate.displayLabel}"?',
+        _voiceText(
+          ru: 'Сохранить метку "$labelName" с адресом "${candidate.displayLabel}"?',
+          kk: '"$labelName" меткасын "${candidate.displayLabel}" мекенжайымен сақтайын ба?',
+        ),
       );
       _setCircleState(CircleState.listening);
       final confirmAnswer = await _sttService.startCommandListening(
+        languageHint: _interactionLanguage,
+        allowAutoLanguage: false,
         durationSeconds: 8,
         minListenMs: 300,
         silenceHoldMs: 950,
@@ -1785,7 +2926,7 @@ class _JanarymHomeState extends State<JanarymHome>
       if (!mounted) return;
       final response = (confirmAnswer ?? '').trim();
       if (response.isEmpty) {
-        await _speak(_l10n.didntHearCommandRepeat);
+        await _speak(_voiceL10n.didntHearCommandRepeat);
         continue;
       }
 
@@ -1804,9 +2945,10 @@ class _JanarymHomeState extends State<JanarymHome>
         );
         await _personalizationController.refresh();
         await _speak(
-          widget.appLanguage == AppLanguage.kk
-              ? '"$labelName" меткасы сақталды.'
-              : 'Сохранила метку "$labelName".',
+          _voiceText(
+            ru: 'Сохранила метку "$labelName".',
+            kk: '"$labelName" меткасы сақталды.',
+          ),
         );
         return;
       }
@@ -1819,12 +2961,15 @@ class _JanarymHomeState extends State<JanarymHome>
       if (_isNegativeResponse(response) &&
           (correction.addressText ?? '').trim().isEmpty) {
         await _speak(
-          widget.appLanguage == AppLanguage.kk
-              ? 'Дұрысын айтыңыз. Мысалы: "сақта үй мекенжайы Абай 10".'
-              : 'Скажите как правильно. Например: "сохрани как дом адрес Абая 10".',
+          _voiceText(
+            ru: 'Скажите как правильно. Например: "сохрани как дом адрес Абая 10".',
+            kk: 'Дұрысын айтыңыз. Мысалы: "сақта үй мекенжайы Абай 10".',
+          ),
         );
         _setCircleState(CircleState.listening);
         final corrected = await _sttService.startCommandListening(
+          languageHint: _interactionLanguage,
+          allowAutoLanguage: false,
           durationSeconds: 10,
           minListenMs: 320,
           silenceHoldMs: 1100,
@@ -1841,9 +2986,10 @@ class _JanarymHomeState extends State<JanarymHome>
 
       if (!correction.hasAny) {
         await _speak(
-          widget.appLanguage == AppLanguage.kk
-              ? 'Иә деп растаңыз немесе дұрыс атау мен мекенжайды айтыңыз.'
-              : 'Скажите "да" для подтверждения или продиктуйте правильные метку и адрес.',
+          _voiceText(
+            ru: 'Скажите "да" для подтверждения или продиктуйте правильные метку и адрес.',
+            kk: 'Иә деп растаңыз немесе дұрыс атау мен мекенжайды айтыңыз.',
+          ),
         );
         continue;
       }
@@ -1864,9 +3010,10 @@ class _JanarymHomeState extends State<JanarymHome>
     }
     if (labelName.isEmpty) {
       await _speak(
-        widget.appLanguage == AppLanguage.kk
-            ? 'Қай меткаға маршрут құру керек?'
-            : 'К какой метке построить маршрут?',
+        _voiceText(
+          ru: 'К какой метке построить маршрут?',
+          kk: 'Қай меткаға маршрут құру керек?',
+        ),
       );
       return;
     }
@@ -1946,7 +3093,7 @@ class _JanarymHomeState extends State<JanarymHome>
         );
         if (label != null) return label;
       } catch (e) {
-        debugPrint('[Personalization] place label lookup error: $e');
+        appLog('[Personalization] place label lookup error: $e');
       }
     }
     return null;
@@ -1963,10 +3110,16 @@ class _JanarymHomeState extends State<JanarymHome>
       case AssistantModeIntent.navStatus:
       case AssistantModeIntent.navNextStep:
       case AssistantModeIntent.navRejectChoice:
-        await _speak(_l10n.enableRouteModeFirst);
+        await _speak(_voiceL10n.enableRouteModeFirst);
         return;
       case AssistantModeIntent.repeat:
         await _repeatLastAnswer();
+        return;
+      case AssistantModeIntent.readText:
+        await _handleReadTextIntent(rawText);
+        return;
+      case AssistantModeIntent.switchVoiceLanguage:
+        await _speak(_voiceLanguageSwitchAck());
         return;
       case AssistantModeIntent.visionDescribe:
         final userText = decision.cleanedText.isEmpty
@@ -1985,7 +3138,7 @@ class _JanarymHomeState extends State<JanarymHome>
             ? rawText.trim()
             : decision.cleanedText.trim();
         if (userText.isEmpty) {
-          await _speak(_l10n.didntHearCommandRepeat);
+          await _speak(_voiceL10n.didntHearCommandRepeat);
           return;
         }
         if (_isIdentityQuestion(userText)) {
@@ -2011,7 +3164,7 @@ class _JanarymHomeState extends State<JanarymHome>
         return;
       case AssistantModeIntent.confirmYes:
       case AssistantModeIntent.confirmNo:
-        await _speak(_l10n.didntHearCommandRepeat);
+        await _speak(_voiceL10n.didntHearCommandRepeat);
         return;
       case AssistantModeIntent.enterNavMode:
       case AssistantModeIntent.exitNavMode:
@@ -2044,7 +3197,7 @@ class _JanarymHomeState extends State<JanarymHome>
           destination = (decision.placeLabelName ?? '').trim();
         }
         if (destination.isEmpty) {
-          await _speak(_l10n.sayAddressAfterRoutePhrase);
+          await _speak(_voiceL10n.sayAddressAfterRoutePhrase);
           return;
         }
         final byLabel = await _findPlaceLabelForRouteCommand(
@@ -2072,9 +3225,15 @@ class _JanarymHomeState extends State<JanarymHome>
       case AssistantModeIntent.navRejectChoice:
         await _navigationController.rejectCandidateSelection();
         return;
+      case AssistantModeIntent.readText:
+        await _handleReadTextIntent(rawText);
+        return;
+      case AssistantModeIntent.switchVoiceLanguage:
+        await _speak(_voiceLanguageSwitchAck());
+        return;
       case AssistantModeIntent.repeat:
       case AssistantModeIntent.visionDescribe:
-        await _speak(_l10n.routeModeDescribeBlocked);
+        await _speak(_voiceL10n.routeModeDescribeBlocked);
         return;
       case AssistantModeIntent.unknown:
         final freeText = decision.cleanedText.isEmpty
@@ -2105,7 +3264,7 @@ class _JanarymHomeState extends State<JanarymHome>
         return;
       case AssistantModeIntent.confirmYes:
       case AssistantModeIntent.confirmNo:
-        await _speak(_l10n.navAnswerYesOrNoOrAddress);
+        await _speak(_voiceL10n.navAnswerYesOrNoOrAddress);
         return;
       case AssistantModeIntent.enterNavMode:
       case AssistantModeIntent.exitNavMode:
@@ -2117,37 +3276,1499 @@ class _JanarymHomeState extends State<JanarymHome>
     }
   }
 
-  Future<void> _enterNavigationMode() async {
-    if (_assistantMode == AssistantMode.navigation) {
-      await _speak(_l10n.routeModeAlreadyEnabled);
+  Future<void> _handleTaskModeCommand(
+    String rawText,
+    CommandDecision decision,
+  ) async {
+    switch (decision.modeIntent) {
+      case AssistantModeIntent.navStart:
+      case AssistantModeIntent.routeToPlaceLabel:
+      case AssistantModeIntent.navStop:
+      case AssistantModeIntent.navStatus:
+      case AssistantModeIntent.navNextStep:
+      case AssistantModeIntent.navRejectChoice:
+        await _speak(_voiceL10n.enableRouteModeFirst);
+        return;
+      case AssistantModeIntent.repeat:
+        await _repeatLastAnswer();
+        return;
+      case AssistantModeIntent.readText:
+        await _handleReadTextIntent(rawText);
+        return;
+      case AssistantModeIntent.switchVoiceLanguage:
+        await _speak(_voiceLanguageSwitchAck());
+        return;
+      case AssistantModeIntent.visionDescribe:
+        final userText = decision.cleanedText.isEmpty
+            ? rawText
+            : decision.cleanedText;
+        await _describeWithVision(userText, systemPrompt: _buildVisionPrompt());
+        return;
+      case AssistantModeIntent.unknown:
+        final userText = decision.cleanedText.isEmpty
+            ? rawText.trim()
+            : decision.cleanedText.trim();
+        if (userText.isEmpty) {
+          await _speak(_voiceL10n.didntHearCommandRepeat);
+          return;
+        }
+        if (_isIdentityQuestion(userText)) {
+          await _speak(_identityAnswer());
+          return;
+        }
+        if (_isCapabilitiesQuestion(userText)) {
+          await _speak(_capabilitiesAnswer());
+          return;
+        }
+        await _handleModeSpecificUnknown(userText);
+        return;
+      case AssistantModeIntent.confirmYes:
+      case AssistantModeIntent.confirmNo:
+        await _speak(_voiceL10n.didntHearCommandRepeat);
+        return;
+      case AssistantModeIntent.enterNavMode:
+      case AssistantModeIntent.exitNavMode:
+      case AssistantModeIntent.setPlaceLabel:
+      case AssistantModeIntent.startOnboarding:
+      case AssistantModeIntent.restartOnboarding:
+      case AssistantModeIntent.updateUserFear:
+        return;
+    }
+  }
+
+  Future<void> _handleModeSpecificUnknown(String userText) async {
+    switch (_assistantMode) {
+      case AssistantMode.general:
+        await _handleHomeModeCommand(userText);
+        return;
+      case AssistantMode.navigation:
+        await _handleRouteModeCommand(userText);
+        return;
+      case AssistantMode.safety:
+        await _handleHomeModeCommand(userText);
+        return;
+      case AssistantMode.textReader:
+        await _handleTextReaderModeCommand(userText);
+        return;
+      case AssistantMode.shopping:
+        await _handleShoppingModeCommand(userText);
+        return;
+      case AssistantMode.cooking:
+        await _handleCookingModeCommand(userText);
+        return;
+      case AssistantMode.dressCode:
+        await _handleDressCodeModeCommand(userText);
+        return;
+      case AssistantMode.antiFraud:
+        await _handleAntiFraudModeCommand(userText);
+        return;
+      case AssistantMode.memory:
+        await _handleMemoryModeCommand(userText);
+        return;
+      case AssistantMode.find:
+        await _handleFindModeCommand(userText);
+        return;
+    }
+  }
+
+  Future<void> _handleHomeModeCommand(String userText) async {
+    if (_shouldUseVisionInHomeMode(userText)) {
+      await _describeWithVision(
+        userText,
+        systemPrompt: _buildVisionPrompt(
+          extraInstruction: _looksLikeColorQuestion(userText)
+              ? _voiceText(
+                  ru: 'Если пользователь спрашивает про цвет, назови основной видимый цвет точно. Если нужно, назови только 1-2 главных цвета.',
+                  kk: 'Егер пайдаланушы түс туралы сұраса, көрінетін негізгі түсті нақты ата. Қажет болса 1-2 түсті ғана айт.',
+                )
+              : null,
+        ),
+      );
       return;
     }
+    await _askGpt(userText, systemPrompt: _buildBlindPrompt());
+  }
+
+  Future<void> _handleRouteModeCommand(String userText) async {
+    if (_looksLikeVisualFreeRequest(userText)) {
+      await _describeWithVision(userText, systemPrompt: _buildVisionPrompt());
+      return;
+    }
+    await _askGpt(
+      userText,
+      systemPrompt: _buildBlindPrompt(navigationMode: true),
+    );
+  }
+
+  bool _shouldUseVisionInHomeMode(String userText) {
+    final normalized = _router.normalize(userText);
+    if (normalized.isEmpty) return true;
+    if (_looksLikeVisualFreeRequest(userText)) return true;
+    const metaCues = <String>[
+      'что ты уме',
+      'кто ты',
+      'режим',
+      'умеешь',
+      'что можешь',
+      'не істей',
+      'кімсің',
+      'режим',
+    ];
+    for (final cue in metaCues) {
+      if (normalized.contains(cue)) return false;
+    }
+    return _currentModeDescriptor().perception.prefersSceneDescription;
+  }
+
+  Future<void> _handleSafetyModeCommand(String userText) async {
+    await _describeWithVision(userText, systemPrompt: _buildVisionPrompt());
+  }
+
+  Future<void> _handleTextReaderModeCommand(String userText) async {
+    await _runManualTextReadSession(
+      userText,
+      source: _TextReaderReadSource.voice,
+    );
+  }
+
+  Future<bool> _maybeHandleTextReaderControlCommand(String userText) async {
+    if (_assistantMode != AssistantMode.textReader) return false;
+    final normalized = _router.normalize(userText);
+    if (normalized.isEmpty) return false;
+
+    if (_isTextReaderStopCommand(normalized)) {
+      await _cancelActiveTextReaderSession();
+      return true;
+    }
+    if (_isTextReaderResumeCommand(normalized)) {
+      await _runManualTextReadSession(
+        userText,
+        source: _TextReaderReadSource.voice,
+      );
+      return true;
+    }
+    return false;
+  }
+
+  bool _isTextReaderStopCommand(String normalized) {
+    const cues = <String>[
+      'стоп',
+      'остановись',
+      'остановить',
+      'пауза',
+      'хватит',
+      'тоқта',
+      'пауза жаса',
+    ];
+    for (final cue in cues) {
+      if (normalized == cue || normalized.contains(cue)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _isTextReaderResumeCommand(String normalized) {
+    const cues = <String>[
+      'начни сначала',
+      'начать сначала',
+      'продолжай',
+      'продолжить',
+      'читай дальше',
+      'продолжай читать',
+      'resume',
+      'continue',
+      'қайта баста',
+      'жалғастыр',
+    ];
+    for (final cue in cues) {
+      if (normalized == cue || normalized.contains(cue)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void _resetTextReaderAutoState({bool clearLastSignature = false}) {
+    _pendingAutoTextReaderSignature = '';
+    _pendingAutoTextReaderSeenCount = 0;
+    if (clearLastSignature) {
+      _lastAutoTextReaderSignature = '';
+      _lastAutoTextReaderSpeakMs = 0;
+      _lastAutoTextReaderExactSignature = '';
+      _lastAutoTextReaderExactMs = 0;
+      _lastAutoTextReaderVisionFallbackSignature = '';
+      _lastAutoTextReaderVisionFallbackMs = 0;
+    }
+  }
+
+  Future<void> _cancelActiveTextReaderSession() async {
+    _textReaderSessionCancelRequested = true;
+    _resetTextReaderAutoState();
     await _tts.stop();
-    await _navigationController.enterMode();
-    if (!_navigationController.state.value.modeEnabled) {
-      return;
-    }
-    _lastNavCameraTarget = null;
-    await _disposeCamera();
-    _assistantMode = AssistantMode.navigation;
+    _isSpeaking = false;
     if (mounted) {
       setState(() {});
+    }
+    appLog('[TextReader][control] stopped');
+    _restoreWakeStateIfIdle();
+  }
+
+  Future<void> _pauseTextReaderContinuousReading() async {
+    _textReaderAutoPaused = true;
+    _textReaderSessionCancelRequested = true;
+    _resetTextReaderAutoState();
+    await _tts.stop();
+    _isSpeaking = false;
+    _syncTextReaderLoop();
+    if (mounted) {
+      setState(() {});
+    }
+    appLog('[TextReader][control] paused');
+    _restoreWakeStateIfIdle();
+  }
+
+  Future<void> _resumeTextReaderContinuousReading({bool restart = true}) async {
+    _textReaderAutoPaused = false;
+    _textReaderSessionCancelRequested = false;
+    _resetTextReaderAutoState(clearLastSignature: restart);
+    _syncTextReaderLoop();
+    if (mounted) {
+      setState(() {});
+    }
+    appLog('[TextReader][control] resumed restart=$restart');
+    if (restart) {
+      Future<void>.delayed(const Duration(milliseconds: 120), () {
+        if (!mounted || _assistantMode != AssistantMode.textReader) return;
+        unawaited(_runAutoTextReaderTick());
+      });
+    }
+  }
+
+  Future<void> _handleReadTextIntent(String rawText) async {
+    if (!_featureFlags.textReaderEnabled ||
+        !_isModeEnabled(AssistantMode.textReader)) {
+      await _speak(_modeUnavailableMessage(AssistantMode.textReader));
+      return;
+    }
+    if (_assistantMode != AssistantMode.textReader) {
+      final changed = await _switchAssistantMode(
+        AssistantMode.textReader,
+        reason: 'intent_read_text',
+      );
+      if (!changed) {
+        await _speak(_modeUnavailableMessage(AssistantMode.textReader));
+        return;
+      }
+    }
+    if (!_cameraGranted || !_cameraStreaming) {
+      await _initCameraLive();
+      if (!_cameraGranted || !_cameraStreaming) {
+        await _speak(
+          _voiceText(
+            ru: 'Для чтения текста нужна камера.',
+            kk: 'Мәтінді оқу үшін камера қажет.',
+          ),
+        );
+        return;
+      }
+    }
+    await _runManualTextReadSession(
+      rawText,
+      source: _TextReaderReadSource.voice,
+    );
+  }
+
+  Future<void> _runManualTextReadSession(
+    String rawText, {
+    required _TextReaderReadSource source,
+  }) async {
+    if (source == _TextReaderReadSource.auto && _textReaderAutoPaused) {
+      return;
+    }
+    if (_manualTextReadInProgress) {
+      appLog('[TextReader][manual_session] skip busy source=${source.name}');
+      return;
+    }
+
+    if (source != _TextReaderReadSource.auto) {
+      _textReaderSessionCancelRequested = false;
+    }
+    _manualTextReadInProgress = true;
+    _textReaderSessionState = _TextReaderSessionState.preparing;
+    _lastTextReaderFailureReason = '';
+    if (mounted) {
+      setState(() {});
+    }
+    appLog('[TextReader][manual_session] start source=${source.name}');
+    appLog('[TextReader][manual_session] state=preparing');
+    _enterVoicePriorityWindow(reason: 'manual_text_read');
+
+    try {
+      await _syncHeavyServices();
+      if (!_cameraGranted) {
+        await _initCameraLive();
+      }
+      if (!_cameraGranted) {
+        _lastTextReaderFailureReason = 'camera_denied';
+        appLog('[TextReader][manual_session] fail reason=camera_denied');
+        await _speak(
+          _voiceText(
+            ru: 'Для чтения текста нужна камера.',
+            kk: 'Мәтінді оқу үшін камера қажет.',
+          ),
+        );
+        return;
+      }
+      if (!_cameraStreaming) {
+        await _startCameraStream(reason: 'manual_text_read');
+      }
+      if (!_cameraStreaming) {
+        _lastTextReaderFailureReason = 'camera_stream_unavailable';
+        appLog(
+          '[TextReader][manual_session] fail reason=camera_stream_unavailable',
+        );
+        await _speak(_textReaderFailureMessage());
+        return;
+      }
+
+      _textReaderSessionState = _TextReaderSessionState.scanning;
+      if (mounted) {
+        setState(() {});
+      }
+      appLog('[TextReader][manual_session] state=scanning');
+      final candidates = await _collectManualTextReadCandidates();
+      if (_textReaderSessionCancelRequested) {
+        appLog('[TextReader][manual_session] cancel requested');
+        return;
+      }
+      if (candidates.isEmpty) {
+        _textReaderSessionState = _TextReaderSessionState.failed;
+        _lastTextReaderFailureReason = 'no_candidates';
+        appLog('[TextReader][manual_session] fail reason=no_candidates');
+        await _speak(_textReaderFailureMessage());
+        return;
+      }
+
+      OnDeviceTextReadResult? selected;
+      double selectedScore = double.negativeInfinity;
+      for (final candidate in candidates) {
+        final score = _scoreManualTextReadCandidate(candidate);
+        if (score > selectedScore) {
+          selected = candidate;
+          selectedScore = score;
+        }
+      }
+
+      final result = selected;
+      if (result == null) {
+        _textReaderSessionState = _TextReaderSessionState.failed;
+        _lastTextReaderFailureReason = 'selection_failed';
+        appLog('[TextReader][manual_session] fail reason=selection_failed');
+        await _speak(_textReaderFailureMessage());
+        return;
+      }
+
+      final resolvedText = _resolveManualSpeechText(result);
+      final normalized = _router.normalize(rawText);
+      final wantsStructuredOnly = _isTextReaderStructuredQuery(normalized);
+      final speakAsManual =
+          source != _TextReaderReadSource.auto ||
+          _assistantMode == AssistantMode.textReader;
+      final stableRepeats = _countStableManualCandidates(
+        candidates,
+        resolvedText,
+      );
+      final shouldUseVisionFallback = _shouldUseVisionTextReadFallback(
+        result,
+        resolvedText,
+        score: selectedScore,
+      );
+      final structuredOnlyAccepted =
+          selectedScore < _manualTextReadAcceptScore &&
+          result.hasStructuredData;
+      final weakAccepted =
+          !structuredOnlyAccepted &&
+          shouldAcceptWeakManualCandidate(
+            score: selectedScore,
+            hasStructuredData: result.hasStructuredData,
+            text: resolvedText,
+            stableRepeats: stableRepeats,
+          );
+      if (selectedScore < _manualTextReadAcceptScore &&
+          !structuredOnlyAccepted &&
+          !weakAccepted) {
+        if (speakAsManual && shouldUseVisionFallback) {
+          final fallbackText = await _tryTextReaderVisionFallback();
+          if (fallbackText != null) {
+            final transcriptSegments = _buildTextReaderSpeechSegments(
+              result,
+              overrideText: fallbackText,
+            );
+            final answer = _buildDirectTextReadAnswer(
+              fallbackText,
+              result: result,
+            );
+            appLog(
+              '[TextReader][manual_session] selected vision_fallback '
+              'score=${selectedScore.toStringAsFixed(1)}',
+            );
+            _textReaderSessionState = _TextReaderSessionState.speaking;
+            if (mounted) {
+              setState(() {});
+            }
+            await _storeOcrRead(result);
+            _publishTextReadEvent(
+              result,
+              source: source,
+              selectedScore: selectedScore,
+            );
+            if (!wantsStructuredOnly && transcriptSegments.isNotEmpty) {
+              if (source != _TextReaderReadSource.auto) {
+                _rememberDialogTurn(rawText, answer);
+              }
+              _lastAnswer = answer;
+              await _speakTextReaderSegments(
+                transcriptSegments,
+                autoRead: false,
+              );
+            } else {
+              if (source != _TextReaderReadSource.auto) {
+                _rememberDialogTurn(rawText, answer);
+              }
+              _lastAnswer = answer;
+              await _ensureTtsLocaleForSpokenText(
+                fallbackText,
+                autoRead: false,
+              );
+              await _speak(answer, ensureLocale: false);
+            }
+            return;
+          }
+        }
+        if (source == _TextReaderReadSource.auto) {
+          _lastTextReaderFailureReason = 'auto_low_score';
+          appLog(
+            '[TextReader][auto] skip low_score '
+            'score=${selectedScore.toStringAsFixed(1)}',
+          );
+          return;
+        }
+        final effectiveScript = _effectiveManualScript(result, resolvedText);
+        _textReaderSessionState = _TextReaderSessionState.failed;
+        _lastTextReaderFailureReason = 'low_score';
+        appLog(
+          '[TextReader][manual_session] fail reason=low_score '
+          'score=${selectedScore.toStringAsFixed(1)} '
+          'script=${effectiveScript.name}',
+        );
+        await _speak(_textReaderFailureMessage());
+        return;
+      }
+
+      final effectiveScript = _effectiveManualScript(result, resolvedText);
+      appLog(
+        '[TextReader][manual_session] selected '
+        'score=${selectedScore.toStringAsFixed(1)} '
+        'script=${effectiveScript.name} '
+        'stable_repeats=$stableRepeats '
+        'weak_accept=$weakAccepted',
+      );
+      appLog(
+        '[TextReader][manual_session] fallback_text_used='
+        '${result.manualSpeechText.trim().isEmpty && result.manualFallbackText.trim().isNotEmpty}',
+      );
+
+      _textReaderSessionState = _TextReaderSessionState.speaking;
+      if (mounted) {
+        setState(() {});
+      }
+      appLog('[TextReader][manual_session] state=speaking');
+
+      if (speakAsManual && shouldUseVisionFallback) {
+        final fallbackText = await _tryTextReaderVisionFallback();
+        if (fallbackText != null) {
+          final transcriptSegments = _buildTextReaderSpeechSegments(
+            result,
+            overrideText: fallbackText,
+          );
+          final answer = _buildDirectTextReadAnswer(
+            fallbackText,
+            result: result,
+          );
+          appLog(
+            '[TextReader][manual_session] selected vision_fallback '
+            'score=${selectedScore.toStringAsFixed(1)}',
+          );
+          await _storeOcrRead(result);
+          _publishTextReadEvent(
+            result,
+            source: source,
+            selectedScore: selectedScore,
+          );
+          if (!wantsStructuredOnly && transcriptSegments.isNotEmpty) {
+            if (source != _TextReaderReadSource.auto) {
+              _rememberDialogTurn(rawText, answer);
+            }
+            _lastAnswer = answer;
+            await _speakTextReaderSegments(transcriptSegments, autoRead: false);
+          } else {
+            if (source != _TextReaderReadSource.auto) {
+              _rememberDialogTurn(rawText, answer);
+            }
+            _lastAnswer = answer;
+            await _ensureTtsLocaleForSpokenText(fallbackText, autoRead: false);
+            await _speak(answer, ensureLocale: false);
+          }
+          return;
+        }
+      }
+
+      await _storeOcrRead(result);
+      _publishTextReadEvent(
+        result,
+        source: source,
+        selectedScore: selectedScore,
+      );
+
+      final answer = structuredOnlyAccepted
+          ? _buildStructuredOnlyTextReaderAnswer(
+              result,
+              normalizedUserText: normalized,
+            )
+          : weakAccepted
+          ? _buildApproximateTextReaderAnswer(result)
+          : _buildTextReaderAnswer(
+              result,
+              normalizedUserText: normalized,
+              autoRead: false,
+            );
+      if (source == _TextReaderReadSource.auto && !speakAsManual) {
+        final autoSegments = _buildAutoTextReaderSpeechSegments(result);
+        final autoAnswer = _buildTextReaderAnswer(
+          result,
+          normalizedUserText: normalized,
+          autoRead: true,
+        );
+        if (autoSegments.isNotEmpty &&
+            result.isAutoSpeakSafe &&
+            _shouldSpeakAutoTextReaderTranscript(
+              autoSegments,
+              result: result,
+            )) {
+          _lastAnswer = autoAnswer;
+          await _speakTextReaderSegments(autoSegments, autoRead: true);
+        } else if (autoSegments.isEmpty &&
+            shouldAutoSpeakStructuredOnly(
+              hasStructuredData: result.hasStructuredData,
+              isAutoSpeakSafe: result.isAutoSpeakSafe,
+            ) &&
+            _shouldSpeakAutoTextReaderTranscript(<String>[
+              autoAnswer,
+            ], result: result)) {
+          _lastAnswer = autoAnswer;
+          await _ensureTtsLocaleForReadResult(result, autoRead: true);
+          await _speak(autoAnswer, ensureLocale: false);
+        } else {
+          final reason = !result.isAutoSpeakSafe
+              ? 'unsafe_auto_text'
+              : 'no_auto_text';
+          appLog('[TextReader][auto] skip $reason');
+        }
+      } else {
+        final transcriptSegments = _buildTextReaderSpeechSegments(result);
+        if (source != _TextReaderReadSource.auto) {
+          _rememberDialogTurn(rawText, answer);
+        }
+        _lastAnswer = answer;
+        if (!wantsStructuredOnly && transcriptSegments.isNotEmpty) {
+          await _speakTextReaderSegments(transcriptSegments, autoRead: false);
+        } else {
+          await _ensureTtsLocaleForReadResult(result, autoRead: false);
+          await _speak(answer, ensureLocale: false);
+        }
+      }
+      if (resolvedText.isEmpty && !result.hasStructuredData) {
+        _lastTextReaderFailureReason = 'empty_resolved_text';
+      }
+    } finally {
+      _manualTextReadInProgress = false;
+      _textReaderSessionState = _TextReaderSessionState.idle;
+      _exitVoicePriorityWindow(reason: 'manual_text_read');
+      if (mounted) {
+        setState(() {});
+      }
+    }
+  }
+
+  Future<List<OnDeviceTextReadResult>>
+  _collectManualTextReadCandidates() async {
+    final results = <OnDeviceTextReadResult>[];
+    for (var i = 0; i < _manualTextReadAttempts; i += 1) {
+      if (_textReaderSessionCancelRequested) {
+        break;
+      }
+      final attempt = i + 1;
+      final timeout = Duration(
+        milliseconds: i == 0
+            ? _manualTextReadFirstTimeoutMs
+            : _manualTextReadRetryTimeoutMs,
+      );
+      final frame = await _prepareTextReaderFrame(timeout: timeout);
+      if (frame == null) {
+        appLog('[TextReader][manual_session] attempt=$attempt no_frame');
+      } else {
+        final result = await _textReaderService.readFrame(frame, force: true);
+        if (result == null || !result.hasRawText) {
+          appLog('[TextReader][manual_session] attempt=$attempt no_result');
+        } else {
+          final text = _resolveManualSpeechText(result);
+          final score = _scoreManualTextReadCandidate(result);
+          final effectiveScript = _effectiveManualScript(result, text);
+          appLog(
+            '[TextReader][manual_session] attempt=$attempt '
+            'score=${score.toStringAsFixed(1)} '
+            'script=${effectiveScript.name} '
+            'raw="${_truncateForLog(result.rawText)}" '
+            'text="${_truncateForLog(text)}"',
+          );
+          results.add(result);
+          final stableRepeats = _countStableManualCandidates(results, text);
+          final structuredOnlyAccepted =
+              score < _manualTextReadAcceptScore && result.hasStructuredData;
+          final weakAccepted =
+              !structuredOnlyAccepted &&
+              shouldAcceptWeakManualCandidate(
+                score: score,
+                hasStructuredData: result.hasStructuredData,
+                text: text,
+                stableRepeats: stableRepeats,
+              );
+          if (score >= _manualTextReadAcceptScore ||
+              structuredOnlyAccepted ||
+              weakAccepted) {
+            appLog(
+              '[TextReader][manual_session] early_accept '
+              'attempt=$attempt '
+              'score=${score.toStringAsFixed(1)} '
+              'stable_repeats=$stableRepeats '
+              'structured_only=$structuredOnlyAccepted '
+              'weak_accept=$weakAccepted',
+            );
+            break;
+          }
+        }
+      }
+      if (i < _manualTextReadAttempts - 1) {
+        await Future<void>.delayed(
+          const Duration(milliseconds: _manualTextReadInterAttemptDelayMs),
+        );
+      }
+    }
+    return results;
+  }
+
+  double _scoreManualTextReadCandidate(OnDeviceTextReadResult result) {
+    final resolvedText = _resolveManualSpeechText(result);
+    return scoreManualTextReadCandidate(
+      text: resolvedText,
+      manualSpeechLinesCount: result.manualSpeechLines.length,
+      dominantScript: _effectiveManualScript(result, resolvedText),
+      hasStructuredData: result.hasStructuredData,
+    );
+  }
+
+  String _resolveManualSpeechText(OnDeviceTextReadResult result) {
+    final manual = result.manualSpeechText.trim();
+    final fallback = result.manualFallbackText.trim();
+    if (fallback.isNotEmpty) {
+      final fallbackScript = TextReadingNormalizer.detectScript(fallback);
+      final manualScript = TextReadingNormalizer.detectScript(manual);
+      final weakLatinManual =
+          manual.isNotEmpty &&
+          manualScript == DetectedTextScript.latin &&
+          !TextReadingNormalizer.shouldUseEnglishTts(manual);
+      if (manual.isEmpty ||
+          (fallbackScript == DetectedTextScript.cyrillic && weakLatinManual)) {
+        return fallback;
+      }
+    }
+    if (manual.isNotEmpty) return manual;
+    return '';
+  }
+
+  int _countStableManualCandidates(
+    List<OnDeviceTextReadResult> candidates,
+    String resolvedText,
+  ) {
+    final selectedSignature = buildManualCandidateSignature(resolvedText);
+    if (selectedSignature.isEmpty) return 0;
+    return candidates.where((candidate) {
+      final candidateText = _resolveManualSpeechText(candidate);
+      final candidateSignature = buildManualCandidateSignature(candidateText);
+      return candidateSignature.isNotEmpty &&
+          candidateSignature == selectedSignature;
+    }).length;
+  }
+
+  DetectedTextScript _effectiveManualScript(
+    OnDeviceTextReadResult result, [
+    String? resolvedTextOverride,
+  ]) {
+    final resolvedText =
+        (resolvedTextOverride ?? _resolveManualSpeechText(result)).trim();
+    if (resolvedText.isEmpty) {
+      return result.dominantScript;
+    }
+    final resolvedScript = TextReadingNormalizer.detectScript(resolvedText);
+    if (resolvedScript == DetectedTextScript.unknown) {
+      return result.dominantScript;
+    }
+    return resolvedScript;
+  }
+
+  String _buildApproximateTextReaderAnswer(OnDeviceTextReadResult result) {
+    final spokenText = _truncateForSpeech(_resolveManualSpeechText(result));
+    if (spokenText.isEmpty) {
+      return _textReaderFailureMessage();
+    }
+    return _voiceText(
+      ru: 'Примерно прочитанный текст: $spokenText',
+      kk: 'Шамамен оқылған мәтін: $spokenText',
+    );
+  }
+
+  bool _isTextReaderStructuredQuery(String normalizedUserText) {
+    return normalizedUserText.contains('цен') ||
+        normalizedUserText.contains('price') ||
+        normalizedUserText.contains('калор') ||
+        normalizedUserText.contains('kcal');
+  }
+
+  List<String> _buildTextReaderSpeechSegments(
+    OnDeviceTextReadResult result, {
+    String? overrideText,
+  }) {
+    final override = overrideText?.trim() ?? '';
+    if (override.isNotEmpty) {
+      final split = _splitTextReaderSpeechSegments(override);
+      if (split.isNotEmpty) return split;
+    }
+
+    if (result.manualSpeechLines.isNotEmpty) {
+      return result.manualSpeechLines
+          .expand(_splitMixedLanguageSpeechSegments)
+          .where((line) => line.isNotEmpty)
+          .toList(growable: false);
+    }
+
+    final resolvedText = _resolveManualSpeechText(result);
+    if (resolvedText.isEmpty) return const <String>[];
+    return _splitTextReaderSpeechSegments(resolvedText);
+  }
+
+  List<String> _buildAutoTextReaderSpeechSegments(
+    OnDeviceTextReadResult result,
+  ) {
+    if (result.autoSpeechLines.isNotEmpty) {
+      return result.autoSpeechLines
+          .expand(_splitMixedLanguageSpeechSegments)
+          .where((line) => line.isNotEmpty)
+          .toList(growable: false);
+    }
+    final resolvedText = result.autoSpeechText.trim();
+    if (resolvedText.isEmpty) return const <String>[];
+    return _splitTextReaderSpeechSegments(resolvedText);
+  }
+
+  List<String> _splitTextReaderSpeechSegments(String text) {
+    final source = text.trim();
+    if (source.isEmpty) return const <String>[];
+    final segments = _splitTextReaderSpeechUnits(source)
+        .expand(_splitMixedLanguageSpeechSegments)
+        .where((line) => line.isNotEmpty)
+        .toList(growable: false);
+    if (segments.isNotEmpty) {
+      return segments;
+    }
+    return <String>[
+      _truncateForSpeech(source, maxChars: 220),
+    ].where((line) => line.isNotEmpty).toList(growable: false);
+  }
+
+  List<String> _splitTextReaderSpeechUnits(String text) {
+    final source = text.trim();
+    if (source.isEmpty) return const <String>[];
+    final normalized = source
+        .replaceAll('\r', '\n')
+        .replaceAll(RegExp(r'[ \t]+'), ' ');
+    final lines = normalized
+        .split(RegExp(r'\n+'))
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList(growable: false);
+    if (lines.length > 1) {
+      return lines;
+    }
+    final sentences = source
+        .split(RegExp(r'(?<=[.!?])\s+'))
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList(growable: false);
+    if (sentences.length > 1) {
+      return sentences;
+    }
+    return <String>[source];
+  }
+
+  List<String> _splitMixedLanguageSpeechSegments(String text) {
+    final source = text.trim();
+    if (source.isEmpty) return const <String>[];
+
+    final tokens = RegExp(
+      r'[A-Za-z]+|[А-Яа-яЁё]+|[0-9]+|[^A-Za-zА-Яа-яЁё0-9]+',
+      unicode: true,
+    ).allMatches(source).map((match) => match.group(0) ?? '').toList();
+    if (tokens.isEmpty) {
+      return <String>[
+        _truncateForSpeech(source, maxChars: 180),
+      ].where((line) => line.isNotEmpty).toList(growable: false);
+    }
+
+    final segments = <String>[];
+    final buffer = StringBuffer();
+    var currentScript = DetectedTextScript.unknown;
+
+    void flush() {
+      final chunk = _truncateForSpeech(
+        buffer.toString().replaceAll(RegExp(r'\s+'), ' ').trim(),
+        maxChars: 180,
+      );
+      buffer.clear();
+      currentScript = DetectedTextScript.unknown;
+      if (chunk.isNotEmpty) {
+        segments.add(chunk);
+      }
+    }
+
+    for (final token in tokens) {
+      if (token.isEmpty) continue;
+      final tokenScript = TextReadingNormalizer.detectScript(token);
+      if (tokenScript == DetectedTextScript.unknown) {
+        if (buffer.isNotEmpty) {
+          buffer.write(token);
+        }
+        continue;
+      }
+
+      if (buffer.isEmpty) {
+        buffer.write(token);
+        currentScript = tokenScript;
+        continue;
+      }
+
+      if (currentScript == tokenScript ||
+          currentScript == DetectedTextScript.unknown) {
+        buffer.write(token);
+        currentScript = tokenScript;
+        continue;
+      }
+
+      flush();
+      buffer.write(token);
+      currentScript = tokenScript;
+    }
+
+    flush();
+    return segments;
+  }
+
+  String _buildTextReaderSpeechSignature(
+    List<String> segments, {
+    OnDeviceTextReadResult? result,
+  }) {
+    final compact = segments
+        .map((segment) => segment.replaceAll(RegExp(r'\s+'), ' ').trim())
+        .where((segment) => segment.isNotEmpty)
+        .join(' | ');
+    if (compact.isEmpty) return '';
+    final suffix = <String>[
+      if (result?.price != null)
+        'price:${result!.price!.toStringAsFixed(result.price! % 1 == 0 ? 0 : 2)}',
+      if (result?.calories != null) 'cal:${result!.calories}',
+    ].join('|');
+    return suffix.isEmpty ? compact : '$compact|$suffix';
+  }
+
+  bool _shouldSpeakAutoTextReaderTranscript(
+    List<String> segments, {
+    OnDeviceTextReadResult? result,
+  }) {
+    final signature = _buildTextReaderSpeechSignature(segments, result: result);
+    if (signature.isEmpty) return false;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (signature == _lastAutoTextReaderSignature) return false;
+    if (now - _lastAutoTextReaderSpeakMs < _textReaderSpeechCooldownMs) {
+      return false;
+    }
+    _lastAutoTextReaderSignature = signature;
+    _lastAutoTextReaderSpeakMs = now;
+    return true;
+  }
+
+  bool _markAutoTextReaderCandidateSeen(String signature) {
+    final value = signature.trim();
+    if (value.isEmpty) {
+      _resetTextReaderAutoState();
+      return false;
+    }
+    if (_pendingAutoTextReaderSignature == value) {
+      _pendingAutoTextReaderSeenCount += 1;
+    } else {
+      _pendingAutoTextReaderSignature = value;
+      _pendingAutoTextReaderSeenCount = 1;
+    }
+    return _pendingAutoTextReaderSeenCount >= _textReaderStableFramesRequired;
+  }
+
+  bool _shouldTriggerAutoExactTextRead(OnDeviceTextReadResult result) {
+    final resolvedText = _resolveManualSpeechText(result);
+    final score = _scoreManualTextReadCandidate(result);
+    final rawText = result.rawText.trim();
+    final candidateText = resolvedText.isNotEmpty ? resolvedText : rawText;
+    final candidateSignature = buildManualCandidateSignature(candidateText);
+    if (candidateSignature.isEmpty) {
+      _resetTextReaderAutoState();
+      return false;
+    }
+    final hasEnoughSignal =
+        result.hasStructuredData ||
+        rawText.length >= 48 ||
+        resolvedText.length >= 24 ||
+        result.lines.length >= 2 ||
+        result.manualSpeechLines.isNotEmpty;
+    if (!hasEnoughSignal) {
+      return false;
+    }
+    if (!_markAutoTextReaderCandidateSeen('exact:$candidateSignature')) {
+      return false;
+    }
+
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (_lastAutoTextReaderExactSignature == candidateSignature &&
+        now - _lastAutoTextReaderExactMs < _textReaderAutoExactCooldownMs) {
+      return false;
+    }
+
+    final structuredOnlyAccepted =
+        score < _manualTextReadAcceptScore && result.hasStructuredData;
+    final weakAccepted =
+        !structuredOnlyAccepted &&
+        shouldAcceptWeakManualCandidate(
+          score: score,
+          hasStructuredData: result.hasStructuredData,
+          text: resolvedText,
+          stableRepeats: _pendingAutoTextReaderSeenCount,
+        );
+    final shouldUseVisionFallback = _shouldUseVisionTextReadFallback(
+      result,
+      resolvedText,
+      score: score,
+    );
+    final shouldTrigger =
+        score >= _manualTextReadAcceptScore ||
+        structuredOnlyAccepted ||
+        weakAccepted ||
+        shouldUseVisionFallback ||
+        rawText.length >= 64;
+    if (!shouldTrigger) {
+      return false;
+    }
+
+    _lastAutoTextReaderExactSignature = candidateSignature;
+    _lastAutoTextReaderExactMs = now;
+    return true;
+  }
+
+  Future<void> _pauseWakeFallbackForAutoTextRead() async {
+    var stoppedWakeFallback = false;
+    if (_wakeFallbackActive || _wakeFallbackLoopRunning) {
+      _stopWakeFallbackLoop();
+      stoppedWakeFallback = true;
+    }
+    if (_sttService.isListening) {
+      await _sttService.stop();
+      stoppedWakeFallback = true;
+    }
+    if (stoppedWakeFallback) {
+      appLog('[TextReader][auto] paused wake fallback');
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+    }
+  }
+
+  bool _shouldTryAutoTextReaderVisionFallback(OnDeviceTextReadResult result) {
+    if (result.hasStructuredData || _gptStatus == GptStatus.loading) {
+      return false;
+    }
+    final rawText = result.rawText.trim();
+    if (rawText.isEmpty) return false;
+    final resolvedText = _resolveManualSpeechText(result);
+    final looksPseudoRussian =
+        TextReadingNormalizer.looksLikePseudoRussianOcr(rawText) ||
+        TextReadingNormalizer.looksLikePseudoRussianOcr(resolvedText);
+    if (!looksPseudoRussian) {
+      return false;
+    }
+    final candidateSignature = buildManualCandidateSignature(rawText);
+    if (candidateSignature.isEmpty ||
+        !_markAutoTextReaderCandidateSeen('vision:$candidateSignature')) {
+      return false;
+    }
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (_lastAutoTextReaderVisionFallbackSignature == candidateSignature &&
+        now - _lastAutoTextReaderVisionFallbackMs <
+            _textReaderAutoVisionFallbackCooldownMs) {
+      return false;
+    }
+    _lastAutoTextReaderVisionFallbackSignature = candidateSignature;
+    _lastAutoTextReaderVisionFallbackMs = now;
+    return true;
+  }
+
+  Future<void> _speakTextReaderSegments(
+    List<String> segments, {
+    required bool autoRead,
+  }) async {
+    for (final segment in segments) {
+      if (_textReaderSessionCancelRequested) {
+        appLog('[TextReader][speech] canceled');
+        return;
+      }
+      final text = segment.trim();
+      if (text.isEmpty) continue;
+      await _ensureTtsLocaleForSpokenText(text, autoRead: autoRead);
+      await _speak(text, ensureLocale: false);
+    }
+  }
+
+  bool _shouldUseVisionTextReadFallback(
+    OnDeviceTextReadResult result,
+    String resolvedText, {
+    required double score,
+  }) {
+    if (result.hasStructuredData) return false;
+    if (resolvedText.trim().isEmpty) return false;
+    if (TextReadingNormalizer.shouldUseEnglishTts(resolvedText)) return false;
+    if (score >= _manualTextReadAcceptScore &&
+        !TextReadingNormalizer.looksLikePseudoRussianOcr(resolvedText) &&
+        !TextReadingNormalizer.looksLikePseudoRussianOcr(result.rawText)) {
+      return false;
+    }
+    return TextReadingNormalizer.looksLikePseudoRussianOcr(resolvedText) ||
+        TextReadingNormalizer.looksLikePseudoRussianOcr(result.rawText);
+  }
+
+  Future<String?> _tryTextReaderVisionFallback() async {
+    if (_gptStatus == GptStatus.loading) return null;
+    final jpegBytes = await _captureLatestJpegFrame();
+    if (jpegBytes == null || jpegBytes.isEmpty) {
+      appLog('[TextReader][vision_fallback] no_frame');
+      return null;
+    }
+
+    final systemPrompt = _voiceText(
+      ru: 'Перепиши видимый текст с изображения максимально точно. Верни только сам текст без описаний, комментариев и домыслов. Сохрани исходный язык текста. Если текст не читается, ответь только NO_TEXT.',
+      kk: 'Суреттегі көрінетін мәтінді дәл көшіріп жаз. Тек мәтіннің өзін қайтар. Ешқандай сипаттама, түсініктеме немесе қосымша сөз қоспа. Бастапқы тілін сақта. Егер мәтін оқылмаса, тек NO_TEXT деп жауап бер.',
+    );
+    final userPrompt = _voiceText(
+      ru: 'Верни только видимый текст.',
+      kk: 'Көрінетін мәтінді ғана қайтар.',
+    );
+
+    try {
+      appLog('[TextReader][vision_fallback] start');
+      final raw = await _openAi.askWithImage(
+        userPrompt,
+        jpegBytes,
+        systemPrompt: _openAi.buildSystemPrompt(basePrompt: systemPrompt),
+        history: const <OpenAiChatMessage>[],
+        taskMode: 'text_reader_ocr',
+        perceptionSnapshot: const <String, Object?>{'ocr_only': true},
+        maxOutputTokens: 220,
+      );
+      final text = _postprocessTextReaderVisionTranscript(raw);
+      if (text.isEmpty) {
+        appLog('[TextReader][vision_fallback] empty');
+        return null;
+      }
+      appLog(
+        '[TextReader][vision_fallback] ok text="${_truncateForLog(text)}"',
+      );
+      return text;
+    } on LlmRateLimitException catch (e) {
+      appLog('[TextReader][vision_fallback] rate_limit: ${e.message}');
+      return null;
+    } catch (e) {
+      appLog('[TextReader][vision_fallback] error: $e');
+      return null;
+    }
+  }
+
+  String _postprocessTextReaderVisionTranscript(String rawText) {
+    var text = rawText.trim();
+    if (text.isEmpty) return '';
+    if (text.toUpperCase() == 'NO_TEXT') return '';
+    text = text
+        .replaceFirst(
+          RegExp(
+            r'^(видимый текст|текст|прочитанный текст|мәтін)\s*[:\-]\s*',
+            caseSensitive: false,
+            unicode: true,
+          ),
+          '',
+        )
+        .trim();
+    text = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (text.isEmpty) return '';
+    if (_visionIncompleteMessage() == text) return '';
+    return text;
+  }
+
+  String _buildDirectTextReadAnswer(
+    String spokenText, {
+    OnDeviceTextReadResult? result,
+  }) {
+    final text = _truncateForSpeech(spokenText, maxChars: 220);
+    if (text.isEmpty) {
+      return _textReaderFailureMessage();
+    }
+    final isLatinManual = TextReadingNormalizer.shouldUseEnglishTts(text);
+    final parts = <String>[];
+    if (result?.price != null) {
+      parts.add(
+        _voiceText(
+          ru: 'Цена ${result!.price!.toStringAsFixed(result.price! % 1 == 0 ? 0 : 2)}',
+          kk: 'Бағасы ${result!.price!.toStringAsFixed(result.price! % 1 == 0 ? 0 : 2)}',
+        ),
+      );
+    }
+    if (result?.calories != null) {
+      parts.add(
+        _voiceText(
+          ru: 'Калорийность ${result!.calories} ккал',
+          kk: 'Калориясы ${result!.calories} ккал',
+        ),
+      );
+    }
+    final meta = parts.isEmpty ? '' : '${parts.join('. ')}. ';
+    if (isLatinManual && meta.isEmpty) {
+      return text;
+    }
+    return _voiceText(
+      ru: '${meta}Прочитанный текст: $text',
+      kk: '${meta}Оқылған мәтін: $text',
+    );
+  }
+
+  String _textReaderFailureMessage() {
+    return _voiceText(
+      ru: 'Не смогла уверенно прочитать текст. Поднесите ближе и держите ровно.',
+      kk: 'Мәтінді сенімді оқи алмадым. Камераны жақындатып, түзу ұстаңыз.',
+    );
+  }
+
+  Future<void> _handleShoppingModeCommand(String userText) async {
+    final normalized = _router.normalize(userText);
+    if (normalized.contains('цен') ||
+        normalized.contains('бағ') ||
+        normalized.contains('price')) {
+      await _handleTextReaderModeCommand(userText);
+      return;
+    }
+    if (_looksLikeShoppingListSetup(userText)) {
+      final session = await _shoppingModeService.startSessionFromText(userText);
+      final items = session.items.map((item) => item.name).join(', ');
+      final answer = _voiceText(
+        ru: 'Список покупок запущен: $items.',
+        kk: 'Тізім басталды: $items.',
+      );
+      _rememberDialogTurn(userText, answer);
+      _lastAnswer = answer;
+      await _speak(answer);
+      return;
+    }
+
+    final pickedItem = _extractPickedShoppingItem(userText);
+    if (pickedItem != null) {
+      final session = await _shoppingModeService.markPicked(pickedItem);
+      if (session == null) {
+        await _speak(
+          _voiceText(
+            ru: 'Сначала продиктуйте список покупок.',
+            kk: 'Алдымен тізімді айтыңыз.',
+          ),
+        );
+        return;
+      }
+      final pending = session.pendingItems.map((item) => item.name).join(', ');
+      final answer = pending.isEmpty
+          ? _voiceText(
+              ru: 'Все покупки отмечены.',
+              kk: 'Барлық сатып алу белгіленді.',
+            )
+          : _voiceText(
+              ru: 'Отметила. Осталось: $pending.',
+              kk: 'Белгіледім. Қалғаны: $pending.',
+            );
+      _rememberDialogTurn(userText, answer);
+      _lastAnswer = answer;
+      await _speak(answer);
+      return;
+    }
+
+    final session = await _shoppingModeService.currentSession();
+    if (session == null || session.items.isEmpty) {
+      await _speak(
+        _voiceText(
+          ru: 'В режиме шопинга сначала скажите список покупок.',
+          kk: 'Сатып алу режимінде алдымен тізімді айтыңыз.',
+        ),
+      );
+      return;
+    }
+
+    final pending = session.pendingItems;
+    if (_asksShoppingStatus(userText)) {
+      final answer = pending.isEmpty
+          ? _voiceText(ru: 'Список уже закрыт.', kk: 'Тізім толық жабылды.')
+          : _voiceText(
+              ru: 'Осталось купить: ${pending.map((item) => item.name).join(', ')}.',
+              kk: 'Қалған тауарлар: ${pending.map((item) => item.name).join(', ')}.',
+            );
+      _rememberDialogTurn(userText, answer);
+      _lastAnswer = answer;
+      await _speak(answer);
+      return;
+    }
+
+    final target = _extractFindTarget(userText) ?? pending.first.name;
+    await _describeWithVision(
+      'Найди товар: $target. Подскажи направление и как взять.',
+      systemPrompt: _buildVisionPrompt(
+        extraInstruction: _voiceText(
+          ru: 'Это shopping режим. Ищи товар на полке, говори коротко направление и конкретное действие для подхода.',
+          kk: 'Бұл shopping режимі. Тауарды ізде, сөре бағытын қысқа айт, жақындау үшін нақты қимыл ұсын.',
+        ),
+      ),
+    );
+  }
+
+  Future<void> _handleCookingModeCommand(String userText) async {
+    await _describeWithVision(userText, systemPrompt: _buildVisionPrompt());
+  }
+
+  Future<void> _handleDressCodeModeCommand(String userText) async {
+    final answer = await _buildDressCodeAnswer(userText);
+    _rememberDialogTurn(userText, answer);
+    _lastAnswer = answer;
+    await _speak(answer);
+  }
+
+  Future<void> _handleAntiFraudModeCommand(String userText) async {
+    final normalized = _router.normalize(userText);
+    if (normalized.contains('цена') ||
+        normalized.contains('чек') ||
+        normalized.contains('калор')) {
+      await _handleTextReaderModeCommand(userText);
+      return;
+    }
+    await _describeWithVision(userText, systemPrompt: _buildVisionPrompt());
+  }
+
+  Future<void> _handleMemoryModeCommand(String userText) async {
+    final anchorName = _extractMemoryAnchorName(userText);
+    if (anchorName != null) {
+      String? summary;
+      try {
+        if (_looksLikeSceneMemoryCapture(anchorName)) {
+          summary = await _captureSceneAnchorSummary(anchorName);
+        } else {
+          summary = anchorName;
+        }
+      } catch (e) {
+        appLog('[Memory] save anchor failed: $e');
+      }
+      if (summary == null) {
+        await _speak(
+          _voiceText(
+            ru: 'Не смогла надежно сохранить текущую сцену.',
+            kk: 'Сахнаны сенімді сақтай алмадым.',
+          ),
+        );
+        return;
+      }
+      await _sceneMemoryService.saveAnchor(
+        anchorName: anchorName,
+        summary: summary,
+      );
+      final answer = _voiceText(
+        ru: 'Сохранила как "$anchorName".',
+        kk: '"$anchorName" ретінде сақтадым.',
+      );
+      _rememberDialogTurn(userText, answer);
+      _lastAnswer = answer;
+      await _speak(answer);
+      return;
+    }
+
+    final lookup = _extractMemoryLookupName(userText);
+    if (lookup != null) {
+      final anchor = await _sceneMemoryService.findBestAnchor(lookup);
+      if (anchor == null) {
+        await _speak(
+          _voiceText(
+            ru: 'Не нашла сохраненный якорь с таким именем.',
+            kk: 'Бұл атаумен сақталған якорь табылмады.',
+          ),
+        );
+        return;
+      }
+      final answer = _voiceText(
+        ru: 'Для "${anchor.name}" сохранено: ${anchor.summary}',
+        kk: '"${anchor.name}" үшін сақталған сипаттама: ${anchor.summary}',
+      );
+      _rememberDialogTurn(userText, answer);
+      _lastAnswer = answer;
+      await _speak(answer);
+      return;
+    }
+
+    final anchors = await _sceneMemoryService.recentAnchors();
+    if (anchors.isEmpty) {
+      await _speak(
+        _voiceText(
+          ru: 'Пока нет сохраненных якорей сцены.',
+          kk: 'Әзірге сақталған сахна якорьлері жоқ.',
+        ),
+      );
+      return;
+    }
+    final answer = _voiceText(
+      ru: 'Последние сохраненные якоря: ${anchors.map((item) => item.name).join(', ')}.',
+      kk: 'Соңғы сақталған якорьлер: ${anchors.map((item) => item.name).join(', ')}.',
+    );
+    _rememberDialogTurn(userText, answer);
+    _lastAnswer = answer;
+    await _speak(answer);
+  }
+
+  Future<void> _handleFindModeCommand(String userText) async {
+    final target = _extractFindTarget(userText);
+    if (target == null || target.isEmpty) {
+      await _speak(
+        _voiceText(
+          ru: 'Скажите, что именно нужно найти.',
+          kk: 'Нені табу керек екенін айтыңыз.',
+        ),
+      );
+      return;
+    }
+    final match = _matchFindTargetAgainstDetections(target);
+    if (match != null) {
+      final answer = _buildFindDetectionAnswer(target, match);
+      _rememberDialogTurn(userText, answer);
+      _lastAnswer = answer;
+      await _speak(answer);
+      return;
+    }
+    await _describeWithVision(
+      'Найди объект: $target. Скажи, виден ли он и куда двигаться.',
+      systemPrompt: _buildVisionPrompt(),
+    );
+  }
+
+  Future<void> _enterNavigationMode() async {
+    if (_assistantMode == AssistantMode.navigation) {
+      await _speak(_voiceL10n.routeModeAlreadyEnabled);
+      return;
+    }
+    final changed = await _switchAssistantMode(
+      AssistantMode.navigation,
+      reason: 'intent_enter_nav',
+    );
+    if (!changed) {
+      await _speak(_voiceL10n.commandProcessingFailed);
     }
   }
 
   Future<void> _exitNavigationMode() async {
-    if (_assistantMode == AssistantMode.general) {
-      await _speak(_l10n.routeModeNotEnabled);
+    if (_assistantMode != AssistantMode.navigation) {
+      await _speak(_voiceL10n.routeModeNotEnabled);
       return;
     }
-    await _tts.stop();
-    await _navigationController.exitMode();
-    _lastNavCameraTarget = null;
-    _assistantMode = AssistantMode.general;
-    unawaited(_initCameraLive());
+    final changed = await _switchAssistantMode(
+      AssistantMode.general,
+      reason: 'intent_exit_nav',
+    );
+    if (!changed) {
+      await _speak(_voiceL10n.commandProcessingFailed);
+    }
+  }
+
+  Future<bool> _switchAssistantMode(
+    AssistantMode target, {
+    required String reason,
+    bool autoTriggered = false,
+  }) async {
+    if (_assistantMode == target) return true;
+    if (!_isModeEnabled(target)) return false;
+
+    if (_assistantMode == AssistantMode.navigation &&
+        target != AssistantMode.navigation) {
+      await _navigationController.exitMode();
+      _lastNavCameraTarget = null;
+    }
+
+    if (target == AssistantMode.navigation &&
+        _assistantMode != AssistantMode.navigation) {
+      await _navigationController.enterMode();
+      if (!_navigationController.state.value.modeEnabled) {
+        return false;
+      }
+      _lastNavCameraTarget = null;
+      if (_modeNeedsLiveCamera(target)) {
+        unawaited(_initCameraLive());
+      }
+    } else if (_modeNeedsLiveCamera(target)) {
+      unawaited(_initCameraLive());
+    } else {
+      unawaited(_stopCameraStream(reason: 'mode_switch_$reason'));
+    }
+
+    unawaited(_tts.stop());
+    _assistantMode = target;
+    if (target != AssistantMode.textReader) {
+      _resetTextReaderAutoState(clearLastSignature: true);
+      _textReaderAutoPaused = false;
+      _textReaderSessionCancelRequested = false;
+    } else {
+      _resetTextReaderAutoState(clearLastSignature: true);
+      _textReaderAutoPaused = false;
+      _textReaderSessionCancelRequested = false;
+    }
+    _modeOrchestrator.transitionTo(
+      _toJanarymMode(target),
+      subState: 'active',
+      autoTriggered: autoTriggered,
+      autoTriggeredBy: reason,
+    );
+    unawaited(_syncHeavyServices());
+
     if (mounted) {
       setState(() {});
     }
+    appLog('[Mode] switched to ${target.name} (reason=$reason)');
+    return true;
   }
 
   Future<void> _askGpt(String text, {String? systemPrompt}) async {
@@ -2156,7 +4777,7 @@ class _JanarymHomeState extends State<JanarymHome>
       _gptStatus = GptStatus.loading;
       _gptError = '';
     });
-    debugPrint('[GPT] start');
+    appLog('[GPT] start');
     final localRequestId = _requestId;
     if (!_thinkingSoundPlayed) {
       _thinkingSoundPlayed = true;
@@ -2193,6 +4814,9 @@ class _JanarymHomeState extends State<JanarymHome>
         text,
         systemPrompt: mergedSystemPrompt,
         history: _dialogHistoryMessages(),
+        contextMode: _assistantModeContextKey(_assistantMode),
+        safetyContext: _activeSafetyContext(),
+        sceneSummary: _sceneSummaryForPrompt(),
         maxOutputTokens: _maxTextOutputTokens(),
       );
       final answer = _postprocessDialogAnswer(rawAnswer);
@@ -2203,11 +4827,11 @@ class _JanarymHomeState extends State<JanarymHome>
         _lastAnswer = answer;
       });
       _rememberDialogTurn(text, answer);
-      debugPrint('[GPT] ok');
+      appLog('[GPT] ok');
       _setCircleState(CircleState.speaking);
       await _speak(answer);
       if (_micGranted) {
-        await _speak(_l10n.followUpNeedAnythingElse);
+        await _speak(_voiceL10n.followUpNeedAnythingElse);
         await _startFollowUpWindow();
       }
     } on LlmRateLimitException catch (e) {
@@ -2218,7 +4842,7 @@ class _JanarymHomeState extends State<JanarymHome>
         _gptStatus = GptStatus.error;
         _gptError = e.message;
       });
-      debugPrint('[GPT] rate limit: ${e.message}');
+      appLog('[GPT] rate limit: ${e.message}');
       await _speak(_llmRateLimitMessage());
     } catch (e) {
       if (!mounted) return;
@@ -2227,8 +4851,8 @@ class _JanarymHomeState extends State<JanarymHome>
         _gptStatus = GptStatus.error;
         _gptError = e.toString();
       });
-      debugPrint('[GPT] error: $e');
-      await _speak(_l10n.commandProcessingFailed);
+      appLog('[GPT] error: $e');
+      await _speak(_voiceL10n.commandProcessingFailed);
     }
     _thinkingSoundPlayed = false;
   }
@@ -2243,7 +4867,7 @@ class _JanarymHomeState extends State<JanarymHome>
       _gptStatus = GptStatus.loading;
       _gptError = '';
     });
-    debugPrint('[GPT] vision start');
+    appLog('[GPT] vision start');
     final localRequestId = _requestId;
     if (!_thinkingSoundPlayed) {
       _thinkingSoundPlayed = true;
@@ -2262,15 +4886,17 @@ class _JanarymHomeState extends State<JanarymHome>
         imageBytes,
         systemPrompt: mergedSystemPrompt,
         history: _dialogHistoryMessages(),
+        taskMode: _assistantModeContextKey(_assistantMode),
+        perceptionSnapshot: _buildPerceptionSnapshot(),
         maxOutputTokens: _maxVisionOutputTokens(),
       );
-      debugPrint('[GPT] vision raw: ${_truncateForLog(rawAnswer)}');
+      appLog('[GPT] vision raw: ${_truncateForLog(rawAnswer)}');
       var answer = _postprocessVisionAnswer(
         rawAnswer,
         allowNumbers: allowNumbers,
       );
       answer = _postprocessDialogAnswer(answer);
-      debugPrint(
+      appLog(
         '[GPT] vision final (allowNumbers=$allowNumbers): '
         '${_truncateForLog(answer)}',
       );
@@ -2281,11 +4907,11 @@ class _JanarymHomeState extends State<JanarymHome>
         _lastAnswer = answer;
       });
       _rememberDialogTurn(text, answer);
-      debugPrint('[GPT] vision ok');
+      appLog('[GPT] vision ok');
       _setCircleState(CircleState.speaking);
       await _speak(answer);
       if (_micGranted) {
-        await _speak(_l10n.followUpNeedAnythingElse);
+        await _speak(_voiceL10n.followUpNeedAnythingElse);
         await _startFollowUpWindow();
       }
     } on LlmRateLimitException catch (e) {
@@ -2296,7 +4922,7 @@ class _JanarymHomeState extends State<JanarymHome>
         _gptStatus = GptStatus.error;
         _gptError = e.message;
       });
-      debugPrint('[GPT] vision rate limit: ${e.message}');
+      appLog('[GPT] vision rate limit: ${e.message}');
       await _speak(_llmRateLimitMessage());
     } catch (e) {
       if (!mounted) return;
@@ -2305,8 +4931,8 @@ class _JanarymHomeState extends State<JanarymHome>
         _gptStatus = GptStatus.error;
         _gptError = e.toString();
       });
-      debugPrint('[GPT] vision error: $e');
-      await _speak(_l10n.commandProcessingFailed);
+      appLog('[GPT] vision error: $e');
+      await _speak(_voiceL10n.commandProcessingFailed);
     }
     _thinkingSoundPlayed = false;
   }
@@ -2315,7 +4941,7 @@ class _JanarymHomeState extends State<JanarymHome>
     if (!_cameraGranted) {
       await _initCameraLive();
       if (!_cameraGranted) {
-        await _speak(_l10n.noCameraAccess);
+        await _speak(_voiceL10n.noCameraAccess);
         return;
       }
     }
@@ -2333,27 +4959,27 @@ class _JanarymHomeState extends State<JanarymHome>
         timeout: const Duration(milliseconds: 1200),
       );
       if (!frameReady) {
-        await _speak(_l10n.fastFrameUnavailable);
+        await _speak(_voiceL10n.fastFrameUnavailable);
         return;
       }
     }
 
     final frameAt = _lastFrameAt;
     if (frameAt == null) {
-      await _speak(_l10n.frameUnavailable);
+      await _speak(_voiceL10n.frameUnavailable);
       return;
     }
 
     final ageMs = DateTime.now().difference(frameAt).inMilliseconds;
     if (ageMs > _maxFrameAgeMs &&
         !await _waitForFreshFrame(timeout: const Duration(milliseconds: 500))) {
-      await _speak(_l10n.staleFrameUnavailable);
+      await _speak(_voiceL10n.staleFrameUnavailable);
       return;
     }
 
-    debugPrint('[VISION] send last frame to GPT');
+    appLog('[VISION] send last frame to GPT');
     final frame = _lastFrame!;
-    final jpegBytes = await compute(_convertYuvToJpeg, frame.toMap());
+    final jpegBytes = await compute(convertNv21ToJpeg, frame.toJpegPayload());
     await _askGptWithImage(
       text,
       jpegBytes,
@@ -2361,9 +4987,640 @@ class _JanarymHomeState extends State<JanarymHome>
     );
   }
 
+  Future<Uint8List?> _captureLatestJpegFrame() async {
+    if (!_cameraGranted) {
+      await _initCameraLive();
+      if (!_cameraGranted) return null;
+    }
+    if (!_cameraStreaming) {
+      await _startCameraStream(reason: 'jpeg_capture_request');
+    }
+
+    var frameReady = await _waitForFreshFrame(
+      timeout: const Duration(milliseconds: 1400),
+    );
+    if (!frameReady) {
+      await _startCameraStream(reason: 'jpeg_capture_retry');
+      frameReady = await _waitForFreshFrame(
+        timeout: const Duration(milliseconds: 1200),
+      );
+      if (!frameReady || _lastFrame == null) return null;
+    }
+
+    final frameAt = _lastFrameAt;
+    if (frameAt == null || _lastFrame == null) return null;
+    final ageMs = DateTime.now().difference(frameAt).inMilliseconds;
+    if (ageMs > _maxFrameAgeMs &&
+        !await _waitForFreshFrame(timeout: const Duration(milliseconds: 500))) {
+      return null;
+    }
+    return compute(convertNv21ToJpeg, _lastFrame!.toJpegPayload());
+  }
+
+  Future<CameraFrameSnapshot?> _prepareTextReaderFrame({
+    Duration timeout = const Duration(milliseconds: 900),
+  }) async {
+    if (!_currentModeDescriptor().perception.enableOcr) {
+      return null;
+    }
+    if (!_cameraGranted) {
+      await _initCameraLive();
+      if (!_cameraGranted) return null;
+    }
+    if (!_cameraStreaming) {
+      await _startCameraStream(reason: 'ocr_frame_request');
+    }
+    if (!await _waitForFreshFrame(timeout: timeout)) {
+      appLog('[TextReader][frame] no_fresh_frame');
+      return null;
+    }
+    final frame = _lastFrame;
+    final frameAt = _lastFrameAt;
+    if (frame == null || frameAt == null) {
+      appLog('[TextReader][frame] missing_last_frame');
+      return null;
+    }
+    final ageMs = DateTime.now().difference(frameAt).inMilliseconds;
+    if (ageMs > _maxFrameAgeMs) {
+      appLog('[TextReader][frame] stale_frame age_ms=$ageMs');
+      return null;
+    }
+    return frame;
+  }
+
+  Future<OnDeviceTextReadResult?> _readTextFromCurrentFrame({
+    bool force = false,
+    Duration timeout = const Duration(milliseconds: 900),
+  }) async {
+    if (_voicePriorityWindowActive && !force) {
+      return null;
+    }
+    final frame = await _prepareTextReaderFrame(timeout: timeout);
+    if (frame == null) return null;
+    return _textReaderService.readFrame(
+      frame,
+      minInterval: Duration(milliseconds: _textReaderFrameIntervalMs),
+      force: force,
+    );
+  }
+
+  Future<void> _storeOcrRead(OnDeviceTextReadResult result) async {
+    final db = await _personalizationDatabase.database;
+    await db.insert('ocr_reads', <String, Object?>{
+      'read_kind': result.kind,
+      'raw_text': await _securePayloadCodec.encrypt(result.rawText),
+      'price': result.price,
+      'calories': result.calories,
+      'created_at': DateTime.now().millisecondsSinceEpoch,
+    });
+    await _personalizationDatabase.pruneOcrReads(maxEntries: 100);
+  }
+
+  void _publishTextReadEvent(
+    OnDeviceTextReadResult result, {
+    _TextReaderReadSource? source,
+    double? selectedScore,
+  }) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _perceptionEventBus.publish(
+      PerceptionEvent(
+        id: 'text_read_$now',
+        type: PerceptionEventType.textRead,
+        timestampMs: now,
+        confidence: result.hasText ? 0.9 : 0.0,
+        label: result.kind,
+        meta: <String, Object?>{
+          'raw_text': result.rawText,
+          'speech_text': result.manualSpeechText,
+          'lines': result.lines,
+          'speech_lines': result.manualSpeechLines,
+          'manual_speech_text': result.manualSpeechText,
+          'manual_speech_lines': result.manualSpeechLines,
+          'manual_fallback_text': result.manualFallbackText,
+          'auto_speech_text': result.autoSpeechText,
+          'auto_speech_lines': result.autoSpeechLines,
+          'dominant_script': result.dominantScript.name,
+          'price': result.price,
+          'calories': result.calories,
+          'mode': _assistantModeContextKey(_assistantMode),
+          'manual_source': source?.name ?? 'auto',
+          'manual_selected_score': selectedScore,
+        },
+      ),
+    );
+  }
+
+  String _buildTextReaderAnswer(
+    OnDeviceTextReadResult result, {
+    required String normalizedUserText,
+    required bool autoRead,
+  }) {
+    final spokenTextSource = autoRead
+        ? result.autoSpeechText
+        : _resolveManualSpeechText(result);
+    final spokenText = _truncateForSpeech(spokenTextSource);
+    final isLatinManual =
+        !autoRead &&
+        TextReadingNormalizer.shouldUseEnglishTts(spokenTextSource);
+    if (normalizedUserText.contains('цен') ||
+        normalizedUserText.contains('price')) {
+      if (result.price != null) {
+        return _voiceText(
+          ru: 'Цена примерно ${result.price!.toStringAsFixed(result.price! % 1 == 0 ? 0 : 2)}.',
+          kk: 'Бағасы шамамен ${result.price!.toStringAsFixed(result.price! % 1 == 0 ? 0 : 2)}.',
+        );
+      }
+      return _voiceText(
+        ru: 'Цена не читается уверенно. Текст: $spokenText',
+        kk: 'Баға анық көрінбейді. Мәтін: $spokenText',
+      );
+    }
+    if (normalizedUserText.contains('калор') ||
+        normalizedUserText.contains('kcal')) {
+      if (result.calories != null) {
+        return _voiceText(
+          ru: 'Калорийность примерно ${result.calories} ккал.',
+          kk: 'Калориясы шамамен ${result.calories} ккал.',
+        );
+      }
+      return _voiceText(
+        ru: 'Калории не нашла. Прочитанный текст: $spokenText',
+        kk: 'Калория табылмады. Оқылған мәтін: $spokenText',
+      );
+    }
+
+    final parts = <String>[];
+    if (result.price != null) {
+      parts.add(
+        _voiceText(
+          ru: 'Цена ${result.price!.toStringAsFixed(result.price! % 1 == 0 ? 0 : 2)}',
+          kk: 'Бағасы ${result.price!.toStringAsFixed(result.price! % 1 == 0 ? 0 : 2)}',
+        ),
+      );
+    }
+    if (result.calories != null) {
+      parts.add(
+        _voiceText(
+          ru: 'Калорийность ${result.calories} ккал',
+          kk: 'Калориясы ${result.calories} ккал',
+        ),
+      );
+    }
+    final prefix = autoRead
+        ? _voiceText(ru: 'Читаю', kk: 'Оқып тұрмын')
+        : _voiceText(ru: 'Прочитанный текст', kk: 'Оқылған мәтін');
+    final meta = parts.isEmpty ? '' : '${parts.join('. ')}. ';
+    if (spokenText.isEmpty) {
+      if (meta.isNotEmpty) {
+        return meta.trimRight();
+      }
+      return _voiceText(
+        ru: 'Не смогла уверенно прочитать текст.',
+        kk: 'Мәтінді сенімді оқи алмадым.',
+      );
+    }
+    if (isLatinManual && meta.isEmpty) {
+      return spokenText;
+    }
+    return '$meta$prefix: $spokenText';
+  }
+
+  String _buildStructuredOnlyTextReaderAnswer(
+    OnDeviceTextReadResult result, {
+    required String normalizedUserText,
+  }) {
+    if (normalizedUserText.contains('цен') ||
+        normalizedUserText.contains('price')) {
+      if (result.price != null) {
+        return _voiceText(
+          ru: 'Цена примерно ${result.price!.toStringAsFixed(result.price! % 1 == 0 ? 0 : 2)}.',
+          kk: 'Бағасы шамамен ${result.price!.toStringAsFixed(result.price! % 1 == 0 ? 0 : 2)}.',
+        );
+      }
+    }
+    if (normalizedUserText.contains('калор') ||
+        normalizedUserText.contains('kcal')) {
+      if (result.calories != null) {
+        return _voiceText(
+          ru: 'Калорийность примерно ${result.calories} ккал.',
+          kk: 'Калориясы шамамен ${result.calories} ккал.',
+        );
+      }
+    }
+
+    final parts = <String>[];
+    if (result.price != null) {
+      parts.add(
+        _voiceText(
+          ru: 'Цена ${result.price!.toStringAsFixed(result.price! % 1 == 0 ? 0 : 2)}',
+          kk: 'Бағасы ${result.price!.toStringAsFixed(result.price! % 1 == 0 ? 0 : 2)}',
+        ),
+      );
+    }
+    if (result.calories != null) {
+      parts.add(
+        _voiceText(
+          ru: 'Калорийность ${result.calories} ккал',
+          kk: 'Калориясы ${result.calories} ккал',
+        ),
+      );
+    }
+    if (parts.isEmpty) {
+      return _textReaderFailureMessage();
+    }
+    return parts.join('. ');
+  }
+
+  void _syncTextReaderLoop() {
+    final perception = _currentModeDescriptor().perception;
+    final shouldRun =
+        WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed &&
+        perception.enableAutoTextReader &&
+        !_voicePriorityWindowActive &&
+        !_textReaderAutoPaused &&
+        _featureFlags.textReaderEnabled;
+    if (!shouldRun) {
+      _textReaderLoopTimer?.cancel();
+      _textReaderLoopTimer = null;
+      _textReaderLoopBusy = false;
+      _resetTextReaderAutoState();
+      return;
+    }
+    if (_textReaderLoopTimer != null) return;
+    _textReaderLoopTimer = Timer.periodic(
+      Duration(milliseconds: _textReaderFrameIntervalMs),
+      (_) {
+        unawaited(_runAutoTextReaderTick());
+      },
+    );
+    unawaited(_runAutoTextReaderTick());
+  }
+
+  Future<void> _runAutoTextReaderTick() async {
+    final perception = _currentModeDescriptor().perception;
+    if (_textReaderLoopBusy ||
+        !perception.enableAutoTextReader ||
+        !_featureFlags.textReaderEnabled) {
+      return;
+    }
+    if (_commandInFlight ||
+        _followUpActive ||
+        _wakeHandling ||
+        _isSpeaking ||
+        _manualTextReadInProgress ||
+        _textReaderAutoPaused ||
+        !_cameraGranted ||
+        !_cameraStreaming) {
+      return;
+    }
+    _textReaderLoopBusy = true;
+    try {
+      final result = await _readTextFromCurrentFrame();
+      if (result == null || !result.hasRawText) {
+        _resetTextReaderAutoState();
+        appLog('[TextReader][auto] skip no_result');
+        return;
+      }
+
+      if (_assistantMode == AssistantMode.textReader) {
+        if (_shouldTriggerAutoExactTextRead(result)) {
+          final score = _scoreManualTextReadCandidate(result);
+          final resolvedText = _resolveManualSpeechText(result);
+          appLog(
+            '[TextReader][auto] trigger_exact_read '
+            'score=${score.toStringAsFixed(1)} '
+            'raw="${_truncateForLog(result.rawText)}" '
+            'text="${_truncateForLog(resolvedText)}"',
+          );
+          await _pauseWakeFallbackForAutoTextRead();
+          _resetTextReaderAutoState();
+          await _runManualTextReadSession(
+            _voiceText(ru: 'авточтение', kk: 'автоматты оқу'),
+            source: _TextReaderReadSource.auto,
+          );
+        }
+        return;
+      }
+
+      final autoSegments = _buildAutoTextReaderSpeechSegments(result);
+      final autoAnswer = _buildTextReaderAnswer(
+        result,
+        normalizedUserText: '',
+        autoRead: true,
+      );
+      final canSpeakAutoSegments =
+          autoSegments.isNotEmpty && result.isAutoSpeakSafe;
+      if (canSpeakAutoSegments) {
+        final signature = _buildTextReaderSpeechSignature(
+          autoSegments,
+          result: result,
+        );
+        if (_markAutoTextReaderCandidateSeen(signature) &&
+            _shouldSpeakAutoTextReaderTranscript(
+              autoSegments,
+              result: result,
+            )) {
+          await _storeOcrRead(result);
+          _publishTextReadEvent(result, source: _TextReaderReadSource.auto);
+          _lastAnswer = autoAnswer;
+          appLog(
+            '[TextReader][auto] raw="${_truncateForLog(result.rawText)}" '
+            'auto="${_truncateForLog(result.autoSpeechText)}"',
+          );
+          await _speakTextReaderSegments(autoSegments, autoRead: true);
+          _resetTextReaderAutoState();
+        }
+        return;
+      }
+
+      final canSpeakStructuredOnly = shouldAutoSpeakStructuredOnly(
+        hasStructuredData: result.hasStructuredData,
+        isAutoSpeakSafe: result.isAutoSpeakSafe,
+      );
+      if (canSpeakStructuredOnly) {
+        final signature = _buildTextReaderSpeechSignature(<String>[
+          autoAnswer,
+        ], result: result);
+        if (_markAutoTextReaderCandidateSeen(signature) &&
+            _shouldSpeakAutoTextReaderTranscript(<String>[
+              autoAnswer,
+            ], result: result)) {
+          await _storeOcrRead(result);
+          _publishTextReadEvent(result, source: _TextReaderReadSource.auto);
+          _lastAnswer = autoAnswer;
+          appLog(
+            '[TextReader][auto] structured="${_truncateForLog(autoAnswer)}"',
+          );
+          await _ensureTtsLocaleForReadResult(result, autoRead: true);
+          await _speak(autoAnswer, ensureLocale: false);
+          _resetTextReaderAutoState();
+        }
+        return;
+      }
+
+      if (_shouldTryAutoTextReaderVisionFallback(result)) {
+        final fallbackText = await _tryTextReaderVisionFallback();
+        if (fallbackText != null) {
+          final transcriptSegments = _splitTextReaderSpeechSegments(
+            fallbackText,
+          );
+          if (transcriptSegments.isNotEmpty &&
+              _shouldSpeakAutoTextReaderTranscript(
+                transcriptSegments,
+                result: result,
+              )) {
+            final answer = _buildDirectTextReadAnswer(
+              fallbackText,
+              result: result,
+            );
+            await _storeOcrRead(result);
+            _publishTextReadEvent(result, source: _TextReaderReadSource.auto);
+            _lastAnswer = answer;
+            appLog(
+              '[TextReader][auto] vision_fallback '
+              'text="${_truncateForLog(fallbackText)}"',
+            );
+            await _speakTextReaderSegments(transcriptSegments, autoRead: false);
+            _resetTextReaderAutoState();
+            return;
+          }
+        }
+      }
+
+      _resetTextReaderAutoState();
+      final reason = !result.isAutoSpeakSafe
+          ? 'unsafe_auto_text'
+          : 'no_auto_text';
+      appLog(
+        '[TextReader][auto] skip $reason '
+        'raw="${_truncateForLog(result.rawText)}" '
+        'auto="${_truncateForLog(result.autoSpeechText)}"',
+      );
+    } finally {
+      _textReaderLoopBusy = false;
+      if (mounted) {
+        _syncWakeFallbackMode(_wakeService.state.value);
+      }
+    }
+  }
+
+  String _truncateForSpeech(String text, {int maxChars = 160}) {
+    final compact = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (compact.length <= maxChars) return compact;
+    return '${compact.substring(0, maxChars).trimRight()}...';
+  }
+
+  bool _looksLikeShoppingListSetup(String text) {
+    final normalized = _router.normalize(text);
+    if (normalized.isEmpty) return false;
+    return normalized.contains('список') ||
+        normalized.contains('купить') ||
+        normalized.contains('shopping') ||
+        normalized.contains('шопинг');
+  }
+
+  String? _extractPickedShoppingItem(String text) {
+    final match = RegExp(
+      r'(?:взял|взяла|нашел|нашла|отметь|picked|в корзине)\s+(.+)$',
+      caseSensitive: false,
+      unicode: true,
+    ).firstMatch(text.trim());
+    final value = (match?.group(1) ?? '').trim();
+    return value.isEmpty ? null : value;
+  }
+
+  bool _asksShoppingStatus(String text) {
+    final normalized = _router.normalize(text);
+    return normalized.contains('что осталось') ||
+        normalized.contains('что купить') ||
+        normalized.contains('остат') ||
+        normalized.contains('список');
+  }
+
+  Future<String> _buildDressCodeAnswer(String userText) async {
+    try {
+      final hasPermission = await _ensureLocationPermission();
+      if (!hasPermission) {
+        throw Exception('location_permission_denied');
+      }
+      final position = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.best,
+        ),
+      );
+      final weather = await _openMeteoService.fetchCurrent(
+        latitude: position.latitude,
+        longitude: position.longitude,
+      );
+      if (weather == null) {
+        throw Exception('weather_unavailable');
+      }
+      final weatherText = _voiceIsKazakh
+          ? weather.describeKk()
+          : weather.describeRu();
+      final suggestion = _outfitSuggestion(weather);
+      return _voiceText(
+        ru: 'Сейчас $weatherText. $suggestion',
+        kk: 'Қазір $weatherText. $suggestion',
+      );
+    } catch (_) {
+      return _voiceText(
+        ru: 'Не смогла получить погоду. Но если выходите на улицу, выбирайте закрытую обувь и внешний слой.',
+        kk: 'Ауа райын ала алмадым. Бірақ сыртта жел болса, жабық аяқ киім мен сыртқы қабат таңдаңыз.',
+      );
+    }
+  }
+
+  String _outfitSuggestion(WeatherSnapshot weather) {
+    final temp = weather.temperatureC;
+    final windy = weather.windSpeedKmh >= 20;
+    if (_voiceIsKazakh) {
+      if (temp <= 0) {
+        return windy
+            ? 'Қалың күрте, жылы бас киім және жабық аяқ киім киіңіз.'
+            : 'Жылы күрте мен жабық аяқ киім киіңіз.';
+      }
+      if (temp <= 10) {
+        return windy
+            ? 'Куртка не қалың худи және жабық аяқ киім дұрыс.'
+            : 'Жеңіл күрте мен жабық аяқ киім дұрыс.';
+      }
+      if (temp <= 18) {
+        return 'Жеңіл сыртқы қабат пен ыңғайлы аяқ киім жеткілікті.';
+      }
+      return 'Жеңіл киім жарайды, бірақ күн қатты болса бас киім қосыңыз.';
+    }
+    if (temp <= 0) {
+      return windy
+          ? 'Нужны теплая куртка, шапка и закрытая обувь.'
+          : 'Нужны теплая куртка и закрытая обувь.';
+    }
+    if (temp <= 10) {
+      return windy
+          ? 'Подойдет куртка или плотный худи и закрытая обувь.'
+          : 'Подойдет легкая куртка и закрытая обувь.';
+    }
+    if (temp <= 18) {
+      return 'Хватит легкого верхнего слоя и удобной обуви.';
+    }
+    return 'Подойдет легкая одежда, при ярком солнце добавьте головной убор.';
+  }
+
+  Future<String?> _captureSceneAnchorSummary(String anchorName) async {
+    final jpegBytes = await _captureLatestJpegFrame();
+    if (jpegBytes == null || jpegBytes.isEmpty) return null;
+    final raw = await _openAi.askWithImage(
+      'Опиши устойчивые ориентиры этой сцены для памяти: $anchorName',
+      jpegBytes,
+      systemPrompt: _buildVisionPrompt(
+        extraInstruction: _voiceIsKazakh
+            ? 'Memory режимі. Бір сөйлеммен тек тұрақты ориентирлерді сипатта.'
+            : 'Режим memory. Одним предложением опиши только устойчивые ориентиры сцены.',
+      ),
+      history: _dialogHistoryMessages(),
+      taskMode: _assistantModeContextKey(_assistantMode),
+      perceptionSnapshot: _buildPerceptionSnapshot(),
+      maxOutputTokens: 120,
+    );
+    return _postprocessDialogAnswer(raw);
+  }
+
+  String? _extractMemoryAnchorName(String text) {
+    final match = RegExp(
+      r'(?:запомни|сохрани|помни это как|есте сақта)\s+(.+)$',
+      caseSensitive: false,
+      unicode: true,
+    ).firstMatch(text.trim());
+    final value = (match?.group(1) ?? '').trim();
+    return value.isEmpty ? null : value;
+  }
+
+  String? _extractMemoryLookupName(String text) {
+    final match = RegExp(
+      r'(?:что помнишь про|вспомни|покажи память|еске тусір|еске түсір)\s+(.+)$',
+      caseSensitive: false,
+      unicode: true,
+    ).firstMatch(text.trim());
+    final value = (match?.group(1) ?? '').trim();
+    return value.isEmpty ? null : value;
+  }
+
+  bool _looksLikeSceneMemoryCapture(String text) {
+    final normalized = _router.normalize(text);
+    if (normalized.isEmpty) return false;
+    return normalized.contains('это место') ||
+        normalized.contains('эту сцену') ||
+        normalized.contains('эту комнату') ||
+        normalized.contains('осы жер') ||
+        normalized.contains('осы бөлме');
+  }
+
+  String? _extractFindTarget(String text) {
+    final match = RegExp(
+      r'(?:найди|отыщи|find)\s+(.+)$',
+      caseSensitive: false,
+      unicode: true,
+    ).firstMatch(text.trim());
+    final value = (match?.group(1) ?? '').trim();
+    return value.isEmpty ? null : value;
+  }
+
+  ReflexDetection? _matchFindTargetAgainstDetections(String target) {
+    final normalizedTarget = _normalizeDetectorToken(target);
+    if (normalizedTarget.isEmpty) return null;
+    for (final detection in _latestReflexDetections) {
+      final candidates = <String>{
+        _normalizeDetectorToken(detection.sourceLabel),
+        _normalizeDetectorToken(detection.hazardLabel),
+        _normalizeDetectorToken(_reflexDisplayLabel(detection.hazardLabel)),
+      };
+      if (candidates.any(
+        (candidate) =>
+            candidate.isNotEmpty &&
+            (candidate == normalizedTarget ||
+                candidate.contains(normalizedTarget) ||
+                normalizedTarget.contains(candidate)),
+      )) {
+        return detection;
+      }
+    }
+    return null;
+  }
+
+  String _normalizeDetectorToken(String value) {
+    final normalized = _router.normalize(value).replaceAll(RegExp(r'\s+'), ' ');
+    return normalized
+        .replaceAll('colour', 'color')
+        .replaceAll('велосипед', 'bike')
+        .replaceAll('машина', 'car')
+        .replaceAll('плита', 'hot surface')
+        .replaceAll('острый предмет', 'sharp object')
+        .trim();
+  }
+
+  String _buildFindDetectionAnswer(String target, ReflexDetection detection) {
+    final direction = switch (detection.direction) {
+      'left' => _voiceText(ru: 'слева', kk: 'сол жақта'),
+      'right' => _voiceText(ru: 'справа', kk: 'оң жақта'),
+      _ => _voiceText(ru: 'прямо перед вами', kk: 'тура алда'),
+    };
+    final action = switch (detection.direction) {
+      'left' => _voiceText(
+        ru: 'поверните немного влево',
+        kk: 'сол жаққа бұрылыңыз',
+      ),
+      'right' => _voiceText(
+        ru: 'поверните немного вправо',
+        kk: 'оң жаққа бұрылыңыз',
+      ),
+      _ => _voiceText(ru: 'сделайте шаг вперед', kk: 'бір қадам алға жылжыңыз'),
+    };
+    return '$target $direction. $action.';
+  }
+
   Future<void> _repeatLastAnswer() async {
     if (_lastAnswer.trim().isEmpty) {
-      await _speak(_l10n.noAnswerToRepeat);
+      await _speak(_voiceL10n.noAnswerToRepeat);
       return;
     }
     await _speak(_lastAnswer);
@@ -2555,10 +5812,10 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   String _visionIncompleteMessage() {
-    if (widget.appLanguage == AppLanguage.kk) {
-      return 'Кадр толық оқылмады. Камераны дәлдеп, "қайта сипатта" деп айтыңыз.';
-    }
-    return 'Не удалось полностью описать кадр. Наведите камеру точнее и скажите: "опиши ещё раз".';
+    return _voiceText(
+      ru: 'Не удалось полностью описать кадр. Наведите камеру точнее и скажите: "опиши ещё раз".',
+      kk: 'Кадр толық оқылмады. Камераны дәлдеп, "қайта сипатта" деп айтыңыз.',
+    );
   }
 
   Future<bool> _waitForFreshFrame({
@@ -2614,10 +5871,10 @@ class _JanarymHomeState extends State<JanarymHome>
   String _llmRateLimitMessage({Duration? wait}) {
     final left = wait ?? _llmRateLimitRemaining();
     final seconds = left == null ? 35 : left.inSeconds.clamp(1, 120);
-    if (widget.appLanguage == AppLanguage.kk) {
-      return 'Сұрау лимиті уақытша асып кетті. $seconds секунд күтіп, қайта айтыңыз.';
-    }
-    return 'Лимит запросов временно превышен. Подождите $seconds секунд и повторите.';
+    return _voiceText(
+      ru: 'Лимит запросов временно превышен. Подождите $seconds секунд и повторите.',
+      kk: 'Сұрау лимиті уақытша асып кетті. $seconds секунд күтіп, қайта айтыңыз.',
+    );
   }
 
   _DialogBrevityMode _parseInitialBrevityMode(String raw) {
@@ -2661,7 +5918,7 @@ class _JanarymHomeState extends State<JanarymHome>
   void _clearDialogHistory() {
     if (_dialogHistory.isEmpty) return;
     _dialogHistory.clear();
-    debugPrint('[Dialog] context cleared');
+    appLog('[Dialog] context cleared');
   }
 
   void _rememberDialogTurn(String userText, String assistantText) {
@@ -2738,10 +5995,10 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   String _assistantFallbackAnswer() {
-    if (widget.appLanguage == AppLanguage.kk) {
-      return 'Түсіндім. Қысқаша жауап берейін: JANARYM дауыспен жұмыс істейді, камерадан сипаттайды және маршрут режимін жүргізеді.';
-    }
-    return 'Поняла. Кратко: JANARYM работает голосом, описывает кадр с камеры и ведёт в режиме маршрута.';
+    return _voiceText(
+      ru: 'Поняла. Кратко: JANARYM работает голосом, описывает кадр с камеры и ведёт в режиме маршрута.',
+      kk: 'Түсіндім. Қысқаша жауап берейін: JANARYM дауыспен жұмыс істейді, камерадан сипаттайды және маршрут режимін жүргізеді.',
+    );
   }
 
   String _compressToShortAnswer(String text) {
@@ -2892,24 +6149,22 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   String _dialogStyleConfirmationText() {
-    if (widget.appLanguage == AppLanguage.kk) {
-      switch (_dialogBrevityMode) {
-        case _DialogBrevityMode.short:
-          return 'Түсіндім. Енді қысқа, тек маңыздысын айтамын.';
-        case _DialogBrevityMode.detailed:
-          return 'Жақсы, енді толығырақ жауап беремін.';
-        case _DialogBrevityMode.auto:
-          return 'Жақсы, енді әдеттегі форматта жауап беремін.';
-      }
-    }
-
     switch (_dialogBrevityMode) {
       case _DialogBrevityMode.short:
-        return 'Поняла. Теперь отвечаю коротко и только по важному.';
+        return _voiceText(
+          ru: 'Поняла. Теперь отвечаю коротко и только по важному.',
+          kk: 'Түсіндім. Енді қысқа, тек маңыздысын айтамын.',
+        );
       case _DialogBrevityMode.detailed:
-        return 'Хорошо, теперь отвечаю подробнее.';
+        return _voiceText(
+          ru: 'Хорошо, теперь отвечаю подробнее.',
+          kk: 'Жақсы, енді толығырақ жауап беремін.',
+        );
       case _DialogBrevityMode.auto:
-        return 'Хорошо, возвращаю обычный формат ответа.';
+        return _voiceText(
+          ru: 'Хорошо, возвращаю обычный формат ответа.',
+          kk: 'Жақсы, енді әдеттегі форматта жауап беремін.',
+        );
     }
   }
 
@@ -2994,37 +6249,37 @@ class _JanarymHomeState extends State<JanarymHome>
 
   String _capabilitiesAnswer() {
     final short = _dialogBrevityMode == _DialogBrevityMode.short;
-    final mode = _assistantMode == AssistantMode.navigation
-        ? (widget.appLanguage == AppLanguage.kk
-              ? 'Қазір маршрут режиміндемін.'
-              : 'Сейчас я в режиме маршрута.')
-        : (widget.appLanguage == AppLanguage.kk
-              ? 'Қазір жалпы режимдемін.'
-              : 'Сейчас я в обычном режиме.');
-    if (widget.appLanguage == AppLanguage.kk) {
+    final mode = _voiceText(
+      ru: 'Сейчас я в режиме: ${_spokenModeDisplayName(_assistantMode)}.',
+      kk: 'Қазір ${_spokenModeDisplayName(_assistantMode)} режиміндемін.',
+    );
+    final enabledModes = _availableModes()
+        .map(_spokenModeDisplayName)
+        .join(', ');
+    if (_voiceIsKazakh) {
       if (short) {
-        return '$mode Мен JANARYM ішінде дауыспен жұмыс істеймін: камерадағы көріністі сипаттаймын, маршрут режимін жүргіземін және командаларыңызды орындаймын.';
+        return '$mode Мен JANARYM ішінде дауыс, камера және режимдік көмек арқылы жұмыс істеймін. Қолжетімді режимдер: $enabledModes.';
       }
-      return '$mode Мен JANARYM ішіндегі ассистентпін. Негізгі мүмкіндіктерім: ояту сөзімен дауыстық диалог, камерадағы көріністі қысқаша сипаттау, маршрут режимін қосу/өшіру, маршрут құру, келесі қадам мен маршрут күйін айту, сондай-ақ үй/жұмыс сияқты меткаларға маршрут бастау.';
+      return '$mode Мен JANARYM ішіндегі ассистентпін. Негізгі мүмкіндіктерім: ояту сөзімен диалог, камерадағы көріністі қысқа сипаттау, қауіп туралы автоматты ескерту, маршрутты бастау, үйге апару, нысанды табу, есте сақтау, мәтін оқу, шоппинг, дайындау, дрескод және антимошенничество сценарийлері. Қолжетімді режимдер: $enabledModes.';
     }
     if (short) {
-      return '$mode Я ассистент JANARYM: работаю голосом, описываю кадр с камеры и веду в режиме маршрута.';
+      return '$mode Я ассистент JANARYM: работаю голосом, камерой и режимами задач. Доступные режимы: $enabledModes.';
     }
-    return '$mode Я ассистент внутри JANARYM. Могу: работать по wake-слову «Жанарым», описывать сцену с камеры, включать и вести режим маршрута, строить маршрут до адреса или метки, озвучивать статус и следующий шаг, и менять стиль ответа (коротко/подробно).';
+    return '$mode Я ассистент внутри JANARYM. Могу: работать по wake-слову «Жанарым», кратко описывать сцену с камеры, автоматически предупреждать об опасности, вести маршрут, вести домой по сохраненной точке, искать объект, хранить память, читать текст, помогать в шоппинге, готовке, дрескоде и антимошенничестве. Доступные режимы: $enabledModes.';
   }
 
   String _identityAnswer() {
-    if (widget.appLanguage == AppLanguage.kk) {
-      return 'Менің атым JANARYM ассистенті. Мен осы қолданбаның ішінде сізге дауыспен, камерамен және маршрут режимімен көмектесемін.';
-    }
-    return 'Я ассистент JANARYM внутри этого приложения. Помогаю голосом, камерой и режимом маршрута.';
+    return _voiceText(
+      ru: 'Я ассистент JANARYM внутри этого приложения. Помогаю голосом, камерой и режимом маршрута.',
+      kk: 'Менің атым JANARYM ассистенті. Мен осы қолданбаның ішінде сізге дауыспен, камерамен және маршрут режимімен көмектесемін.',
+    );
   }
 
   String _routeModeHelpAnswer(bool detailed) {
     final short = !detailed || _dialogBrevityMode == _DialogBrevityMode.short;
     final navState = _navigationController.state.value;
     final routeActive = navState.activeRoute != null;
-    if (widget.appLanguage == AppLanguage.kk) {
+    if (_voiceIsKazakh) {
       if (short) {
         final stateLine = routeActive
             ? 'Қазір маршрут белсенді.'
@@ -3050,7 +6305,7 @@ class _JanarymHomeState extends State<JanarymHome>
 
   String _dialogStylePromptTail() {
     if (_dialogBrevityMode == _DialogBrevityMode.auto) return '';
-    if (widget.appLanguage == AppLanguage.kk) {
+    if (_voiceIsKazakh) {
       if (_dialogBrevityMode == _DialogBrevityMode.short) {
         return 'Жауап 1-2 қысқа сөйлем болсын, тек маңызды ақпаратты айт.';
       }
@@ -3063,7 +6318,11 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   String _projectCapabilitiesPrompt({required bool navigationMode}) {
-    if (widget.appLanguage == AppLanguage.kk) {
+    final enabledModes = _availableModes()
+        .map(_spokenModeDisplayName)
+        .join(', ');
+    final releaseStage = _featureFlags.releaseStage;
+    if (_voiceIsKazakh) {
       final modeLine = navigationMode
           ? 'Қазір маршрут режимі қосулы, навигация контекстін ұстан.'
           : 'Қазір жалпы режим қосулы.';
@@ -3073,11 +6332,14 @@ class _JanarymHomeState extends State<JanarymHome>
           '1) ояту сөзі "Жанарым" арқылы дауыс диалогы, '
           '2) камера кадрын қысқаша сипаттау, '
           '3) маршрут режимін қосу/өшіру, маршрут құру, маршрут күйі мен келесі қадамды айту, '
-          '4) меткаларды сақтау (үй/жұмыс) және соларға маршрут құру, '
+          '4) үйге және сақталған меткаларға маршрут құру, '
           '5) соңғы жауапты қайталау, '
-          '6) қысқа/толық жауап стилін ауыстыру. '
+          '6) қысқа/толық жауап стилін ауыстыру, '
+          '7) автоматты қауіп ескертуі камера белсенді кезде әрқашан жұмыс істейді, '
+          '8) қосымша режимдер: ordinary/route/home/find/memory/text_reader/shopping/cooking/dress_code/anti_fraud. '
           'Қолданбада жоқ мүмкіндікті ойдан шығарма. '
           'Егер сұраныс қолданба шегінен тыс болса, оны қысқа айт та осы функциялардың жақынын ұсын. '
+          'Қолжетімді режимдер: $enabledModes. Релиз кезеңі: $releaseStage. '
           '$modeLine';
     }
 
@@ -3091,11 +6353,14 @@ class _JanarymHomeState extends State<JanarymHome>
         '1) голосовой диалог через wake-слово "Жанарым", '
         '2) краткое описание сцены с последнего кадра камеры, '
         '3) режим маршрута: включение/выключение, построение маршрута, статус маршрута, следующий шаг, остановка маршрута, '
-        '4) сохранение меток (дом/работа и т.п.) и маршрут по меткам, '
+        '4) маршрут домой и к сохранённым меткам, '
         '5) повтор последнего ответа, '
-        '6) переключение стиля ответа (коротко/подробно/обычно). '
+        '6) переключение стиля ответа (коротко/подробно/обычно), '
+        '7) автоматические предупреждения об опасности, пока камера активна, '
+        '8) дополнительные режимы: ordinary/route/home/find/memory/text_reader/shopping/cooking/dress_code/anti_fraud. '
         'Не выдумывай функции, которых нет в приложении. '
         'Если запрос вне возможностей приложения, скажи это коротко и предложи ближайший поддерживаемый сценарий. '
+        'Доступные режимы: $enabledModes. Стадия релиза: $releaseStage. '
         '$modeLine';
   }
 
@@ -3106,30 +6371,87 @@ class _JanarymHomeState extends State<JanarymHome>
     final navStatus = _navStatusLabel(navState.navStatus);
     final cameraState = _cameraGranted && _cameraStreaming ? 'on' : 'off';
     final micState = _micGranted ? 'on' : 'off';
+    final runtimeState = _runtimeServiceRunning ? 'on' : 'off';
 
-    if (widget.appLanguage == AppLanguage.kk) {
+    final currentMode = navigationMode
+        ? 'navigation'
+        : _assistantModeContextKey(_assistantMode);
+    if (_voiceIsKazakh) {
       return 'Ағымдағы runtime-контекст: '
-          'режим=${navigationMode ? 'navigation' : 'general'}, '
+          'режим=$currentMode, '
           'навигация-күйі=$navStatus, '
           'белсенді маршрут=${routeActive ? 'иә' : 'жоқ'}, '
-          'камера=$cameraState, микрофон=$micState. '
+          'камера=$cameraState, микрофон=$micState, runtime_service=$runtimeState. '
           'Жауапта осы контекстті ескер.';
     }
     return 'Текущий runtime-контекст: '
-        'режим=${navigationMode ? 'navigation' : 'general'}, '
+        'режим=$currentMode, '
         'навигационный статус=$navStatus, '
         'активный маршрут=${routeActive ? 'да' : 'нет'}, '
-        'камера=$cameraState, микрофон=$micState. '
+        'камера=$cameraState, микрофон=$micState, runtime_service=$runtimeState. '
         'Учитывай это состояние в ответе.';
   }
 
   String _navStatusLabel(NavigationStatus status) => status.name;
 
-  String _buildBlindPrompt({bool navigationMode = false}) {
+  String _assistantModeContextKey(AssistantMode mode) {
+    return _modeDescriptorForAssistantMode(mode).contextKey;
+  }
+
+  Map<String, Object?> _buildPerceptionSnapshot() {
+    final descriptor = _currentModeDescriptor();
+    return <String, Object?>{
+      'mode': descriptor.contextKey,
+      'mode_sub_state': _modeOrchestrator.value.subState,
+      'camera_streaming': _cameraStreaming,
+      'frame_age_ms': _lastFrameAt == null
+          ? null
+          : DateTime.now().difference(_lastFrameAt!).inMilliseconds,
+      'hazard_hint': _latestHazardHint.isEmpty ? null : _latestHazardHint,
+      'safety_level': _currentReflexSafetyLevel().name,
+      'perception_filters': descriptor.perception.toSnapshot(),
+    };
+  }
+
+  String _sceneSummaryForPrompt() {
+    final descriptor = _currentModeDescriptor();
+    final frameAgeMs = _lastFrameAt == null
+        ? 'unknown'
+        : DateTime.now().difference(_lastFrameAt!).inMilliseconds.toString();
+    final focus = <String>[
+      ...descriptor.perception.hazardLabelsOfInterest,
+      ...descriptor.perception.ocrFocus,
+    ].join(',');
+    final modeState = _modeOrchestrator.value.subState;
+    if (_latestHazardHint.isNotEmpty) {
+      return 'mode=${descriptor.contextKey}, sub_state=$modeState, '
+          'camera=${_cameraStreaming ? 'on' : 'off'}, '
+          'frame_age_ms=$frameAgeMs, hazard=$_latestHazardHint, focus=$focus';
+    }
+    return 'mode=${descriptor.contextKey}, sub_state=$modeState, '
+        'camera=${_cameraStreaming ? 'on' : 'off'}, '
+        'frame_age_ms=$frameAgeMs, focus=$focus';
+  }
+
+  String _activeSafetyContext() {
+    final level = _currentReflexSafetyLevel().name;
+    if (_latestHazardHint.isEmpty) {
+      if (!_featureFlags.safetyEnabled) return 'safety_monitoring_off';
+      return 'safety_monitoring_on; level=$level';
+    }
+    return 'safety_monitoring_on; level=$level; latest_hazard=$_latestHazardHint';
+  }
+
+  String _buildBlindPrompt({
+    bool navigationMode = false,
+    String? extraInstruction,
+  }) {
+    final descriptor = _currentModeDescriptor();
     final parts = <String>[
-      CommandRouter.blindSystemPromptFor(widget.appLanguage),
+      CommandRouter.blindSystemPromptFor(_voiceLanguage),
       _projectCapabilitiesPrompt(navigationMode: navigationMode),
       _runtimeProjectStatePrompt(navigationMode: navigationMode),
+      descriptor.prompts.blind(isKazakh: _voiceIsKazakh),
     ];
     final styleTail = _dialogStylePromptTail();
     if (styleTail.isNotEmpty) {
@@ -3137,27 +6459,36 @@ class _JanarymHomeState extends State<JanarymHome>
     }
     if (navigationMode) {
       parts.add(
-        widget.appLanguage == AppLanguage.kk
-            ? 'Пайдаланушы қазір маршрут режимінде.'
-            : 'Пользователь сейчас в режиме маршрута.',
+        _voiceText(
+          ru: 'Пользователь сейчас в режиме маршрута.',
+          kk: 'Пайдаланушы қазір маршрут режимінде.',
+        ),
       );
+    }
+    if (extraInstruction != null && extraInstruction.trim().isNotEmpty) {
+      parts.add(extraInstruction.trim());
     }
     return parts.join(' ');
   }
 
-  String _buildVisionPrompt() {
+  String _buildVisionPrompt({String? extraInstruction}) {
+    final descriptor = _currentModeDescriptor();
     final parts = <String>[
-      CommandRouter.visionSystemPromptFor(widget.appLanguage),
+      CommandRouter.visionSystemPromptFor(_voiceLanguage),
       _projectCapabilitiesPrompt(
         navigationMode: _assistantMode == AssistantMode.navigation,
       ),
       _runtimeProjectStatePrompt(
         navigationMode: _assistantMode == AssistantMode.navigation,
       ),
+      descriptor.prompts.vision(isKazakh: _voiceIsKazakh),
     ];
     final styleTail = _dialogStylePromptTail();
     if (styleTail.isNotEmpty) {
       parts.add(styleTail);
+    }
+    if (extraInstruction != null && extraInstruction.trim().isNotEmpty) {
+      parts.add(extraInstruction.trim());
     }
     return parts.join(' ');
   }
@@ -3179,6 +6510,31 @@ class _JanarymHomeState extends State<JanarymHome>
       'айналамда',
       'не көріп тұрсың',
       'не көріп тұр',
+      'какой цвет',
+      'какого цвета',
+      'цвет предмета',
+      'цвет этого',
+      'узнай цвет',
+      'определи цвет',
+      'what color',
+      'қандай түс',
+      'түсі қандай',
+      'түсін айт',
+    ];
+    return cues.any(normalized.contains);
+  }
+
+  bool _looksLikeColorQuestion(String text) {
+    final normalized = _router.normalize(text);
+    if (normalized.isEmpty) return false;
+    const cues = <String>[
+      'какой цвет',
+      'какого цвета',
+      'цвет',
+      'what color',
+      'қандай түс',
+      'түсі қандай',
+      'түс',
     ];
     return cues.any(normalized.contains);
   }
@@ -3343,7 +6699,7 @@ class _JanarymHomeState extends State<JanarymHome>
 
     var destination = _extractDestinationCandidate(rawDestination);
     if (destination.isEmpty) {
-      await _speak(_l10n.navSayDestinationAfterRouteWords);
+      await _speak(_voiceL10n.navSayDestinationAfterRouteWords);
       return;
     }
 
@@ -3357,9 +6713,13 @@ class _JanarymHomeState extends State<JanarymHome>
         destination,
       );
       if (similar != null) {
-        await _speak(_l10n.navConfirmAddressQuestion(similar.resolvedAddress));
+        await _speak(
+          _voiceL10n.navConfirmAddressQuestion(similar.resolvedAddress),
+        );
         _setCircleState(CircleState.listening);
         final similarAnswer = await _sttService.startCommandListening(
+          languageHint: _interactionLanguage,
+          allowAutoLanguage: false,
           durationSeconds: 8,
           minListenMs: 300,
           silenceHoldMs: 950,
@@ -3397,7 +6757,7 @@ class _JanarymHomeState extends State<JanarymHome>
     }
 
     final wakeHealthy =
-        (_wakeWordOnlyMode || !_alwaysDialogMode) &&
+        _requireWakeWord &&
         _wakeService.state.value.status != WakeWordStatus.error;
 
     try {
@@ -3406,9 +6766,11 @@ class _JanarymHomeState extends State<JanarymHome>
       }
 
       while (mounted) {
-        await _speak(_l10n.navConfirmAddressQuestion(destination));
+        await _speak(_voiceL10n.navConfirmAddressQuestion(destination));
         _setCircleState(CircleState.listening);
         final answer = await _sttService.startCommandListening(
+          languageHint: _interactionLanguage,
+          allowAutoLanguage: false,
           durationSeconds: 9,
           minListenMs: 320,
           silenceHoldMs: 1000,
@@ -3419,7 +6781,7 @@ class _JanarymHomeState extends State<JanarymHome>
         if (!mounted) return;
         final response = (answer ?? '').trim();
         if (response.isEmpty) {
-          await _speak(_l10n.didntHearCommandRepeat);
+          await _speak(_voiceL10n.didntHearCommandRepeat);
           continue;
         }
 
@@ -3433,9 +6795,11 @@ class _JanarymHomeState extends State<JanarymHome>
         }
 
         if (_isNegativeResponse(normalized)) {
-          await _speak(_l10n.navSayCorrectAddressNow);
+          await _speak(_voiceL10n.navSayCorrectAddressNow);
           _setCircleState(CircleState.listening);
           final corrected = await _sttService.startCommandListening(
+            languageHint: _interactionLanguage,
+            allowAutoLanguage: false,
             durationSeconds: 10,
             minListenMs: 350,
             silenceHoldMs: 1100,
@@ -3448,7 +6812,7 @@ class _JanarymHomeState extends State<JanarymHome>
             (corrected ?? '').trim(),
           );
           if (correctedDestination.isEmpty) {
-            await _speak(_l10n.didntHearCommandRepeat);
+            await _speak(_voiceL10n.didntHearCommandRepeat);
             continue;
           }
           destination = correctedDestination;
@@ -3463,13 +6827,14 @@ class _JanarymHomeState extends State<JanarymHome>
           continue;
         }
 
-        await _speak(_l10n.navAnswerYesOrNoOrAddress);
+        await _speak(_voiceL10n.navAnswerYesOrNoOrAddress);
       }
     } finally {
       if (wakeHealthy) {
         await _wakeService.start();
-      } else if (_alwaysDialogMode ||
-          _wakeService.state.value.status == WakeWordStatus.error) {
+      } else if (!_requireWakeWord &&
+          (_alwaysDialogMode ||
+              _wakeService.state.value.status == WakeWordStatus.error)) {
         _startWakeFallbackLoop();
       }
     }
@@ -3489,8 +6854,10 @@ class _JanarymHomeState extends State<JanarymHome>
       _wakeWordOnlyMode = false;
       await _wakeService.stop();
       _setCircleState(CircleState.listening);
-      debugPrint('[STT] post-speech listening');
+      appLog('[STT] post-speech listening');
       final text = await _sttService.startCommandListening(
+        languageHint: _interactionLanguage,
+        allowAutoLanguage: false,
         durationSeconds: 5,
         minListenMs: 260,
         silenceHoldMs: 700,
@@ -3510,7 +6877,7 @@ class _JanarymHomeState extends State<JanarymHome>
         await _armWakeWordWaiting();
       }
     } catch (e) {
-      debugPrint('[STT] post-speech follow-up failed: $e');
+      appLog('[STT] post-speech follow-up failed: $e');
       await _armWakeWordWaiting();
     } finally {
       _followUpActive = false;
@@ -3523,32 +6890,42 @@ class _JanarymHomeState extends State<JanarymHome>
     }
   }
 
-  Future<void> _speak(String text) async {
+  Future<void> _speak(String text, {bool ensureLocale = true}) async {
     final t = text.trim();
     if (t.isEmpty) return;
-    debugPrint('[TTS] speak');
+    appLog('[TTS] speak');
     _setCircleState(CircleState.speaking);
     _isSpeaking = true;
-    await _tts.stop();
-    await _tts.speak(t);
-    _isSpeaking = false;
-    if (_circleState == CircleState.speaking) {
-      _restoreWakeStateIfIdle();
+    try {
+      if (ensureLocale) {
+        await _ensureTtsLocaleForCurrentMode();
+      }
+      await _tts.stop();
+      await _tts.speak(t);
+    } finally {
+      _isSpeaking = false;
+      if (_circleState == CircleState.speaking) {
+        _restoreWakeStateIfIdle();
+      }
     }
   }
 
   Future<void> _stopAll() async {
-    debugPrint('[Stop] pressed');
+    appLog('[Stop] pressed');
     await _sttService.stop();
     await _tts.stop();
     _followUpActive = false;
     await _playEndCue();
     await _vibrateEnd();
     if (_micGranted) {
-      if (_alwaysDialogMode) {
+      if (_requireWakeWord &&
+          _wakeService.state.value.status != WakeWordStatus.error) {
+        await _wakeService.start();
+      } else if (_alwaysDialogMode) {
         _startWakeFallbackLoop();
       } else if (_wakeService.state.value.status == WakeWordStatus.error) {
-        _startWakeFallbackLoop();
+        _scheduleWakeRecoveryIfNeeded(_wakeService.state.value);
+        _syncWakeFallbackMode(_wakeService.state.value);
       } else {
         await _wakeService.start();
       }
@@ -3558,6 +6935,16 @@ class _JanarymHomeState extends State<JanarymHome>
 
   Future<void> _stopTtsOnly() async {
     await _tts.stop();
+  }
+
+  void _triggerFastModeFeedback() {
+    _setCircleState(CircleState.end);
+    unawaited(_playEndCue());
+    unawaited(_vibrateEnd());
+    Future<void>.delayed(const Duration(milliseconds: 120), () {
+      if (!mounted) return;
+      _restoreWakeStateIfIdle();
+    });
   }
 
   String _formatTimestamp(DateTime? time) {
@@ -3590,6 +6977,359 @@ class _JanarymHomeState extends State<JanarymHome>
       default:
         return 'idle';
     }
+  }
+
+  AssistantMode _fromJanarymMode(JanarymMode mode) {
+    switch (mode) {
+      case JanarymMode.home:
+        return AssistantMode.general;
+      case JanarymMode.route:
+        return AssistantMode.navigation;
+      case JanarymMode.safety:
+        return AssistantMode.general;
+      case JanarymMode.shopping:
+        return AssistantMode.shopping;
+      case JanarymMode.cooking:
+        return AssistantMode.cooking;
+      case JanarymMode.dress_code:
+        return AssistantMode.dressCode;
+      case JanarymMode.anti_fraud:
+        return AssistantMode.antiFraud;
+      case JanarymMode.text_reader:
+        return AssistantMode.textReader;
+      case JanarymMode.memory:
+        return AssistantMode.memory;
+      case JanarymMode.find:
+        return AssistantMode.find;
+    }
+  }
+
+  ModeDescriptor _modeDescriptorForAssistantMode(AssistantMode mode) {
+    return _modeOrchestrator.descriptorFor(_toJanarymMode(mode));
+  }
+
+  ModeDescriptor _currentModeDescriptor() {
+    return _modeOrchestrator.activeDescriptor;
+  }
+
+  bool _modeNeedsLiveCamera(AssistantMode mode) {
+    return _modeDescriptorForAssistantMode(mode).perception.requiresLiveCamera;
+  }
+
+  bool _isModeEnabled(AssistantMode mode) {
+    return _modeOrchestrator.isEnabled(_toJanarymMode(mode));
+  }
+
+  JanarymMode _toJanarymMode(AssistantMode mode) {
+    switch (mode) {
+      case AssistantMode.general:
+        return JanarymMode.home;
+      case AssistantMode.navigation:
+        return JanarymMode.route;
+      case AssistantMode.safety:
+        return JanarymMode.home;
+      case AssistantMode.shopping:
+        return JanarymMode.shopping;
+      case AssistantMode.cooking:
+        return JanarymMode.cooking;
+      case AssistantMode.dressCode:
+        return JanarymMode.dress_code;
+      case AssistantMode.antiFraud:
+        return JanarymMode.anti_fraud;
+      case AssistantMode.textReader:
+        return JanarymMode.text_reader;
+      case AssistantMode.memory:
+        return JanarymMode.memory;
+      case AssistantMode.find:
+        return JanarymMode.find;
+    }
+  }
+
+  List<AssistantMode> _availableModes() {
+    return _modeOrchestrator
+        .availableModes()
+        .map(_fromJanarymMode)
+        .toList(growable: false);
+  }
+
+  String _modeDisplayName(AssistantMode mode) {
+    return _modeDescriptorForAssistantMode(
+      mode,
+    ).ui.label(isKazakh: widget.appLanguage == AppLanguage.kk);
+  }
+
+  String _spokenModeDisplayName(AssistantMode mode) {
+    return _modeDescriptorForAssistantMode(
+      mode,
+    ).ui.label(isKazakh: _voiceIsKazakh);
+  }
+
+  AssistantMode? _detectModeSwitchByText(String text) {
+    final normalized = _router.normalize(text);
+    if (normalized.isEmpty) return null;
+
+    final stripped = _router.stripWakeWords(normalized).trim();
+    if (stripped.isEmpty) return null;
+
+    final tokens = stripped
+        .split(' ')
+        .map((token) => token.trim())
+        .where((token) => token.isNotEmpty)
+        .toList(growable: false);
+
+    bool containsAnyFragment(List<String> fragments) {
+      for (final fragment in fragments) {
+        if (stripped.contains(fragment)) return true;
+      }
+      return false;
+    }
+
+    bool containsTokenPrefix(List<String> prefixes) {
+      for (final token in tokens) {
+        for (final prefix in prefixes) {
+          if (token.startsWith(prefix)) return true;
+        }
+      }
+      return false;
+    }
+
+    bool matchesSwitchIntent() {
+      return containsTokenPrefix([
+            'включ',
+            'переключ',
+            'смен',
+            'постав',
+            'откро',
+            'запуст',
+            'давай',
+            'нуж',
+            'хоч',
+            'қос',
+            'ауыстыр',
+            'аш',
+            'керек',
+            'қалайм',
+          ]) ||
+          stripped == 'режим' ||
+          stripped.startsWith('режим ') ||
+          stripped == 'mode' ||
+          stripped.startsWith('mode ');
+    }
+
+    bool isShortDirectModePhrase() {
+      if (tokens.isEmpty || tokens.length > 3) return false;
+      if (stripped.endsWith('?')) return false;
+      if (containsTokenPrefix([
+        'что',
+        'как',
+        'расскаж',
+        'объясн',
+        'уме',
+        'мож',
+        'why',
+        'зачем',
+      ])) {
+        return false;
+      }
+      if (tokens.any((token) => token == 'не' || token == 'нет')) {
+        return false;
+      }
+      return true;
+    }
+
+    bool wantsMode(
+      List<String> tokenPrefixes, {
+      List<String> fragments = const <String>[],
+      bool allowBare = true,
+    }) {
+      if (!containsTokenPrefix(tokenPrefixes) &&
+          !containsAnyFragment(fragments)) {
+        return false;
+      }
+      if (matchesSwitchIntent()) return true;
+      return allowBare && isShortDirectModePhrase();
+    }
+
+    final modeTokenPrefixes = <AssistantMode, List<String>>{
+      AssistantMode.general: ['обычн', 'главн', 'home', 'қалыпты', 'жалпы'],
+      AssistantMode.navigation: [
+        'маршрут',
+        'навигац',
+        'route',
+        'бағдарлағыш',
+        'бағыт',
+        'багыт',
+        'бағдар',
+      ],
+      AssistantMode.shopping: [
+        'шоп',
+        'покупк',
+        'shopping',
+        'сауда',
+        'сатып',
+        'алу',
+      ],
+      AssistantMode.cooking: [
+        'готовк',
+        'кухн',
+        'cooking',
+        'дайында',
+        'асуй',
+        'ас',
+      ],
+      AssistantMode.dressCode: ['дрес', 'dress', 'киім'],
+      AssistantMode.antiFraud: [
+        'антимошен',
+        'касс',
+        'anti',
+        'антиалаяқ',
+        'алаяқ',
+        'алаяқтық',
+      ],
+      AssistantMode.textReader: ['чтен', 'чтени', 'reader', 'оқу', 'мәтін'],
+      AssistantMode.memory: ['памят', 'жад', 'есте', 'сақтау'],
+      AssistantMode.find: ['поиск', 'find', 'іздеу', 'табу'],
+    };
+
+    final modeFragments = <AssistantMode, List<String>>{
+      AssistantMode.general: ['обычный режим', 'главный режим', 'home scan'],
+      AssistantMode.navigation: [
+        'маршрутизатор',
+        'маршрут',
+        'навигация',
+        'бағыт режимі',
+      ],
+      AssistantMode.shopping: ['шоппинг', 'покупки', 'shopping', 'сатып алу'],
+      AssistantMode.cooking: ['готовка', 'кухня', 'cooking', 'ас дайындау'],
+      AssistantMode.dressCode: ['дрескод', 'dress', 'киім режимі'],
+      AssistantMode.antiFraud: [
+        'антимошен',
+        'анти мошен',
+        'anti fraud',
+        'алаяқтықтан қорғау',
+      ],
+      AssistantMode.textReader: [
+        'чтение текста',
+        'режим чтения',
+        'включи чтение',
+        'чтение',
+        'чтения',
+        'мәтін оқу',
+        'мәтін оқу режимі',
+        'оқу режимі',
+      ],
+      AssistantMode.memory: ['память', 'жад', 'есте сақтау'],
+      AssistantMode.find: [
+        'режим найти',
+        'режим поиска',
+        'включи найти',
+        'включи поиск',
+        'табу режимі',
+        'іздеу режимі',
+      ],
+    };
+
+    for (final entry in modeTokenPrefixes.entries) {
+      final allowBare = entry.key != AssistantMode.find;
+      if (wantsMode(
+        entry.value,
+        fragments: modeFragments[entry.key] ?? const <String>[],
+        allowBare: allowBare,
+      )) {
+        appLog('[ModeSwitch] matched "${entry.key.name}" from "$stripped"');
+        return entry.key;
+      }
+    }
+
+    if (matchesSwitchIntent()) {
+      appLog('[ModeSwitch] no match for "$stripped"');
+    }
+    return null;
+  }
+
+  List<_ModeMenuEntry> _modeMenuItems() {
+    final kk = widget.appLanguage == AppLanguage.kk;
+    final items = <_ModeMenuEntry>[
+      _ModeMenuEntry(
+        mode: AssistantMode.general,
+        label: kk ? 'Қалыпты' : 'Обычный',
+        icon: Icons.home_rounded,
+      ),
+      if (_isModeEnabled(AssistantMode.navigation))
+        _ModeMenuEntry(
+          mode: AssistantMode.navigation,
+          label: kk ? 'Бағдарлағыш' : 'Маршрутизатор',
+          icon: Icons.alt_route_rounded,
+        ),
+      if (_isModeEnabled(AssistantMode.navigation))
+        _ModeMenuEntry(
+          actionId: 'go_home',
+          label: kk ? 'Үйге' : 'Домой',
+          icon: Icons.house_rounded,
+        ),
+      if (_isModeEnabled(AssistantMode.find))
+        _ModeMenuEntry(
+          mode: AssistantMode.find,
+          label: kk ? 'Табу' : 'Найти',
+          icon: Icons.search_rounded,
+        ),
+      if (_isModeEnabled(AssistantMode.memory))
+        _ModeMenuEntry(
+          mode: AssistantMode.memory,
+          label: kk ? 'Жад' : 'Память',
+          icon: Icons.bookmark_rounded,
+        ),
+      if (_isModeEnabled(AssistantMode.textReader))
+        _ModeMenuEntry(
+          mode: AssistantMode.textReader,
+          label: kk ? 'Мәтін оқу' : 'Чтение текста',
+          icon: Icons.text_snippet_rounded,
+        ),
+      if (_isModeEnabled(AssistantMode.shopping))
+        _ModeMenuEntry(
+          mode: AssistantMode.shopping,
+          label: kk ? 'Шоппинг' : 'Шоппинг',
+          icon: Icons.shopping_bag_rounded,
+        ),
+      if (_isModeEnabled(AssistantMode.cooking))
+        _ModeMenuEntry(
+          mode: AssistantMode.cooking,
+          label: kk ? 'Дайындау' : 'Готовка',
+          icon: Icons.restaurant_menu_rounded,
+        ),
+      if (_isModeEnabled(AssistantMode.dressCode))
+        _ModeMenuEntry(
+          mode: AssistantMode.dressCode,
+          label: kk ? 'Дресс-код' : 'Дрескод',
+          icon: Icons.checkroom_rounded,
+        ),
+      if (_isModeEnabled(AssistantMode.antiFraud))
+        _ModeMenuEntry(
+          mode: AssistantMode.antiFraud,
+          label: kk ? 'Антиалаяқ' : 'Антимошеничество',
+          icon: Icons.shield_rounded,
+        ),
+      _ModeMenuEntry(
+        actionId: 'voice_enrollment',
+        label: kk ? 'Дауыс профилі' : 'Голосовой профиль',
+        icon: Icons.record_voice_over_rounded,
+      ),
+    ];
+    return items;
+  }
+
+  String _modeSwitchAck(AssistantMode mode) {
+    return _voiceText(
+      ru: 'Включила режим: ${_spokenModeDisplayName(mode)}.',
+      kk: '${_spokenModeDisplayName(mode)} режимі қосылды.',
+    );
+  }
+
+  String _modeUnavailableMessage(AssistantMode mode) {
+    return _voiceText(
+      ru: 'Режим ${_spokenModeDisplayName(mode)} сейчас выключен в конфиге.',
+      kk: '${_spokenModeDisplayName(mode)} режимі қазір өшірулі.',
+    );
   }
 
   String _circleLabel() {
@@ -3670,6 +7410,783 @@ class _JanarymHomeState extends State<JanarymHome>
         : _l10n.languageShortRu;
   }
 
+  Color _modeAccentColor(AssistantMode mode) {
+    return _modeDescriptorForAssistantMode(mode).ui.accentColor;
+  }
+
+  IconData _modeIcon(AssistantMode mode) {
+    return _modeDescriptorForAssistantMode(mode).ui.icon;
+  }
+
+  Widget _buildCameraStage() {
+    final controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) {
+      return Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Color(0xFF020617), Color(0xFF09021A), Color(0xFF140230)],
+          ),
+        ),
+      );
+    }
+
+    return ColoredBox(
+      color: Colors.black,
+      child: Center(
+        child: RepaintBoundary(
+          child: AspectRatio(
+            aspectRatio: _cameraPreviewAspectRatio(controller),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                RotatedBox(
+                  quarterTurns: _cameraPreviewQuarterTurns(controller),
+                  child: controller.buildPreview(),
+                ),
+                IgnorePointer(
+                  child: RepaintBoundary(
+                    child: RotatedBox(
+                      quarterTurns: _cameraPreviewQuarterTurns(controller),
+                      child: CustomPaint(
+                        painter: BBoxPainter(
+                          entries: _reflexBBoxes,
+                          mirrorHorizontally:
+                              controller.description.lensDirection ==
+                              CameraLensDirection.front,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                if (_featureFlags.developerDiagnosticsEnabled)
+                  Positioned(
+                    top: 14,
+                    left: 14,
+                    child: IgnorePointer(child: _buildDebugMetricsBadge()),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  double _cameraPreviewAspectRatio(CameraController controller) {
+    final orientation = _cameraPreviewOrientationName(controller);
+    final isLandscape =
+        orientation == 'DeviceOrientation.landscapeLeft' ||
+        orientation == 'DeviceOrientation.landscapeRight';
+    return isLandscape
+        ? controller.value.aspectRatio
+        : (1 / controller.value.aspectRatio);
+  }
+
+  int _cameraPreviewQuarterTurns(CameraController controller) {
+    final orientation = _cameraPreviewOrientationName(controller);
+    switch (orientation) {
+      case 'DeviceOrientation.portraitUp':
+        return 0;
+      case 'DeviceOrientation.landscapeRight':
+        return 1;
+      case 'DeviceOrientation.portraitDown':
+        return 2;
+      case 'DeviceOrientation.landscapeLeft':
+        return 3;
+      default:
+        return 0;
+    }
+  }
+
+  String _cameraPreviewOrientationName(CameraController controller) {
+    final orientation = controller.value.isRecordingVideo
+        ? controller.value.recordingOrientation!
+        : (controller.value.previewPauseOrientation ??
+              controller.value.lockedCaptureOrientation ??
+              controller.value.deviceOrientation);
+    return orientation.toString();
+  }
+
+  Widget _buildDebugMetricsBadge() {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: const Color(0xCC020617),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        child: DefaultTextStyle(
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('FPS ${_cameraPreviewFps.toString().padLeft(2, '0')}'),
+              Text('Reflex ${_reflexInferenceLatencyMs}ms'),
+              Text('Dropped $_cameraDroppedFrames'),
+              Text('Boxes $_reflexDetectionsCount'),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  int _cameraImageRotationDegrees() {
+    final controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) return 0;
+    final sensorOrientation = controller.description.sensorOrientation;
+    final deviceRotation = switch (controller.value.deviceOrientation) {
+      DeviceOrientation.portraitUp => 0,
+      DeviceOrientation.landscapeLeft => 90,
+      DeviceOrientation.portraitDown => 180,
+      DeviceOrientation.landscapeRight => 270,
+    };
+    if (controller.description.lensDirection == CameraLensDirection.front) {
+      return (sensorOrientation + deviceRotation) % 360;
+    }
+    return (sensorOrientation - deviceRotation + 360) % 360;
+  }
+
+  Widget _buildModePickerOverlay() {
+    final menuItems = _modeMenuItems();
+    return IgnorePointer(
+      ignoring: !_modePickerOpen,
+      child: AnimatedOpacity(
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOutCubic,
+        opacity: _modePickerOpen ? 1 : 0,
+        child: AnimatedSlide(
+          duration: const Duration(milliseconds: 240),
+          curve: Curves.easeOutCubic,
+          offset: _modePickerOpen ? Offset.zero : const Offset(0.06, 0.12),
+          child: AnimatedScale(
+            duration: const Duration(milliseconds: 240),
+            curve: Curves.easeOutBack,
+            scale: _modePickerOpen ? 1 : 0.88,
+            child: Align(
+              alignment: Alignment.bottomRight,
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 240),
+                child: SingleChildScrollView(
+                  reverse: true,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      for (int i = 0; i < menuItems.length; i++) ...[
+                        AnimatedSlide(
+                          duration: Duration(milliseconds: 170 + i * 22),
+                          curve: Curves.easeOutCubic,
+                          offset: _modePickerOpen
+                              ? Offset.zero
+                              : const Offset(0.22, 0),
+                          child: menuItems[i].isMode
+                              ? _buildModeGlassButton(
+                                  menuItems[i].mode!,
+                                  label: menuItems[i].label,
+                                  iconOverride: menuItems[i].icon,
+                                )
+                              : _buildMenuActionGlassButton(
+                                  actionId: menuItems[i].actionId!,
+                                  label: menuItems[i].label,
+                                  icon: menuItems[i].icon,
+                                ),
+                        ),
+                        if (i != menuItems.length - 1)
+                          const SizedBox(height: 10),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMenuActionGlassButton({
+    required String actionId,
+    required String label,
+    required IconData icon,
+  }) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(999),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+        child: Material(
+          color: Colors.white.withOpacity(0.10),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(999),
+            onTap: () async {
+              _modePickerAutoCloseTimer?.cancel();
+              if (mounted) {
+                setState(() => _modePickerOpen = false);
+              }
+              await _playEndCue();
+              await _vibrateEnd();
+              switch (actionId) {
+                case 'go_home':
+                  await _handleGoHomeShortcut(
+                    widget.appLanguage == AppLanguage.kk ? 'үйге' : 'домой',
+                  );
+                  break;
+                case 'voice_enrollment':
+                  await _openWakeEnrollmentSheet();
+                  break;
+              }
+            },
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 220),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(999),
+                border: Border.all(color: Colors.white30),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(icon, size: 18, color: Colors.white),
+                  const SizedBox(width: 10),
+                  Text(
+                    label,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildModeGlassButton(
+    AssistantMode mode, {
+    String? label,
+    IconData? iconOverride,
+  }) {
+    final active = _assistantMode == mode;
+    final displayLabel = label ?? _modeDisplayName(mode);
+    final displayIcon = iconOverride ?? _modeIcon(mode);
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(999),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+        child: Material(
+          color: Colors.white.withOpacity(active ? 0.2 : 0.1),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(999),
+            onTap: () async {
+              final changed = await _switchAssistantMode(
+                mode,
+                reason: 'mode_picker',
+              );
+              if (!mounted) return;
+              _modePickerAutoCloseTimer?.cancel();
+              setState(() => _modePickerOpen = false);
+              if (!changed) return;
+              _triggerFastModeFeedback();
+            },
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 220),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(999),
+                border: Border.all(
+                  color: active
+                      ? _modeAccentColor(mode).withOpacity(0.9)
+                      : Colors.white30,
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    displayIcon,
+                    size: 18,
+                    color: active ? _modeAccentColor(mode) : Colors.white70,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    displayLabel,
+                    style: TextStyle(
+                      color: active ? Colors.white : Colors.white70,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openWakeEnrollmentSheet() async {
+    if (!_micGranted) {
+      await _ensureMicPermission();
+      if (!_micGranted || !mounted) return;
+    }
+    if (_wakeService.state.value.status == WakeWordStatus.error) {
+      await _wakeService.recover(restartListening: true);
+    } else {
+      await _wakeService.start();
+    }
+    if (!mounted) return;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF0F172A),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (sheetContext) {
+        return Padding(
+          padding: EdgeInsets.only(
+            left: 16,
+            right: 16,
+            top: 16,
+            bottom: 16 + MediaQuery.of(sheetContext).padding.bottom,
+          ),
+          child: ValueListenableBuilder<WakeWordState>(
+            valueListenable: _wakeService.state,
+            builder: (context, wake, _) {
+              return ValueListenableBuilder<WakeEnrollmentState>(
+                valueListenable: _wakeService.enrollmentState,
+                builder: (context, enrollment, __) {
+                  final isActive =
+                      enrollment.isActive ||
+                      wake.status == WakeWordStatus.enrolling;
+                  final hasProfile = wake.hasOwnerProfile;
+                  final total = enrollment.total <= 0 ? 8 : enrollment.total;
+                  final current = enrollment.current.clamp(0, total);
+                  final progress = total == 0
+                      ? 0.0
+                      : (current / total).clamp(0, 1).toDouble();
+                  final statusText = switch (enrollment.state) {
+                    'progress' =>
+                      widget.appLanguage == AppLanguage.kk
+                          ? 'Үлгі жазылып жатыр: $current/$total'
+                          : 'Идет запись образца: $current/$total',
+                    'completed' =>
+                      widget.appLanguage == AppLanguage.kk
+                          ? 'Дауыс профилі сақталды'
+                          : 'Голосовой профиль сохранен',
+                    'cancelled' =>
+                      widget.appLanguage == AppLanguage.kk
+                          ? 'Жазу тоқтатылды'
+                          : 'Запись остановлена',
+                    _ =>
+                      hasProfile
+                          ? (widget.appLanguage == AppLanguage.kk
+                                ? 'Дауыс профилі дайын'
+                                : 'Голосовой профиль готов')
+                          : (widget.appLanguage == AppLanguage.kk
+                                ? 'Дауыс профилі жоқ'
+                                : 'Голосовой профиль не записан'),
+                  };
+
+                  return Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        widget.appLanguage == AppLanguage.kk
+                            ? 'Дауыс профилі'
+                            : 'Голосовой профиль',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 18,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Text(
+                        widget.appLanguage == AppLanguage.kk
+                            ? '«Жанарым» сөзін 8 рет бірдей айтыңыз. Тыныш бөлме, 20-30 см қашықтық.'
+                            : 'Скажите «Жанарым» 8 раз одинаково. Тихая комната, расстояние 20-30 см.',
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 13,
+                          height: 1.35,
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.06),
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(
+                            color: isActive
+                                ? const Color(0xFFF59E0B)
+                                : hasProfile
+                                ? const Color(0xFF22C55E)
+                                : Colors.white24,
+                          ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              statusText,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 14,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            LinearProgressIndicator(
+                              value: isActive ? progress : (hasProfile ? 1 : 0),
+                              minHeight: 7,
+                              color: isActive
+                                  ? const Color(0xFFF59E0B)
+                                  : const Color(0xFF22C55E),
+                              backgroundColor: Colors.white12,
+                            ),
+                            if ((wake.lastError ?? '').isNotEmpty) ...[
+                              const SizedBox(height: 8),
+                              Text(
+                                wake.lastError!,
+                                style: const TextStyle(
+                                  color: Color(0xFFFCA5A5),
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: FilledButton(
+                              onPressed: isActive
+                                  ? null
+                                  : () async {
+                                      await _wakeService.start();
+                                      await _wakeService.startEnrollment(
+                                        sampleCount: 8,
+                                      );
+                                    },
+                              child: Text(
+                                widget.appLanguage == AppLanguage.kk
+                                    ? 'Жазуды бастау'
+                                    : 'Начать запись',
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: OutlinedButton(
+                              onPressed: isActive
+                                  ? () async {
+                                      await _wakeService.cancelEnrollment();
+                                    }
+                                  : null,
+                              child: Text(
+                                widget.appLanguage == AppLanguage.kk
+                                    ? 'Тоқтату'
+                                    : 'Остановить',
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: OutlinedButton(
+                              onPressed: hasProfile && !isActive
+                                  ? () async {
+                                      await _wakeService.clearOwnerProfile();
+                                    }
+                                  : null,
+                              child: Text(
+                                widget.appLanguage == AppLanguage.kk
+                                    ? 'Профильді өшіру'
+                                    : 'Сбросить профиль',
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: TextButton(
+                              onPressed: () {
+                                Navigator.of(sheetContext).pop();
+                              },
+                              child: Text(
+                                widget.appLanguage == AppLanguage.kk
+                                    ? 'Жабу'
+                                    : 'Закрыть',
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  );
+                },
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
+  String _modeIndicatorSubStateLabel() {
+    return _modeOrchestrator.localizedSubState(
+      _modeOrchestrator.value.subState,
+      isKazakh: widget.appLanguage == AppLanguage.kk,
+    );
+  }
+
+  Widget _buildModeIndicatorPill() {
+    final state = _modeOrchestrator.value;
+    final descriptor = _modeOrchestrator.descriptorFor(state.activeMode);
+    final color = descriptor.ui.accentColor;
+    final modeLabel = descriptor.ui.label(
+      isKazakh: widget.appLanguage == AppLanguage.kk,
+    );
+    final subState = _modeIndicatorSubStateLabel();
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeOutCubic,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.26),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: color.withOpacity(0.75)),
+        boxShadow: <BoxShadow>[
+          BoxShadow(
+            color: color.withOpacity(0.16),
+            blurRadius: 18,
+            spreadRadius: 2,
+          ),
+        ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(descriptor.ui.icon, size: 16, color: color),
+          const SizedBox(width: 8),
+          Text(
+            modeLabel,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Container(
+            width: 5,
+            height: 5,
+            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            subState,
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.82),
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildModeToggleButton() {
+    return AnimatedBuilder(
+      animation: _modeFabPulse,
+      builder: (context, _) {
+        final scale = _modePickerOpen ? 1.0 : _modeFabPulse.value;
+        final glowOpacity = _modePickerOpen ? 0.45 : 0.28;
+        return Transform.scale(
+          scale: scale,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(999),
+            child: BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+              child: Material(
+                color: Colors.black.withOpacity(0.35),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(999),
+                  onTap: () async {
+                    if (!mounted) return;
+                    final nextOpen = !_modePickerOpen;
+                    _modePickerAutoCloseTimer?.cancel();
+                    setState(() => _modePickerOpen = nextOpen);
+                    if (nextOpen) {
+                      await _playStartCue();
+                      await _vibrateStart();
+                    } else {
+                      await _playEndCue();
+                      await _vibrateEnd();
+                    }
+                  },
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 220),
+                    curve: Curves.easeOutCubic,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 18,
+                      vertical: 12,
+                    ),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(999),
+                      border: Border.all(
+                        color: _modePickerOpen
+                            ? const Color(0xFF93C5FD)
+                            : Colors.white30,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color:
+                              (_modePickerOpen
+                                      ? const Color(0xFF60A5FA)
+                                      : const Color(0xFF0EA5E9))
+                                  .withOpacity(glowOpacity),
+                          blurRadius: _modePickerOpen ? 18 : 14,
+                          spreadRadius: _modePickerOpen ? 2 : 1,
+                        ),
+                      ],
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        AnimatedRotation(
+                          duration: const Duration(milliseconds: 220),
+                          turns: _modePickerOpen ? 0.125 : 0,
+                          child: Icon(
+                            _modePickerOpen
+                                ? Icons.close_rounded
+                                : Icons.grid_view_rounded,
+                            color: Colors.white,
+                            size: 20,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        const Text(
+                          'Режимы',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  String _textReaderActionLabel() {
+    if (_textReaderSessionState == _TextReaderSessionState.scanning ||
+        _textReaderSessionState == _TextReaderSessionState.speaking ||
+        _textReaderSessionState == _TextReaderSessionState.preparing ||
+        _manualTextReadInProgress) {
+      return widget.appLanguage == AppLanguage.kk ? 'Тоқтату' : 'Стоп';
+    }
+    return widget.appLanguage == AppLanguage.kk ? 'Оқу' : 'Прочитать';
+  }
+
+  Widget _buildTextReaderActionButton() {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(999),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+        child: Material(
+          color: Colors.black.withOpacity(0.32),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(999),
+            onTap: () async {
+              if (_manualTextReadInProgress ||
+                  _textReaderSessionState ==
+                      _TextReaderSessionState.preparing ||
+                  _textReaderSessionState == _TextReaderSessionState.scanning ||
+                  _textReaderSessionState == _TextReaderSessionState.speaking) {
+                await _cancelActiveTextReaderSession();
+                return;
+              }
+              await _runManualTextReadSession(
+                widget.appLanguage == AppLanguage.kk
+                    ? 'мәтінді оқы'
+                    : 'прочитай',
+                source: _TextReaderReadSource.tap,
+              );
+            },
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 180),
+              curve: Curves.easeOutCubic,
+              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(999),
+                border: Border.all(
+                  color: const Color(0xFF86EFAC).withOpacity(0.8),
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: const Color(0xFF22C55E).withOpacity(0.28),
+                    blurRadius: 16,
+                    spreadRadius: 1,
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.menu_book_rounded,
+                    color: Colors.white.withOpacity(0.95),
+                    size: 20,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    _textReaderActionLabel(),
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   String _describePromptForDirection(String direction) {
     switch (direction) {
       case 'впереди':
@@ -3740,200 +8257,143 @@ class _JanarymHomeState extends State<JanarymHome>
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final theme = _orbThemeForState(_circleState);
-    final navState = _navigationController.state.value;
-    final statusText = _circleStatusText();
-    final statusIcon = _circleStatusIcon();
-    final statusColor = _circleStatusColor();
-    final modeLabel = _assistantMode == AssistantMode.navigation
-        ? _l10n.modeNavigation
-        : _l10n.modeGeneral;
-
-    return Scaffold(
-      resizeToAvoidBottomInset: false,
-      backgroundColor: const Color(0xFF020617),
-      body: Container(
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [Color(0xFF020617), Color(0xFF09021A), Color(0xFF140230)],
-          ),
-        ),
-        child: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-            child: Column(
-              children: [
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 7,
-                      ),
-                      decoration: BoxDecoration(
-                        color: _assistantMode == AssistantMode.navigation
-                            ? const Color(0xFF0E7490).withOpacity(0.24)
-                            : Colors.white.withOpacity(0.08),
-                        borderRadius: BorderRadius.circular(999),
-                        border: Border.all(color: Colors.white24),
-                      ),
-                      child: Text(
-                        modeLabel,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                    const Spacer(),
-                    IconButton(
-                      tooltip: widget.appLanguage == AppLanguage.kk
-                          ? 'Жеке баптаулар'
-                          : 'Персонализация',
-                      onPressed: _personalizationReady
-                          ? _openPersonalizationSettings
-                          : null,
-                      icon: const Icon(
-                        Icons.settings_voice_rounded,
-                        color: Colors.white70,
-                      ),
-                    ),
-                    PopupMenuButton<AppLanguage>(
-                      initialValue: widget.appLanguage,
-                      onSelected: (language) {
-                        unawaited(widget.onLanguageChanged(language));
-                      },
-                      color: const Color(0xFF0F172A),
-                      itemBuilder: (context) => [
-                        PopupMenuItem<AppLanguage>(
-                          value: AppLanguage.ru,
-                          child: Text(_l10n.languageRu),
-                        ),
-                        PopupMenuItem<AppLanguage>(
-                          value: AppLanguage.kk,
-                          child: Text(_l10n.languageKk),
-                        ),
-                      ],
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 6,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.08),
-                          borderRadius: BorderRadius.circular(999),
-                          border: Border.all(color: Colors.white24),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Icon(
-                              Icons.language_rounded,
-                              color: Colors.white70,
-                              size: 16,
-                            ),
-                            const SizedBox(width: 6),
-                            Text(
-                              _languageBadgeLabel(widget.appLanguage),
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                if (_personalizationReady &&
-                    _showOnboardingOverlay &&
-                    _personalizationController.onboardingRequired)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 10),
-                    child: _buildOnboardingCard(),
-                  ),
-                if (_assistantMode == AssistantMode.navigation)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 10),
-                    child: _buildNavigationPanel(navState),
-                  ),
-                Expanded(
-                  child: SingleChildScrollView(
-                    child: Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 14,
-                              vertical: 7,
-                            ),
-                            decoration: BoxDecoration(
-                              color: statusColor.withOpacity(0.18),
-                              borderRadius: BorderRadius.circular(999),
-                              border: Border.all(
-                                color: statusColor.withOpacity(0.85),
-                                width: 1.4,
-                              ),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(statusIcon, color: statusColor, size: 18),
-                                const SizedBox(width: 8),
-                                Text(
-                                  statusText,
-                                  style: TextStyle(
-                                    color: statusColor,
-                                    fontSize: 15,
-                                    fontWeight: FontWeight.w800,
-                                    letterSpacing: 0.8,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                          if (_followUpActive)
-                            Text(
-                              _l10n.statusWaitingReply,
-                              style: TextStyle(
-                                color: Colors.white.withOpacity(0.7),
-                                fontSize: 14,
-                              ),
-                            ),
-                          const SizedBox(height: 24),
-                          GestureDetector(
-                            onTap: () => _runCommandFlow(reason: 'manual'),
-                            child: AnimatedBuilder(
-                              animation: _circlePulse,
-                              builder: (context, child) {
-                                return Transform.scale(
-                                  scale: _circlePulse.value,
-                                  child: child,
-                                );
-                              },
-                              child: _AssistantOrb(
-                                state: _circleState,
-                                label: _circleLabel(),
-                                theme: theme,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
+  Widget _buildWakeDebugOverlay() {
+    if (!_wakeDebugOverlayEnabled) {
+      return const SizedBox.shrink();
+    }
+    return ValueListenableBuilder<WakeWordDebugState>(
+      valueListenable: _wakeService.debugState,
+      builder: (context, debug, _) {
+        final keywordLabel = _wakeService.state.value.keywordLabel.isEmpty
+            ? '--'
+            : _wakeService.state.value.keywordLabel;
+        final recallLabel = _wakeRecallModeRaw == 'balanced' ? 'bal' : 'max';
+        final templateEnabled = debug.templateVerificationEnabled
+            ? 'on'
+            : (_wakeTemplateVerificationEnabled ? 'on' : 'off');
+        final speakerEnabled = debug.ownerVerificationEnabled
+            ? 'on'
+            : (_ownerVerificationEnabled ? 'on' : 'off');
+        final ownerLabel = _wakeService.state.value.hasOwnerProfile
+            ? (speakerEnabled == 'on'
+                  ? 'owner:stored,verify:on'
+                  : 'owner:stored,verify:off')
+            : (speakerEnabled == 'on'
+                  ? 'owner:none,verify:on'
+                  : 'owner:none,verify:off');
+        final text =
+            'KW $keywordLabel\n'
+            'REC $recallLabel\n'
+            'TMP $templateEnabled\n'
+            'SPK $speakerEnabled\n'
+            'RMS ${debug.rmsDb?.toStringAsFixed(1) ?? '--'} dB\n'
+            'SNR ${debug.snrDb?.toStringAsFixed(1) ?? '--'} dB\n'
+            'VAD ${debug.vadActive ? 'speech' : 'noise'}\n'
+            'S1 ${debug.stage1Score?.toStringAsFixed(2) ?? '--'}\n'
+            'S2 ${debug.stage2Score?.toStringAsFixed(2) ?? '--'}\n'
+            'SPK ${debug.speakerSimilarity?.toStringAsFixed(2) ?? '--'}\n'
+            'CD ${debug.cooldownRemainingMs}ms\n'
+            '${debug.reason.isEmpty ? 'idle' : debug.reason}\n'
+            '$ownerLabel';
+        return IgnorePointer(
+          child: Container(
+            width: 140,
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: BoxDecoration(
+              color: const Color(0xB8162033),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(
+                color: debug.accepted
+                    ? const Color(0xAA39D98A)
+                    : const Color(0x66FFFFFF),
+              ),
+              boxShadow: const [
+                BoxShadow(
+                  color: Color(0x33000000),
+                  blurRadius: 18,
+                  offset: Offset(0, 10),
                 ),
               ],
             ),
+            child: Text(
+              text,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 11,
+                height: 1.25,
+                fontFamily: 'monospace',
+              ),
+            ),
           ),
-        ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomPadding = MediaQuery.paddingOf(context).bottom;
+    final rightPadding = MediaQuery.paddingOf(context).right;
+    return Scaffold(
+      resizeToAvoidBottomInset: false,
+      backgroundColor: const Color(0xFF020617),
+      body: Stack(
+        children: [
+          Positioned.fill(child: _buildCameraStage()),
+          Positioned.fill(
+            child: IgnorePointer(
+              child: Container(
+                decoration: const BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Color(0x42020617),
+                      Color(0x2209021A),
+                      Color(0x6409021A),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+          if (_modePickerOpen)
+            Positioned.fill(
+              child: GestureDetector(
+                onTap: () => setState(() => _modePickerOpen = false),
+                child: Container(color: Colors.black.withOpacity(0.18)),
+              ),
+            ),
+          Positioned(
+            right: rightPadding + 16,
+            bottom: bottomPadding + 88,
+            child: _buildModePickerOverlay(),
+          ),
+          if (_assistantMode == AssistantMode.textReader && !_modePickerOpen)
+            Positioned(
+              right: rightPadding + 16,
+              bottom: bottomPadding + 88,
+              child: _buildTextReaderActionButton(),
+            ),
+          Positioned(
+            left: 16,
+            top: MediaQuery.paddingOf(context).top + 16,
+            child: _buildWakeDebugOverlay(),
+          ),
+          Positioned(
+            top: MediaQuery.paddingOf(context).top + 16,
+            left: 0,
+            right: 0,
+            child: IgnorePointer(
+              child: Center(child: _buildModeIndicatorPill()),
+            ),
+          ),
+          Positioned(
+            right: rightPadding + 16,
+            bottom: bottomPadding + 18,
+            child: _buildModeToggleButton(),
+          ),
+        ],
       ),
     );
   }
@@ -4504,75 +8964,6 @@ class _BigButton extends StatelessWidget {
       ),
     );
   }
-}
-
-class _YuvFrame {
-  final int width;
-  final int height;
-  final Uint8List y;
-  final Uint8List u;
-  final Uint8List v;
-  final int yRowStride;
-  final int uvRowStride;
-  final int uvPixelStride;
-
-  const _YuvFrame({
-    required this.width,
-    required this.height,
-    required this.y,
-    required this.u,
-    required this.v,
-    required this.yRowStride,
-    required this.uvRowStride,
-    required this.uvPixelStride,
-  });
-
-  Map<String, dynamic> toMap() => {
-    'width': width,
-    'height': height,
-    'y': y,
-    'u': u,
-    'v': v,
-    'yRowStride': yRowStride,
-    'uvRowStride': uvRowStride,
-    'uvPixelStride': uvPixelStride,
-  };
-}
-
-Uint8List _convertYuvToJpeg(Map<String, dynamic> args) {
-  final width = args['width'] as int;
-  final height = args['height'] as int;
-  final yPlane = args['y'] as Uint8List;
-  final uPlane = args['u'] as Uint8List;
-  final vPlane = args['v'] as Uint8List;
-  final yRowStride = args['yRowStride'] as int;
-  final uvRowStride = args['uvRowStride'] as int;
-  final uvPixelStride = args['uvPixelStride'] as int;
-
-  final image = img.Image(width: width, height: height);
-
-  for (int y = 0; y < height; y++) {
-    final yRow = yRowStride * y;
-    final uvRow = uvRowStride * (y >> 1);
-    for (int x = 0; x < width; x++) {
-      final uvIndex = uvRow + (x >> 1) * uvPixelStride;
-      final yp = yPlane[yRow + x];
-      final up = uPlane[uvIndex];
-      final vp = vPlane[uvIndex];
-
-      int r = (yp + 1.370705 * (vp - 128)).round();
-      int g = (yp - 0.337633 * (up - 128) - 0.698001 * (vp - 128)).round();
-      int b = (yp + 1.732446 * (up - 128)).round();
-
-      r = r.clamp(0, 255);
-      g = g.clamp(0, 255);
-      b = b.clamp(0, 255);
-
-      image.setPixelRgba(x, y, r, g, b, 255);
-    }
-  }
-
-  return Uint8List.fromList(img.encodeJpg(image, quality: 72));
 }
 
 class _AssistantOrbTheme {

@@ -39,6 +39,25 @@ void main() {
       expect(vision.directionRu, 'справа');
     });
 
+    test('parses explicit read-text action commands', () {
+      expect(router.route('прочитай').modeIntent, AssistantModeIntent.readText);
+      expect(
+        router.route('прочитать текст').modeIntent,
+        AssistantModeIntent.readText,
+      );
+    });
+
+    test('parses explicit voice-language switch commands', () {
+      expect(
+        router.route('қазақша жауап бер').modeIntent,
+        AssistantModeIntent.switchVoiceLanguage,
+      );
+      expect(
+        router.route('на русском').modeIntent,
+        AssistantModeIntent.switchVoiceLanguage,
+      );
+    });
+
     test('extracts candidate choice index', () {
       final second = router.route('второй вариант');
       expect(second.candidateChoiceIndex, 1);

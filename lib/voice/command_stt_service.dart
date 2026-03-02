@@ -12,6 +12,8 @@ import '../l10n/app_localizations.dart';
 
 enum CommandSttStatus { idle, listening, error }
 
+enum CommandListenProfile { quickWake, normal, navigation }
+
 class CommandSttState {
   final CommandSttStatus status;
   final String liveWords;
@@ -31,6 +33,13 @@ class CommandSttState {
 class CommandSttService {
   CommandSttService({AppLanguage language = AppLanguage.ru})
     : _language = language;
+
+  final int _globalListenReductionSeconds =
+      (int.tryParse(
+                (dotenv.env['STT_LISTEN_REDUCTION_SECONDS'] ?? '').trim(),
+              ) ??
+              2)
+          .clamp(0, 10);
 
   final ValueNotifier<CommandSttState> state = ValueNotifier(
     const CommandSttState(
@@ -52,6 +61,8 @@ class CommandSttService {
   bool _voiceDetected = false;
   bool _amplitudeProbeRunning = false;
   AppLanguage _language;
+  AppLanguage? _currentLanguageHint;
+  bool _currentAllowAutoLanguage = true;
 
   bool get isListening => state.value.isListening;
   AppLocalizations get _l10n => lookupAppLocalizations(_language.locale);
@@ -61,7 +72,10 @@ class CommandSttService {
   }
 
   Future<String?> startCommandListening({
-    int durationSeconds = 6,
+    CommandListenProfile profile = CommandListenProfile.normal,
+    AppLanguage? languageHint,
+    bool allowAutoLanguage = true,
+    int? durationSeconds,
     int? minListenMs,
     int? silenceHoldMs,
     double? silenceDb,
@@ -72,6 +86,8 @@ class CommandSttService {
     if (_completer != null) return _completer!.future;
     _completer = Completer<String?>();
     final completer = _completer!;
+    _currentLanguageHint = languageHint;
+    _currentAllowAutoLanguage = allowAutoLanguage;
 
     _setState(
       status: CommandSttStatus.listening,
@@ -82,8 +98,10 @@ class CommandSttService {
 
     try {
       final restartCooldownMsValue =
-          (restartCooldownMs ?? _readIntEnv('STT_RESTART_COOLDOWN_MS', 450))
-              .clamp(0, 5000);
+          (restartCooldownMs ?? _defaultRestartCooldownMs(profile)).clamp(
+            0,
+            5000,
+          );
       final lastFinishedAt = _lastFinishedAt;
       if (restartCooldownMsValue > 0 && lastFinishedAt != null) {
         final elapsedMs = DateTime.now()
@@ -129,11 +147,15 @@ class CommandSttService {
         path: path,
       );
 
-      final maxSeconds = durationSeconds.clamp(2, 30);
+      final maxSeconds = _effectiveDurationSeconds(
+        profile,
+        override: durationSeconds,
+      );
       _recordingStartedAt = DateTime.now();
       _lastVoiceAt = _recordingStartedAt;
       _voiceDetected = false;
       _startSilenceMonitor(
+        profile: profile,
         pollMsOverride: ampPollMs,
         minListenMsOverride: minListenMs,
         silenceHoldMsOverride: silenceHoldMs,
@@ -176,6 +198,8 @@ class CommandSttService {
     _voiceDetected = false;
     _amplitudeProbeRunning = false;
     _lastFinishedAt = DateTime.now();
+    _currentLanguageHint = null;
+    _currentAllowAutoLanguage = true;
 
     try {
       if (await _recorder.isRecording()) {
@@ -219,6 +243,7 @@ class CommandSttService {
   }
 
   void _startSilenceMonitor({
+    required CommandListenProfile profile,
     int? pollMsOverride,
     int? minListenMsOverride,
     int? silenceHoldMsOverride,
@@ -226,16 +251,17 @@ class CommandSttService {
     int? maxNoSpeechMsOverride,
   }) {
     _silenceTimer?.cancel();
-    final pollMs = (pollMsOverride ?? _readIntEnv('STT_AMP_POLL_MS', 140))
-        .clamp(60, 600);
-    final minListenMs =
-        (minListenMsOverride ?? _readIntEnv('STT_MIN_LISTEN_MS', 1500)).clamp(
+    final pollMs = (pollMsOverride ?? _defaultAmpPollMs(profile)).clamp(
+      60,
+      600,
+    );
+    final minListenMs = (minListenMsOverride ?? _defaultMinListenMs(profile))
+        .clamp(300, 12000);
+    final silenceHoldMs =
+        (silenceHoldMsOverride ?? _defaultSilenceHoldMs(profile)).clamp(
           300,
           12000,
         );
-    final silenceHoldMs =
-        (silenceHoldMsOverride ?? _readIntEnv('STT_SILENCE_HOLD_MS', 2400))
-            .clamp(300, 12000);
     final silenceDb =
         (silenceDbOverride ?? _readDoubleEnv('STT_SILENCE_DB', -52.0)).clamp(
           -90.0,
@@ -283,6 +309,96 @@ class CommandSttService {
     });
   }
 
+  int _resolveDurationSeconds(
+    CommandListenProfile profile, {
+    required int? override,
+  }) {
+    if (override != null) return override;
+    return _defaultDurationSeconds(profile);
+  }
+
+  int _effectiveDurationSeconds(
+    CommandListenProfile profile, {
+    required int? override,
+  }) {
+    final resolved = _resolveDurationSeconds(profile, override: override);
+    final reduction = switch (profile) {
+      CommandListenProfile.quickWake => 0,
+      CommandListenProfile.navigation => _globalListenReductionSeconds,
+      CommandListenProfile.normal => _globalListenReductionSeconds,
+    };
+    final minSeconds = switch (profile) {
+      CommandListenProfile.quickWake => 3,
+      CommandListenProfile.navigation => 4,
+      CommandListenProfile.normal => 2,
+    };
+    return (resolved - reduction).clamp(minSeconds, 30);
+  }
+
+  int _defaultDurationSeconds(CommandListenProfile profile) {
+    switch (profile) {
+      case CommandListenProfile.quickWake:
+        return _readIntEnv('STT_WAKE_QUICK_DURATION_SECONDS', 5).clamp(3, 10);
+      case CommandListenProfile.navigation:
+        return 8;
+      case CommandListenProfile.normal:
+        return 6;
+    }
+  }
+
+  int _defaultMinListenMs(CommandListenProfile profile) {
+    switch (profile) {
+      case CommandListenProfile.quickWake:
+        return _readIntEnv(
+          'STT_WAKE_QUICK_MIN_LISTEN_MS',
+          260,
+        ).clamp(200, 3000);
+      case CommandListenProfile.navigation:
+        return 850;
+      case CommandListenProfile.normal:
+        return _readIntEnv('STT_MIN_LISTEN_MS', 1500);
+    }
+  }
+
+  int _defaultSilenceHoldMs(CommandListenProfile profile) {
+    switch (profile) {
+      case CommandListenProfile.quickWake:
+        return _readIntEnv(
+          'STT_WAKE_QUICK_SILENCE_HOLD_MS',
+          420,
+        ).clamp(300, 3000);
+      case CommandListenProfile.navigation:
+        return 1100;
+      case CommandListenProfile.normal:
+        return _readIntEnv('STT_SILENCE_HOLD_MS', 2400);
+    }
+  }
+
+  int _defaultAmpPollMs(CommandListenProfile profile) {
+    switch (profile) {
+      case CommandListenProfile.quickWake:
+        return _readIntEnv('STT_WAKE_QUICK_AMP_POLL_MS', 70).clamp(60, 200);
+      case CommandListenProfile.navigation:
+        return 95;
+      case CommandListenProfile.normal:
+        return _readIntEnv('STT_AMP_POLL_MS', 140);
+    }
+  }
+
+  int _defaultRestartCooldownMs(CommandListenProfile profile) {
+    switch (profile) {
+      case CommandListenProfile.quickWake:
+        return _readIntEnv(
+          'STT_WAKE_QUICK_RESTART_COOLDOWN_MS',
+          60,
+        ).clamp(0, 1000);
+      case CommandListenProfile.navigation:
+        return 180;
+      case CommandListenProfile.normal:
+        return _readIntEnv('STT_RESTART_COOLDOWN_MS', 450);
+    }
+  }
+
   void _setError(String message) {
     _setState(status: CommandSttStatus.error, lastError: message);
   }
@@ -318,15 +434,10 @@ class CommandSttService {
       throw Exception(_l10n.errorOpenAiKeyMissing);
     }
 
-    final model =
-        (dotenv.env['OPENAI_STT_MODEL'] ?? 'gpt-4o-mini-transcribe')
-            .trim();
-    final language =
-        (dotenv.env['OPENAI_STT_LANGUAGE'] ??
-                dotenv.env['STT_LANGUAGE'] ??
-                'auto')
-            .trim()
-            .toLowerCase();
+    final model = (dotenv.env['OPENAI_STT_MODEL'] ?? 'gpt-4o-mini-transcribe')
+        .trim();
+    final language = _resolveTranscriptionLanguage();
+    debugPrint('[STT] language_hint=${language.isEmpty ? 'auto' : language}');
 
     final audioSize = await file.length();
     if (audioSize <= 0) return null;
@@ -361,10 +472,7 @@ class CommandSttService {
   }
 
   String _resolveOpenAiApiKey() {
-    final candidates = [
-      dotenv.env['OPENAI_API_KEY'],
-      dotenv.env['OPENAI_KEY'],
-    ];
+    final candidates = [dotenv.env['OPENAI_API_KEY'], dotenv.env['OPENAI_KEY']];
     for (final candidate in candidates) {
       final value = _sanitizeApiKey(candidate);
       if (value.isNotEmpty) {
@@ -372,6 +480,24 @@ class CommandSttService {
       }
     }
     return '';
+  }
+
+  String _resolveTranscriptionLanguage() {
+    final configured =
+        (dotenv.env['OPENAI_STT_LANGUAGE'] ?? dotenv.env['STT_LANGUAGE'] ?? '')
+            .trim()
+            .toLowerCase();
+    if (configured.isNotEmpty && configured != 'auto') {
+      return configured;
+    }
+    if (_currentAllowAutoLanguage) {
+      return '';
+    }
+    final effectiveLanguage = _currentLanguageHint ?? _language;
+    return switch (effectiveLanguage) {
+      AppLanguage.kk => 'kk',
+      AppLanguage.ru => 'ru',
+    };
   }
 
   String _sanitizeApiKey(String? raw) {

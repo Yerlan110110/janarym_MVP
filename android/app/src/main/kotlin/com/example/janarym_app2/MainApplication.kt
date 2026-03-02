@@ -1,6 +1,7 @@
 package com.example.janarym_app2
 
 import android.app.Application
+import android.content.pm.ApplicationInfo
 import android.util.Log
 import com.yandex.mapkit.MapKitFactory
 
@@ -11,12 +12,16 @@ class MainApplication : Application() {
     val apiKey = readYandexApiKeyFromFlutterAssets()
     if (apiKey.isNotBlank()) {
       MapKitFactory.setApiKey(apiKey)
-      Log.i("MainApplication", "Yandex MapKit API key loaded from .env")
+      if (isDebuggableApp()) {
+        Log.i("MainApplication", "Yandex MapKit API key loaded from .env")
+      }
     } else {
-      Log.w(
-        "MainApplication",
-        "YANDEX_MAPKIT_API_KEY is empty. Map and routing may be unavailable.",
-      )
+      if (isDebuggableApp()) {
+        Log.w(
+          "MainApplication",
+          "YANDEX_MAPKIT_API_KEY is empty. Map and routing may be unavailable.",
+        )
+      }
     }
   }
 
@@ -33,5 +38,9 @@ class MainApplication : Application() {
     } catch (_: Exception) {
       ""
     }
+  }
+
+  private fun isDebuggableApp(): Boolean {
+    return (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
   }
 }

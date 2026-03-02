@@ -112,6 +112,9 @@ class OpenAiClient {
     String userText, {
     String? systemPrompt,
     List<OpenAiChatMessage> history = const [],
+    String? contextMode,
+    String? safetyContext,
+    String? sceneSummary,
     int maxOutputTokens = 300,
   }) async {
     final apiKey = _resolveOpenAiApiKey();
@@ -120,9 +123,16 @@ class OpenAiClient {
     }
 
     final model = (dotenv.env['OPENAI_MODEL'] ?? _defaultModel).trim();
+    final runtimeContextPrompt = _buildRuntimeContextPrompt(
+      contextMode: contextMode,
+      safetyContext: safetyContext,
+      sceneSummary: sceneSummary,
+    );
     final messages = <Map<String, dynamic>>[
       if (systemPrompt != null && systemPrompt.trim().isNotEmpty)
         {'role': 'system', 'content': systemPrompt.trim()},
+      if (runtimeContextPrompt.isNotEmpty)
+        {'role': 'system', 'content': runtimeContextPrompt},
       ..._buildHistoryMessages(history),
       {'role': 'user', 'content': userText.trim()},
     ];
@@ -154,6 +164,8 @@ class OpenAiClient {
     Uint8List imageBytes, {
     String? systemPrompt,
     List<OpenAiChatMessage> history = const [],
+    Map<String, Object?>? perceptionSnapshot,
+    String? taskMode,
     int maxOutputTokens = 220,
   }) async {
     final apiKey = _resolveOpenAiApiKey();
@@ -170,9 +182,15 @@ class OpenAiClient {
                 _defaultModel)
             .trim();
 
+    final visionContextPrompt = _buildVisionRuntimePrompt(
+      taskMode: taskMode,
+      perceptionSnapshot: perceptionSnapshot,
+    );
     final messages = <Map<String, dynamic>>[
       if (systemPrompt != null && systemPrompt.trim().isNotEmpty)
         {'role': 'system', 'content': systemPrompt.trim()},
+      if (visionContextPrompt.isNotEmpty)
+        {'role': 'system', 'content': visionContextPrompt},
       ..._buildHistoryMessages(history),
       {
         'role': 'user',
@@ -224,6 +242,42 @@ class OpenAiClient {
       result.add({'role': role, 'content': content});
     }
     return result;
+  }
+
+  String _buildRuntimeContextPrompt({
+    String? contextMode,
+    String? safetyContext,
+    String? sceneSummary,
+  }) {
+    final parts = <String>[];
+    if (contextMode != null && contextMode.trim().isNotEmpty) {
+      parts.add('context_mode=${contextMode.trim()}');
+    }
+    if (safetyContext != null && safetyContext.trim().isNotEmpty) {
+      parts.add('safety_context=${safetyContext.trim()}');
+    }
+    if (sceneSummary != null && sceneSummary.trim().isNotEmpty) {
+      parts.add('scene_summary=${sceneSummary.trim()}');
+    }
+    if (parts.isEmpty) return '';
+    return 'Runtime context: ${parts.join('; ')}.';
+  }
+
+  String _buildVisionRuntimePrompt({
+    String? taskMode,
+    Map<String, Object?>? perceptionSnapshot,
+  }) {
+    final parts = <String>[];
+    if (taskMode != null && taskMode.trim().isNotEmpty) {
+      parts.add('task_mode=${taskMode.trim()}');
+    }
+    final snapshot = perceptionSnapshot ?? const <String, Object?>{};
+    if (snapshot.isNotEmpty) {
+      final compact = jsonEncode(snapshot);
+      parts.add('perception_snapshot=$compact');
+    }
+    if (parts.isEmpty) return '';
+    return 'Vision runtime context: ${parts.join('; ')}.';
   }
 
   Future<http.Response> _postWithRetry(

@@ -17,6 +17,8 @@ enum AssistantModeIntent {
   navRejectChoice,
   visionDescribe,
   repeat,
+  readText,
+  switchVoiceLanguage,
   unknown,
 }
 
@@ -47,6 +49,8 @@ class CommandDecision {
 
 class CommandRouter {
   static const List<String> wakeWordVariants = [
+    'жанар',
+    'жанара',
     'жанарым',
     'жанарим',
     'жанарум',
@@ -57,7 +61,11 @@ class CommandRouter {
     'жанрам',
     'шмарым',
     'janarym',
+    'janar',
+    'janara',
     'janarim',
+    'zhanar',
+    'zhanara',
     'zhanarym',
     'zhanarim',
     'zhanarum',
@@ -75,13 +83,18 @@ class CommandRouter {
     'позади',
     'вокруг',
     'сипатта',
+    'сипаттап бер',
     'айналаны сипатта',
     'алдымда не бар',
     'алдыңда не бар',
+    'не көріп тұрсың',
     'оң жақта',
     'сол жақта',
     'артта',
     'айналамда',
+    'қандай түс',
+    'түсі қандай',
+    'түсін айт',
   ];
 
   static const List<String> repeatTriggers = [
@@ -92,6 +105,39 @@ class CommandRouter {
     'қайтала',
     'тағы бір рет',
     'тағы қайтала',
+    'жауап бер',
+  ];
+
+  static const List<String> readTextTriggers = [
+    'прочитай',
+    'прочитать',
+    'читай',
+    'читай текст',
+    'прочитай текст',
+    'считай текст',
+    'read text',
+    'read this',
+    'scan text',
+    'оқы',
+    'мәтінді оқы',
+    'мәтінді оқып бер',
+    'қайта оқы',
+  ];
+
+  static const List<String> switchVoiceLanguageTriggers = [
+    'қазақша',
+    'қазақша сөйле',
+    'қазақша жауап бер',
+    'қазақ тілінде',
+    'қазақ тілінде жауап бер',
+    'по-казахски',
+    'по казахски',
+    'на казахском',
+    'орысша',
+    'орысша сөйле',
+    'по-русски',
+    'по русски',
+    'на русском',
   ];
 
   static const List<String> enterNavModeTriggers = [
@@ -128,6 +174,8 @@ class CommandRouter {
     'маршрут жаса',
     'дейін апар',
     'бағыт құр',
+    'маршрут баста',
+    'үйге апар',
   ];
 
   static const List<String> navStopTriggers = [
@@ -151,6 +199,7 @@ class CommandRouter {
     'қай жерде тұрмын',
     'қанша қалды',
     'қандай қашықтық қалды',
+    'қайда бару керек',
   ];
 
   static const List<String> navNextStepTriggers = [
@@ -390,8 +439,14 @@ class CommandRouter {
     if (destination != null && destination.isNotEmpty) {
       return AssistantModeIntent.navStart;
     }
+    if (switchVoiceLanguageTriggers.any(text.contains)) {
+      return AssistantModeIntent.switchVoiceLanguage;
+    }
     if (repeatTriggers.any(text.contains)) {
       return AssistantModeIntent.repeat;
+    }
+    if (readTextTriggers.any(text.contains)) {
+      return AssistantModeIntent.readText;
     }
     final hasVisionDirection = _directionFromText(text) != null;
     if (hasVisionDirection || describeTriggers.any(text.contains)) {
