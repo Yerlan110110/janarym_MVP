@@ -42,6 +42,7 @@ class WakeWordDebugState {
     this.requiredStrictHits = 0,
     this.repeatRequiredStrictHits = 0,
     this.templateVerificationEnabled = false,
+    this.stage2VerificationEnabled = false,
     this.ownerVerificationEnabled = false,
     this.cooldownRemainingMs = 0,
     this.reason = '',
@@ -60,6 +61,7 @@ class WakeWordDebugState {
   final int requiredStrictHits;
   final int repeatRequiredStrictHits;
   final bool templateVerificationEnabled;
+  final bool stage2VerificationEnabled;
   final bool ownerVerificationEnabled;
   final int cooldownRemainingMs;
   final String reason;
@@ -315,6 +317,18 @@ class WakeWordService {
         'OWNER_VOICE_PROFILE_ENABLED',
         fallback: !maxRecall,
       ),
+      'enableStage2Verification': _readBoolEnv(
+        'WAKE_STAGE2_VERIFICATION_ENABLED',
+        fallback: !maxRecall,
+      ),
+      'acceptOnStage1': _readBoolEnv(
+        'WAKE_ACCEPT_ON_STAGE1',
+        fallback: maxRecall,
+      ),
+      'gatePorcupineWithVad': _readBoolEnv(
+        'WAKE_VAD_GATE_ENABLED',
+        fallback: !maxRecall,
+      ),
       'enableWakeTemplateVerification': _readBoolEnv(
         'WAKE_TEMPLATE_VERIFICATION_ENABLED',
         fallback: !maxRecall,
@@ -512,6 +526,8 @@ class WakeWordService {
               (event['repeatRequiredStrictHits'] as num?)?.toInt() ?? 0,
           templateVerificationEnabled:
               event['templateVerificationEnabled'] as bool? ?? false,
+          stage2VerificationEnabled:
+              event['stage2VerificationEnabled'] as bool? ?? false,
           ownerVerificationEnabled:
               event['ownerVerificationEnabled'] as bool? ?? false,
           cooldownRemainingMs:

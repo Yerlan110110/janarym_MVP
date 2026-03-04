@@ -40,6 +40,9 @@ data class NativeWakeWordConfig(
   val strictSensitivity: Float = 0.50f,
   val recallMode: String = "maxRecall",
   val enableOwnerVerification: Boolean = true,
+  val enableStage2Verification: Boolean = true,
+  val acceptOnStage1: Boolean = false,
+  val gatePorcupineWithVad: Boolean = true,
   val enableWakeTemplateVerification: Boolean = true,
   val speakerSimilarityThreshold: Double = 0.70,
   val wakeTemplateThreshold: Double = 0.62,
@@ -78,6 +81,9 @@ data class NativeWakeWordConfig(
         strictSensitivity = (args["strictSensitivity"] as? Number)?.toFloat() ?: 0.50f,
         recallMode = args["recallMode"]?.toString()?.trim().orEmpty().ifEmpty { "maxRecall" },
         enableOwnerVerification = args["enableOwnerVerification"] as? Boolean ?: true,
+        enableStage2Verification = args["enableStage2Verification"] as? Boolean ?: true,
+        acceptOnStage1 = args["acceptOnStage1"] as? Boolean ?: false,
+        gatePorcupineWithVad = args["gatePorcupineWithVad"] as? Boolean ?: true,
         enableWakeTemplateVerification =
           args["enableWakeTemplateVerification"] as? Boolean ?: true,
         speakerSimilarityThreshold =
@@ -193,7 +199,7 @@ class NativeWakeWordEngine(context: Context) {
   fun start() {
     if (running.get()) return
     val record = audioRecord
-    if (record == null || broadPorcupine == null || strictPorcupine == null || vadWebRtc == null || vadSilero == null) {
+    if (record == null || broadPorcupine == null || vadWebRtc == null || vadSilero == null) {
       updateState("error", "Wake engine is not initialized")
       return
     }
@@ -346,7 +352,10 @@ class NativeWakeWordEngine(context: Context) {
       if (enrollmentSession != null) {
         handleEnrollmentFrame(vadFrame, isSpeech)
       }
-      if (!isSpeech || candidateCapture != null || enrollmentSession != null) {
+      if (candidateCapture != null || enrollmentSession != null) {
+        continue
+      }
+      if ((config?.gatePorcupineWithVad ?: true) && !isSpeech) {
         continue
       }
       porcupineAccumulator.append(vadFrame, vadFrame.size)
@@ -371,6 +380,7 @@ class NativeWakeWordEngine(context: Context) {
     noiseFloorRms: Double,
   ) {
     val now = SystemClock.elapsedRealtime()
+    val currentConfig = config ?: return
     if (now < cooldownUntilMs) {
       emitDecision(
         accepted = false,
@@ -378,15 +388,50 @@ class NativeWakeWordEngine(context: Context) {
         rmsDb = WakeWordAudioFeatures.normalizeDb(signalRms),
         snrDb = computeSnrDb(signalRms, noiseFloorRms),
         stage1Score = 1.0,
+        stage2VerificationEnabled = currentConfig.enableStage2Verification,
+        templateVerificationEnabled = currentConfig.enableWakeTemplateVerification,
+        ownerVerificationEnabled = currentConfig.enableOwnerVerification,
       )
       return
     }
     if (candidateCapture != null) return
+    if (currentConfig.acceptOnStage1 || !currentConfig.enableStage2Verification) {
+      cooldownUntilMs = now + currentConfig.cooldownMs
+      maybeLog(
+        "stage1_accept keywordIndex=$keywordIndex acceptOnStage1=${currentConfig.acceptOnStage1} gatePorcupineWithVad=${currentConfig.gatePorcupineWithVad}",
+      )
+      emitDecision(
+        accepted = true,
+        reason = "stage1_accept",
+        rmsDb = WakeWordAudioFeatures.normalizeDb(signalRms),
+        snrDb = computeSnrDb(signalRms, noiseFloorRms),
+        stage1Score = 1.0,
+        stage2Score = 1.0,
+        templateVerificationEnabled = currentConfig.enableWakeTemplateVerification,
+        stage2VerificationEnabled = currentConfig.enableStage2Verification,
+        ownerVerificationEnabled = currentConfig.enableOwnerVerification,
+        minSpeechRatio = currentConfig.minSpeechRatio,
+        requiredStrictHits = currentConfig.requiredStrictHits,
+        repeatRequiredStrictHits = currentConfig.repeatRequiredStrictHits,
+        keywordIndex = keywordIndex,
+      )
+      emitEvent(
+        mapOf(
+          "type" to "wake",
+          "timestampMs" to System.currentTimeMillis(),
+          "keywordIndex" to keywordIndex,
+          "keywordLabel" to currentConfig.keywordLabels.getOrElse(keywordIndex) { "unknown" },
+          "stage2Score" to 1.0,
+          "speakerSimilarity" to null,
+        ),
+      )
+      return
+    }
     lastCandidateAtMs = now
     val preRollSamples =
-      SAMPLE_RATE * (config?.stage2PrerollMs ?: 260).coerceIn(120, 500) / 1000
+      SAMPLE_RATE * currentConfig.stage2PrerollMs.coerceIn(120, 500) / 1000
     val postSamples =
-      SAMPLE_RATE * (config?.stage2WindowMs ?: 700).coerceIn(500, 900) / 1000
+      SAMPLE_RATE * currentConfig.stage2WindowMs.coerceIn(500, 900) / 1000
     val preRoll = recentAudio.toArray(preRollSamples)
     candidateCapture =
       CandidateCapture(
@@ -410,6 +455,38 @@ class NativeWakeWordEngine(context: Context) {
 
   private fun evaluateCandidate(keywordIndex: Int, candidateAudio: ShortArray) {
     val currentConfig = config ?: return
+    if (!currentConfig.enableStage2Verification) {
+      val signalRms = WakeWordAudioFeatures.computeRms(candidateAudio)
+      val rmsDb = WakeWordAudioFeatures.normalizeDb(signalRms)
+      val snrDb = computeSnrDb(signalRms, estimateNoiseFloorRms())
+      cooldownUntilMs = SystemClock.elapsedRealtime() + currentConfig.cooldownMs
+      emitDecision(
+        accepted = true,
+        reason = "stage2_bypass_accept",
+        rmsDb = rmsDb,
+        snrDb = snrDb,
+        stage1Score = 1.0,
+        stage2Score = 1.0,
+        templateVerificationEnabled = currentConfig.enableWakeTemplateVerification,
+        stage2VerificationEnabled = currentConfig.enableStage2Verification,
+        ownerVerificationEnabled = currentConfig.enableOwnerVerification,
+        minSpeechRatio = currentConfig.minSpeechRatio,
+        requiredStrictHits = currentConfig.requiredStrictHits,
+        repeatRequiredStrictHits = currentConfig.repeatRequiredStrictHits,
+        keywordIndex = keywordIndex,
+      )
+      emitEvent(
+        mapOf(
+          "type" to "wake",
+          "timestampMs" to System.currentTimeMillis(),
+          "keywordIndex" to keywordIndex,
+          "keywordLabel" to currentConfig.keywordLabels.getOrElse(keywordIndex) { "unknown" },
+          "stage2Score" to 1.0,
+          "speakerSimilarity" to null,
+        ),
+      )
+      return
+    }
     val profile = activeProfile ?: profileStore.load().also { activeProfile = it }
     val signalRms = WakeWordAudioFeatures.computeRms(candidateAudio)
     val rmsDb = WakeWordAudioFeatures.normalizeDb(signalRms)
@@ -460,6 +537,7 @@ class NativeWakeWordEngine(context: Context) {
         wakeTemplateSimilarity = wakeTemplateSimilarity,
         templateThreshold = stage2Threshold,
         speakerSimilarity = Double.NaN,
+        stage2VerificationEnabled = currentConfig.enableStage2Verification,
         templateVerificationEnabled = currentConfig.enableWakeTemplateVerification,
         ownerVerificationEnabled = currentConfig.enableOwnerVerification,
         minSpeechRatio = currentConfig.minSpeechRatio,
@@ -505,6 +583,7 @@ class NativeWakeWordEngine(context: Context) {
         templateThreshold = stage2Threshold,
         speakerSimilarity = speakerSimilarity,
         speakerThreshold = speakerThreshold,
+        stage2VerificationEnabled = currentConfig.enableStage2Verification,
         templateVerificationEnabled = currentConfig.enableWakeTemplateVerification,
         ownerVerificationEnabled = currentConfig.enableOwnerVerification,
         minSpeechRatio = currentConfig.minSpeechRatio,
@@ -529,6 +608,7 @@ class NativeWakeWordEngine(context: Context) {
       templateThreshold = stage2Threshold,
       speakerSimilarity = speakerSimilarity,
       speakerThreshold = speakerThreshold,
+      stage2VerificationEnabled = currentConfig.enableStage2Verification,
       templateVerificationEnabled = currentConfig.enableWakeTemplateVerification,
       ownerVerificationEnabled = currentConfig.enableOwnerVerification,
       minSpeechRatio = currentConfig.minSpeechRatio,
@@ -621,12 +701,9 @@ class NativeWakeWordEngine(context: Context) {
         .setKeywordPaths(keywordFiles.toTypedArray())
         .setSensitivities(FloatArray(keywordFiles.size) { config.broadSensitivity })
         .build(appContext)
-    strictPorcupine =
-      Porcupine.Builder()
-        .setAccessKey(config.accessKey)
-        .setKeywordPaths(keywordFiles.toTypedArray())
-        .setSensitivities(FloatArray(keywordFiles.size) { config.strictSensitivity })
-        .build(appContext)
+    // Recall-first mode uses only the broad detector. The strict detector stays
+    // disabled to minimize post-hit verification and wake latency.
+    strictPorcupine = null
     frameLength = broadPorcupine?.frameLength ?: throw IllegalStateException("Porcupine frame length unavailable")
 
     vadWebRtc =
@@ -731,7 +808,7 @@ class NativeWakeWordEngine(context: Context) {
   }
 
   private fun runStrictVerification(audio: ShortArray): Int {
-    val strict = strictPorcupine ?: return 0
+    val strict = strictPorcupine ?: return 1
     if (audio.size < frameLength) return 0
     var hits = 0
     var offset = 0
@@ -803,6 +880,7 @@ class NativeWakeWordEngine(context: Context) {
     templateThreshold: Double = Double.NaN,
     speakerSimilarity: Double = Double.NaN,
     speakerThreshold: Double = Double.NaN,
+    stage2VerificationEnabled: Boolean = true,
     templateVerificationEnabled: Boolean = true,
     ownerVerificationEnabled: Boolean = true,
     minSpeechRatio: Double = 0.55,
@@ -823,6 +901,7 @@ class NativeWakeWordEngine(context: Context) {
         "templateThreshold" to if (templateThreshold.isNaN()) null else templateThreshold,
         "speakerSimilarity" to if (speakerSimilarity.isNaN()) null else speakerSimilarity,
         "speakerThreshold" to if (speakerThreshold.isNaN()) null else speakerThreshold,
+        "stage2VerificationEnabled" to stage2VerificationEnabled,
         "templateVerificationEnabled" to templateVerificationEnabled,
         "ownerVerificationEnabled" to ownerVerificationEnabled,
         "minSpeechRatio" to minSpeechRatio,
@@ -854,6 +933,7 @@ class NativeWakeWordEngine(context: Context) {
         "templateThreshold" to null,
         "speakerSimilarity" to null,
         "speakerThreshold" to null,
+        "stage2VerificationEnabled" to (currentConfig?.enableStage2Verification ?: true),
         "templateVerificationEnabled" to (currentConfig?.enableWakeTemplateVerification ?: true),
         "ownerVerificationEnabled" to (currentConfig?.enableOwnerVerification ?: true),
         "minSpeechRatio" to (currentConfig?.minSpeechRatio ?: 0.55),

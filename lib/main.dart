@@ -38,8 +38,11 @@ import 'services/shopping_mode_service.dart';
 import 'services/text_reader_decision_helper.dart';
 import 'services/text_reading_normalizer.dart';
 import 'widgets/bbox_painter.dart';
+import 'voice/android_stt_wake_service.dart';
 import 'voice/command_stt_service.dart';
 import 'voice/spoken_language_detector.dart';
+import 'voice/wake_engine_mode.dart';
+import 'voice/wake_phrase_matcher.dart';
 import 'voice/wake_word_service.dart';
 
 bool _readEnvBool(String key, {required bool fallback}) {
@@ -253,6 +256,8 @@ class _JanarymHomeState extends State<JanarymHome>
   late final NavigationModeController _navigationController;
   late final CommandSttService _sttService;
   late final WakeWordService _wakeService;
+  late final WakeEngineMode _wakeEngineMode;
+  late final AndroidSttWakeService _sttWakeService;
   late final RuntimeFeatureFlags _featureFlags;
   late final ModeOrchestrator _modeOrchestrator;
   late final PerceptionEventBus _perceptionEventBus;
@@ -336,6 +341,13 @@ class _JanarymHomeState extends State<JanarymHome>
   bool _wakeRecoveryInProgress = false;
   bool _wakeWordOnlyMode = false;
   int _wakeRecoveryAttempts = 0;
+  bool _sttWakeArmed = false;
+  bool _sttWakeUnavailable = false;
+  DateTime? _sttWakeFatalErrorWindowStartedAt;
+  int _sttWakeFatalErrors = 0;
+  String _lastSttWakeMatch = 'none';
+  String _lastSttWakeReason = 'idle';
+  StreamSubscription<SttWakeEvent>? _sttWakeSubscription;
   bool _textReaderLoopBusy = false;
   bool _manualTextReadInProgress = false;
   bool _textReaderAutoPaused = false;
@@ -349,6 +361,41 @@ class _JanarymHomeState extends State<JanarymHome>
   NavPoint? _lastNavCameraTarget;
   final bool _alwaysDialogMode = _readEnvBool(
     'ALWAYS_DIALOG_MODE',
+    fallback: true,
+  );
+  final bool _sttWakeEnabled = _readEnvBool('STT_WAKE_ENABLED', fallback: true);
+  final String _sttWakeLanguage = _readEnvString(
+    'STT_WAKE_LANGUAGE',
+    fallback: 'kk-KZ',
+  );
+  final bool _sttWakePartialResultsEnabled = _readEnvBool(
+    'STT_WAKE_PARTIAL_RESULTS_ENABLED',
+    fallback: true,
+  );
+  final int _sttWakeRestartDelayMs = _readEnvInt(
+    'STT_WAKE_RESTART_DELAY_MS',
+    fallback: 120,
+    min: 50,
+    max: 2000,
+  );
+  final int _sttWakeFatalErrorThreshold = _readEnvInt(
+    'STT_WAKE_FATAL_ERROR_THRESHOLD',
+    fallback: 5,
+    min: 1,
+    max: 20,
+  );
+  final int _sttWakeFatalErrorWindowMs = _readEnvInt(
+    'STT_WAKE_FATAL_ERROR_WINDOW_MS',
+    fallback: 20000,
+    min: 1000,
+    max: 120000,
+  );
+  final bool _sttWakeLegacyFallbackEnabled = _readEnvBool(
+    'STT_WAKE_LEGACY_FALLBACK_ENABLED',
+    fallback: true,
+  );
+  final bool _sttWakeDebugLogs = _readEnvBool(
+    'STT_WAKE_DEBUG_LOGS',
     fallback: true,
   );
   final bool _requireWakeWord = _readEnvBool(
@@ -398,6 +445,10 @@ class _JanarymHomeState extends State<JanarymHome>
   ).toLowerCase();
   final bool _wakeTemplateVerificationEnabled = _readEnvBool(
     'WAKE_TEMPLATE_VERIFICATION_ENABLED',
+    fallback: false,
+  );
+  final bool _wakeStage2VerificationEnabled = _readEnvBool(
+    'WAKE_STAGE2_VERIFICATION_ENABLED',
     fallback: false,
   );
   final bool _ownerVerificationEnabled = _readEnvBool(
@@ -470,6 +521,9 @@ class _JanarymHomeState extends State<JanarymHome>
   static const int _textReaderAutoVisionFallbackCooldownMs = 6000;
   DateTime? _lastWakeRecoveryAttemptAt;
 
+  bool get _useSttWakeEngine =>
+      _wakeEngineMode == WakeEngineMode.sttAndroid && _sttWakeEnabled;
+
   @override
   void initState() {
     super.initState();
@@ -524,8 +578,10 @@ class _JanarymHomeState extends State<JanarymHome>
       instructionAdapter: _adaptNavigationInstruction,
       onRouteBuilt: _handleRouteBuilt,
     );
+    _wakeEngineMode = readWakeEngineModeFromEnv();
     _sttService = CommandSttService(language: _interactionLanguage);
     _wakeService = WakeWordService(onWakeWordDetected: _handleWakeDetected);
+    _sttWakeService = AndroidSttWakeService(debugLogs: _sttWakeDebugLogs);
     _openAi.setLanguage(_interactionLanguage);
     _dialogBrevityMode = _parseInitialBrevityMode(_dialogBrevityDefaultRaw);
     _micMessage = _l10n.checkingMic;
@@ -533,6 +589,9 @@ class _JanarymHomeState extends State<JanarymHome>
     _navigationController.state.addListener(_handleNavigationStateChange);
     _sttService.state.addListener(_handleSttStateChange);
     _wakeService.state.addListener(_handleWakeStateChange);
+    _sttWakeSubscription = _sttWakeService.events.listen(
+      (event) => unawaited(_handleSttWakeEvent(event)),
+    );
     _modeOrchestrator.addListener(_handleModeOrchestratorChange);
     _personalizationController.addListener(_handlePersonalizationChange);
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -568,6 +627,8 @@ class _JanarymHomeState extends State<JanarymHome>
     _navigationController.state.removeListener(_handleNavigationStateChange);
     _sttService.state.removeListener(_handleSttStateChange);
     _wakeService.state.removeListener(_handleWakeStateChange);
+    _sttWakeSubscription?.cancel();
+    _sttWakeSubscription = null;
     _modeOrchestrator.removeListener(_handleModeOrchestratorChange);
     _personalizationController.removeListener(_handlePersonalizationChange);
     unawaited(_navigationController.dispose());
@@ -575,6 +636,7 @@ class _JanarymHomeState extends State<JanarymHome>
     _personalizationController.dispose();
     _sttService.dispose();
     _wakeService.dispose();
+    unawaited(_sttWakeService.dispose());
     unawaited(_textReaderService.dispose());
     _openMeteoService.dispose();
     _modeOrchestrator.dispose();
@@ -621,6 +683,182 @@ class _JanarymHomeState extends State<JanarymHome>
 
   String _voiceText({required String ru, required String kk}) {
     return _voiceIsKazakh ? kk : ru;
+  }
+
+  Future<void> _initializeSttWakeIfNeeded() async {
+    if (!_useSttWakeEngine) return;
+    try {
+      await _sttWakeService.initialize(
+        language: _sttWakeLanguage,
+        partialResults: _sttWakePartialResultsEnabled,
+      );
+      if (_sttWakeDebugLogs) {
+        appLog(
+          '[STTWake] initialize language=$_sttWakeLanguage '
+          'partials=$_sttWakePartialResultsEnabled',
+        );
+      }
+    } catch (error) {
+      _sttWakeUnavailable = true;
+      appLog('[STTWake] initialize failed: $error');
+    }
+  }
+
+  Future<void> _startSttWake({required String reason}) async {
+    if (!_useSttWakeEngine || _sttWakeUnavailable) return;
+    if (_sttWakeArmed) return;
+    try {
+      await _sttWakeService.start();
+      _sttWakeArmed = true;
+      if (_sttWakeDebugLogs) {
+        appLog('[STTWake] start reason=$reason');
+      }
+    } catch (error) {
+      _sttWakeArmed = false;
+      appLog('[STTWake] start failed reason=$reason error=$error');
+    }
+  }
+
+  Future<void> _stopSttWake({required String reason}) async {
+    if (!_useSttWakeEngine) return;
+    if (!_sttWakeArmed && !_sttWakeUnavailable) return;
+    try {
+      await _sttWakeService.stop();
+    } catch (_) {}
+    _sttWakeArmed = false;
+    if (_sttWakeDebugLogs) {
+      appLog('[STTWake] stop reason=$reason');
+    }
+  }
+
+  Future<void> _stopPrimaryWake({required String reason}) async {
+    if (_useSttWakeEngine) {
+      await _stopSttWake(reason: reason);
+      return;
+    }
+    await _wakeService.stop();
+  }
+
+  bool _isFatalSttWakeEvent(SttWakeEvent event) {
+    return event.reason == 'fatal' ||
+        event.errorName == 'ERROR_INSUFFICIENT_PERMISSIONS';
+  }
+
+  void _recordSttWakeFatalError() {
+    final now = DateTime.now();
+    final startedAt = _sttWakeFatalErrorWindowStartedAt;
+    if (startedAt == null ||
+        now.difference(startedAt).inMilliseconds > _sttWakeFatalErrorWindowMs) {
+      _sttWakeFatalErrorWindowStartedAt = now;
+      _sttWakeFatalErrors = 1;
+      return;
+    }
+    _sttWakeFatalErrors += 1;
+    if (_sttWakeFatalErrors >= _sttWakeFatalErrorThreshold) {
+      _sttWakeUnavailable = true;
+    }
+  }
+
+  Future<void> _handleSttWakeEvent(SttWakeEvent event) async {
+    if (!_useSttWakeEngine || !mounted) return;
+    switch (event.status) {
+      case 'ready':
+      case 'listening':
+        _sttWakeArmed = true;
+        _lastSttWakeReason = event.status;
+        return;
+      case 'partial':
+      case 'final':
+        final text = (event.text ?? '').trim();
+        if (text.isEmpty) return;
+        if (_sttWakeDebugLogs) {
+          appLog('[STTWake] ${event.status}="${_truncateForLog(text)}"');
+        }
+        final match = WakePhraseMatcher.match(
+          text,
+          isPartial: event.status == 'partial',
+        );
+        _lastSttWakeMatch = match.strength.name;
+        _lastSttWakeReason = match.reason;
+        final accepted = event.status == 'partial'
+            ? match.strength == WakeMatchStrength.strong
+            : match.strength == WakeMatchStrength.strong ||
+                  match.strength == WakeMatchStrength.probable;
+        if (!accepted) {
+          return;
+        }
+        appLog(
+          '[STTWake] accepted ${event.status} '
+          'match=${match.strength.name} reason=${match.reason}',
+        );
+        await _stopSttWake(reason: 'accepted_${event.status}');
+        await _handleWakeDetected();
+        return;
+      case 'error':
+        _sttWakeArmed = false;
+        _lastSttWakeReason = event.reason ?? 'error';
+        appLog(
+          '[STTWake] error code=${event.errorCode ?? '-'} '
+          'name=${event.errorName ?? '-'} reason=${event.reason ?? '-'}',
+        );
+        if (_isFatalSttWakeEvent(event)) {
+          _recordSttWakeFatalError();
+          if (_sttWakeUnavailable) {
+            appLog('[STTWake] unavailable reason=${event.reason ?? 'fatal'}');
+            await _syncPrimaryWakeMode();
+            return;
+          }
+        }
+        Future<void>.delayed(
+          Duration(milliseconds: _sttWakeRestartDelayMs),
+          () async {
+            if (!mounted || !_useSttWakeEngine) return;
+            await _syncPrimaryWakeMode();
+          },
+        );
+        return;
+      case 'stopped':
+        _sttWakeArmed = false;
+        _lastSttWakeReason = event.reason ?? 'stopped';
+        return;
+      default:
+        return;
+    }
+  }
+
+  Future<void> _syncPrimaryWakeMode() async {
+    if (!_useSttWakeEngine) return;
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    final shouldRun =
+        mounted &&
+        lifecycle == AppLifecycleState.resumed &&
+        _requireWakeWord &&
+        _micGranted &&
+        !_commandInFlight &&
+        !_followUpActive &&
+        !_wakeHandling &&
+        !_isSpeaking &&
+        !_onboardingDialogInProgress &&
+        !_sttService.isListening &&
+        !_manualTextReadInProgress &&
+        !_sttWakeUnavailable;
+    if (shouldRun) {
+      await _initializeSttWakeIfNeeded();
+      _stopWakeFallbackLoop();
+      _setCircleState(CircleState.wake);
+      await _startSttWake(reason: 'sync');
+      return;
+    }
+    await _stopSttWake(reason: 'sync_blocked');
+    if (_sttWakeUnavailable &&
+        _sttWakeLegacyFallbackEnabled &&
+        _micGranted &&
+        lifecycle == AppLifecycleState.resumed &&
+        !_onboardingDialogInProgress) {
+      _startWakeFallbackLoop();
+    } else {
+      _stopWakeFallbackLoop();
+    }
   }
 
   void _applyInteractionLanguage(
@@ -1038,6 +1276,9 @@ class _JanarymHomeState extends State<JanarymHome>
     }
     _interactionLanguagePinned = false;
     _setCircleState(CircleState.wake);
+    if (_useSttWakeEngine) {
+      unawaited(_syncPrimaryWakeMode());
+    }
   }
 
   Future<bool> _ensureNotificationPermission() async {
@@ -1098,13 +1339,23 @@ class _JanarymHomeState extends State<JanarymHome>
         _wakeWordOnlyMode = true;
         _stopWakeFallbackLoop();
         _setCircleState(CircleState.wake);
-        await _wakeService.start();
+        if (_useSttWakeEngine) {
+          await _initializeSttWakeIfNeeded();
+          await _syncPrimaryWakeMode();
+        } else {
+          await _wakeService.start();
+        }
       } else if (_alwaysDialogMode) {
-        await _wakeService.stop();
+        await _stopPrimaryWake(reason: 'always_dialog_init');
         _startWakeFallbackLoop();
       } else {
         _setCircleState(CircleState.wake);
-        await _wakeService.start();
+        if (_useSttWakeEngine) {
+          await _initializeSttWakeIfNeeded();
+          await _syncPrimaryWakeMode();
+        } else {
+          await _wakeService.start();
+        }
       }
       _maybeStartOnboardingDialog();
       unawaited(_announceModesOnStartup());
@@ -1420,7 +1671,9 @@ class _JanarymHomeState extends State<JanarymHome>
     if (state == AppLifecycleState.resumed) {
       unawaited(_syncHeavyServices());
       if (_micGranted) {
-        if (_requireWakeWord &&
+        if (_useSttWakeEngine) {
+          unawaited(_syncPrimaryWakeMode());
+        } else if (_requireWakeWord &&
             _wakeService.state.value.status != WakeWordStatus.error) {
           unawaited(_wakeService.start());
           _stopWakeFallbackLoop();
@@ -1440,6 +1693,7 @@ class _JanarymHomeState extends State<JanarymHome>
     } else if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
       unawaited(_stopCameraStream(reason: 'lifecycle_${state.name}'));
+      unawaited(_stopSttWake(reason: 'lifecycle_${state.name}'));
       _stopWakeFallbackLoop();
       _wakeRecoveryTimer?.cancel();
       _wakeRecoveryTimer = null;
@@ -1456,6 +1710,7 @@ class _JanarymHomeState extends State<JanarymHome>
       _textReaderLoopTimer?.cancel();
       _textReaderLoopTimer = null;
       unawaited(_syncReflexLoop());
+      unawaited(_stopSttWake(reason: 'lifecycle_${state.name}'));
       _stopWakeFallbackLoop();
     }
   }
@@ -1473,6 +1728,12 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   void _handleWakeStateChange() {
+    if (_useSttWakeEngine) {
+      if (mounted) {
+        setState(() {});
+      }
+      return;
+    }
     final wake = _wakeService.state.value;
     if (wake.status == WakeWordStatus.error) {
       _wakeErrorSince ??= DateTime.now();
@@ -1600,6 +1861,9 @@ class _JanarymHomeState extends State<JanarymHome>
     _voicePriorityWindowActive = true;
     appLog('[VoicePriority] enter reason=$reason');
     unawaited(_syncHeavyServices());
+    if (_useSttWakeEngine) {
+      unawaited(_syncPrimaryWakeMode());
+    }
   }
 
   void _exitVoicePriorityWindow({required String reason}) {
@@ -1607,6 +1871,9 @@ class _JanarymHomeState extends State<JanarymHome>
     _voicePriorityWindowActive = false;
     appLog('[VoicePriority] exit reason=$reason');
     unawaited(_syncHeavyServices());
+    if (_useSttWakeEngine) {
+      unawaited(_syncPrimaryWakeMode());
+    }
   }
 
   Future<void> _syncReflexLoop() async {
@@ -1863,6 +2130,17 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   void _syncWakeFallbackMode(WakeWordState wake) {
+    if (_useSttWakeEngine) {
+      if (_sttWakeUnavailable &&
+          _sttWakeLegacyFallbackEnabled &&
+          _micGranted &&
+          !_onboardingDialogInProgress) {
+        _startWakeFallbackLoop();
+      } else {
+        _stopWakeFallbackLoop();
+      }
+      return;
+    }
     if (_onboardingDialogInProgress) {
       _stopWakeFallbackLoop();
       return;
@@ -1888,6 +2166,9 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   void _startWakeFallbackLoop() {
+    if (_useSttWakeEngine && !_sttWakeUnavailable) {
+      return;
+    }
     if (_wakeFallbackActive || !_micGranted || _wakeWordOnlyMode) {
       return;
     }
@@ -1990,25 +2271,9 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   bool _containsWakeWordCandidate(String text) {
-    final normalized = _router.normalize(text).replaceAll('-', ' ');
-    final compact = normalized.replaceAll(' ', '');
-    final wakeRootPattern = RegExp(
-      r'\b(жанар(?:ым|им|ум|ом|ам|а)?|janar(?:ym|im|um|a)?|zhanar(?:ym|im|um|a)?)\b',
-    );
-    if (wakeRootPattern.hasMatch(normalized)) {
-      return true;
-    }
-    for (final wake in CommandRouter.wakeWordVariants) {
-      final wakeNormalized = _router.normalize(wake).replaceAll('-', ' ');
-      final wakeCompact = wakeNormalized.replaceAll(' ', '');
-      if (wakeNormalized.isNotEmpty && normalized.contains(wakeNormalized)) {
-        return true;
-      }
-      if (wakeCompact.isNotEmpty && compact.contains(wakeCompact)) {
-        return true;
-      }
-    }
-    return false;
+    final match = WakePhraseMatcher.match(text, isPartial: false);
+    return match.strength == WakeMatchStrength.strong ||
+        match.strength == WakeMatchStrength.probable;
   }
 
   bool _shouldProcessSpeechInterruption(String text) {
@@ -2202,7 +2467,7 @@ class _JanarymHomeState extends State<JanarymHome>
     }
     _requestId++;
     await _tts.stop();
-    await _wakeService.stop();
+    await _stopPrimaryWake(reason: 'wake_detected');
     if (_followUpActive) {
       await _sttService.stop();
       _followUpActive = false;
@@ -2248,7 +2513,10 @@ class _JanarymHomeState extends State<JanarymHome>
       _wakeWordOnlyMode = true;
       _stopWakeFallbackLoop();
       _setCircleState(CircleState.wake);
-      if (_wakeService.state.value.status != WakeWordStatus.error) {
+      if (_useSttWakeEngine) {
+        await _initializeSttWakeIfNeeded();
+        await _syncPrimaryWakeMode();
+      } else if (_wakeService.state.value.status != WakeWordStatus.error) {
         await _wakeService.start();
       } else {
         _scheduleWakeRecoveryIfNeeded(_wakeService.state.value);
@@ -2265,7 +2533,10 @@ class _JanarymHomeState extends State<JanarymHome>
     _wakeWordOnlyMode = true;
     _stopWakeFallbackLoop();
     _setCircleState(CircleState.wake);
-    if (_wakeService.state.value.status != WakeWordStatus.error) {
+    if (_useSttWakeEngine) {
+      await _initializeSttWakeIfNeeded();
+      await _syncPrimaryWakeMode();
+    } else if (_wakeService.state.value.status != WakeWordStatus.error) {
       await _wakeService.start();
     } else {
       _scheduleWakeRecoveryIfNeeded(_wakeService.state.value);
@@ -2280,12 +2551,13 @@ class _JanarymHomeState extends State<JanarymHome>
     _commandInFlight = true;
     final localRequestId = _requestId;
     final wakeHealthy =
+        !_useSttWakeEngine &&
         _requireWakeWord &&
         _wakeService.state.value.status != WakeWordStatus.error;
     try {
       _enterVoicePriorityWindow(reason: 'command_$reason');
-      if (wakeHealthy) {
-        await _wakeService.stop();
+      if (_requireWakeWord) {
+        await _stopPrimaryWake(reason: 'command_$reason');
       }
       final listenProfile = _assistantMode == AssistantMode.navigation
           ? CommandListenProfile.navigation
@@ -2311,7 +2583,9 @@ class _JanarymHomeState extends State<JanarymHome>
       );
 
       // Re-arm dedicated wake engine immediately after command capture.
-      if (wakeHealthy) {
+      if (_useSttWakeEngine) {
+        await _syncPrimaryWakeMode();
+      } else if (wakeHealthy) {
         await _wakeService.start();
       }
 
@@ -2724,7 +2998,7 @@ class _JanarymHomeState extends State<JanarymHome>
     _onboardingDialogInProgress = true;
     _wakeWordOnlyMode = false;
     _stopWakeFallbackLoop();
-    await _wakeService.stop();
+    await _stopPrimaryWake(reason: 'onboarding');
     try {
       while (mounted &&
           _showOnboardingOverlay &&
@@ -2775,7 +3049,9 @@ class _JanarymHomeState extends State<JanarymHome>
     } finally {
       _onboardingDialogInProgress = false;
       if (_micGranted) {
-        if (_wakeService.state.value.status == WakeWordStatus.error) {
+        if (_useSttWakeEngine) {
+          await _syncPrimaryWakeMode();
+        } else if (_wakeService.state.value.status == WakeWordStatus.error) {
           _wakeWordOnlyMode = false;
           _scheduleWakeRecoveryIfNeeded(_wakeService.state.value);
           _syncWakeFallbackMode(_wakeService.state.value);
@@ -6757,12 +7033,13 @@ class _JanarymHomeState extends State<JanarymHome>
     }
 
     final wakeHealthy =
+        !_useSttWakeEngine &&
         _requireWakeWord &&
         _wakeService.state.value.status != WakeWordStatus.error;
 
     try {
-      if (wakeHealthy) {
-        await _wakeService.stop();
+      if (_requireWakeWord) {
+        await _stopPrimaryWake(reason: 'route_confirm');
       }
 
       while (mounted) {
@@ -6830,7 +7107,9 @@ class _JanarymHomeState extends State<JanarymHome>
         await _speak(_voiceL10n.navAnswerYesOrNoOrAddress);
       }
     } finally {
-      if (wakeHealthy) {
+      if (_useSttWakeEngine) {
+        await _syncPrimaryWakeMode();
+      } else if (wakeHealthy) {
         await _wakeService.start();
       } else if (!_requireWakeWord &&
           (_alwaysDialogMode ||
@@ -6852,7 +7131,7 @@ class _JanarymHomeState extends State<JanarymHome>
 
     try {
       _wakeWordOnlyMode = false;
-      await _wakeService.stop();
+      await _stopPrimaryWake(reason: 'follow_up');
       _setCircleState(CircleState.listening);
       appLog('[STT] post-speech listening');
       final text = await _sttService.startCommandListening(
@@ -6918,7 +7197,9 @@ class _JanarymHomeState extends State<JanarymHome>
     await _playEndCue();
     await _vibrateEnd();
     if (_micGranted) {
-      if (_requireWakeWord &&
+      if (_useSttWakeEngine) {
+        await _syncPrimaryWakeMode();
+      } else if (_requireWakeWord &&
           _wakeService.state.value.status != WakeWordStatus.error) {
         await _wakeService.start();
       } else if (_alwaysDialogMode) {
@@ -7309,11 +7590,12 @@ class _JanarymHomeState extends State<JanarymHome>
           label: kk ? 'Антиалаяқ' : 'Антимошеничество',
           icon: Icons.shield_rounded,
         ),
-      _ModeMenuEntry(
-        actionId: 'voice_enrollment',
-        label: kk ? 'Дауыс профилі' : 'Голосовой профиль',
-        icon: Icons.record_voice_over_rounded,
-      ),
+      if (!_useSttWakeEngine)
+        _ModeMenuEntry(
+          actionId: 'voice_enrollment',
+          label: kk ? 'Дауыс профилі' : 'Голосовой профиль',
+          icon: Icons.record_voice_over_rounded,
+        ),
     ];
     return items;
   }
@@ -7738,6 +8020,15 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   Future<void> _openWakeEnrollmentSheet() async {
+    if (_useSttWakeEngine) {
+      await _speak(
+        _voiceText(
+          ru: 'Профиль голоса недоступен в режиме STT wake.',
+          kk: 'STT wake режимінде дауыс профилі қолжетімсіз.',
+        ),
+      );
+      return;
+    }
     if (!_micGranted) {
       await _ensureMicPermission();
       if (!_micGranted || !mounted) return;
@@ -8261,6 +8552,48 @@ class _JanarymHomeState extends State<JanarymHome>
     if (!_wakeDebugOverlayEnabled) {
       return const SizedBox.shrink();
     }
+    if (_useSttWakeEngine) {
+      final legacyFallbackActive =
+          _sttWakeUnavailable && _sttWakeLegacyFallbackEnabled;
+      final text =
+          'WAKE stt_android\n'
+          'LANG $_sttWakeLanguage\n'
+          'ARM ${_sttWakeArmed ? 'on' : 'off'}\n'
+          'LEGACY fb ${legacyFallbackActive ? 'on' : 'off'}\n'
+          'MATCH $_lastSttWakeMatch\n'
+          '${_lastSttWakeReason.isEmpty ? 'idle' : _lastSttWakeReason}';
+      return IgnorePointer(
+        child: Container(
+          width: 150,
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          decoration: BoxDecoration(
+            color: const Color(0xB8162033),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: _sttWakeArmed
+                  ? const Color(0xAA39D98A)
+                  : const Color(0x66FFFFFF),
+            ),
+            boxShadow: const [
+              BoxShadow(
+                color: Color(0x33000000),
+                blurRadius: 18,
+                offset: Offset(0, 10),
+              ),
+            ],
+          ),
+          child: Text(
+            text,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 11,
+              height: 1.28,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      );
+    }
     return ValueListenableBuilder<WakeWordDebugState>(
       valueListenable: _wakeService.debugState,
       builder: (context, debug, _) {
@@ -8268,6 +8601,9 @@ class _JanarymHomeState extends State<JanarymHome>
             ? '--'
             : _wakeService.state.value.keywordLabel;
         final recallLabel = _wakeRecallModeRaw == 'balanced' ? 'bal' : 'max';
+        final stage2Enabled = debug.stage2VerificationEnabled
+            ? 'on'
+            : (_wakeStage2VerificationEnabled ? 'on' : 'off');
         final templateEnabled = debug.templateVerificationEnabled
             ? 'on'
             : (_wakeTemplateVerificationEnabled ? 'on' : 'off');
@@ -8284,6 +8620,7 @@ class _JanarymHomeState extends State<JanarymHome>
         final text =
             'KW $keywordLabel\n'
             'REC $recallLabel\n'
+            'STG $stage2Enabled\n'
             'TMP $templateEnabled\n'
             'SPK $speakerEnabled\n'
             'RMS ${debug.rmsDb?.toStringAsFixed(1) ?? '--'} dB\n'

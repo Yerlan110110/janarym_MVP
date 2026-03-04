@@ -34,6 +34,7 @@ class MainActivity : FlutterActivity() {
 
     val wakeEngine = getWakeEngine()
     val reflexDetector = getReflexDetector()
+    val sttWakeRecognizer = getSttWakeRecognizer()
 
     MethodChannel(
       flutterEngine.dartExecutor.binaryMessenger,
@@ -84,6 +85,54 @@ class MainActivity : FlutterActivity() {
           result.success(true)
         }
         "status" -> result.success(wakeEngine.currentStatus())
+        else -> result.notImplemented()
+      }
+    }
+
+    MethodChannel(
+      flutterEngine.dartExecutor.binaryMessenger,
+      STT_WAKE_CHANNEL,
+    ).setMethodCallHandler { call, result ->
+      when (call.method) {
+        "initialize" -> {
+          try {
+            val arguments = call.arguments as? Map<String, Any?> ?: emptyMap()
+            sttWakeRecognizer.initialize(arguments)
+            result.success(true)
+          } catch (error: Exception) {
+            result.error("stt_wake_init_failed", error.message, null)
+          }
+        }
+        "start" -> {
+          try {
+            sttWakeRecognizer.start()
+            result.success(true)
+          } catch (error: Exception) {
+            result.error("stt_wake_start_failed", error.message, null)
+          }
+        }
+        "stop" -> {
+          try {
+            sttWakeRecognizer.stop()
+            result.success(true)
+          } catch (error: Exception) {
+            result.error("stt_wake_stop_failed", error.message, null)
+          }
+        }
+        "cancel" -> {
+          try {
+            sttWakeRecognizer.cancel()
+            result.success(true)
+          } catch (error: Exception) {
+            result.error("stt_wake_cancel_failed", error.message, null)
+          }
+        }
+        "dispose" -> {
+          sttWakeRecognizer.dispose()
+          result.success(true)
+        }
+        "isAvailable" -> result.success(sttWakeRecognizer.isAvailable())
+        "status" -> result.success(sttWakeRecognizer.status())
         else -> result.notImplemented()
       }
     }
@@ -156,10 +205,30 @@ class MainActivity : FlutterActivity() {
         }
       },
     )
+
+    EventChannel(
+      flutterEngine.dartExecutor.binaryMessenger,
+      STT_WAKE_EVENTS_CHANNEL,
+    ).setStreamHandler(
+      object : EventChannel.StreamHandler {
+        override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+          sttWakeRecognizer.eventListener = object : AndroidSttWakeRecognizer.EventListener {
+            override fun onEvent(event: Map<String, Any?>) {
+              events?.success(event)
+            }
+          }
+        }
+
+        override fun onCancel(arguments: Any?) {
+          sttWakeRecognizer.eventListener = null
+        }
+      },
+    )
   }
 
   override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
     wakeEngine?.setEventListener(null)
+    sttWakeRecognizer?.eventListener = null
     super.cleanUpFlutterEngine(flutterEngine)
   }
 
@@ -168,6 +237,9 @@ class MainActivity : FlutterActivity() {
       wakeEngine?.setEventListener(null)
       wakeEngine?.dispose()
       wakeEngine = null
+      sttWakeRecognizer?.eventListener = null
+      sttWakeRecognizer?.dispose()
+      sttWakeRecognizer = null
       reflexDetector?.dispose()
       reflexDetector = null
       reflexExecutor?.shutdownNow()
@@ -180,8 +252,11 @@ class MainActivity : FlutterActivity() {
     private const val RUNTIME_CHANNEL = "janarym/runtime_service"
     private const val WAKE_CHANNEL = "janarym/wake_word"
     private const val WAKE_EVENTS_CHANNEL = "janarym/wake_word/events"
+    private const val STT_WAKE_CHANNEL = "janarym/stt_wake"
+    private const val STT_WAKE_EVENTS_CHANNEL = "janarym/stt_wake/events"
     private const val REFLEX_CHANNEL = "janarym/reflex_detector"
     @Volatile private var wakeEngine: NativeWakeWordEngine? = null
+    @Volatile private var sttWakeRecognizer: AndroidSttWakeRecognizer? = null
     @Volatile private var reflexDetector: ReflexNativeDetector? = null
     @Volatile private var reflexExecutor: ExecutorService? = null
   }
@@ -192,6 +267,16 @@ class MainActivity : FlutterActivity() {
     return synchronized(MainActivity::class.java) {
       wakeEngine ?: NativeWakeWordEngine(applicationContext).also {
         wakeEngine = it
+      }
+    }
+  }
+
+  private fun getSttWakeRecognizer(): AndroidSttWakeRecognizer {
+    val existing = sttWakeRecognizer
+    if (existing != null) return existing
+    return synchronized(MainActivity::class.java) {
+      sttWakeRecognizer ?: AndroidSttWakeRecognizer(applicationContext).also {
+        sttWakeRecognizer = it
       }
     }
   }
