@@ -692,6 +692,12 @@ class _JanarymHomeState extends State<JanarymHome>
         language: _sttWakeLanguage,
         partialResults: _sttWakePartialResultsEnabled,
       );
+      final available = await _sttWakeService.isAvailable();
+      if (!available) {
+        _sttWakeUnavailable = true;
+        appLog('[STTWake] unavailable reason=not_available');
+        return;
+      }
       if (_sttWakeDebugLogs) {
         appLog(
           '[STTWake] initialize language=$_sttWakeLanguage '
@@ -704,18 +710,21 @@ class _JanarymHomeState extends State<JanarymHome>
     }
   }
 
-  Future<void> _startSttWake({required String reason}) async {
-    if (!_useSttWakeEngine || _sttWakeUnavailable) return;
-    if (_sttWakeArmed) return;
+  Future<bool> _startSttWake({required String reason}) async {
+    if (!_useSttWakeEngine || _sttWakeUnavailable) return false;
+    if (_sttWakeArmed) return true;
     try {
       await _sttWakeService.start();
       _sttWakeArmed = true;
       if (_sttWakeDebugLogs) {
         appLog('[STTWake] start reason=$reason');
       }
+      return true;
     } catch (error) {
       _sttWakeArmed = false;
+      _sttWakeUnavailable = true;
       appLog('[STTWake] start failed reason=$reason error=$error');
+      return false;
     }
   }
 
@@ -729,6 +738,24 @@ class _JanarymHomeState extends State<JanarymHome>
     if (_sttWakeDebugLogs) {
       appLog('[STTWake] stop reason=$reason');
     }
+  }
+
+  Future<bool> _startLegacyNativeWake({required String reason}) async {
+    try {
+      await _wakeService.start();
+      appLog('[Wake] native rollback start reason=$reason');
+      return true;
+    } catch (error) {
+      appLog('[Wake] native rollback failed reason=$reason error=$error');
+      return false;
+    }
+  }
+
+  Future<void> _stopLegacyNativeWake({required String reason}) async {
+    try {
+      await _wakeService.stop();
+      appLog('[Wake] native rollback stop reason=$reason');
+    } catch (_) {}
   }
 
   Future<void> _stopPrimaryWake({required String reason}) async {
@@ -840,16 +867,39 @@ class _JanarymHomeState extends State<JanarymHome>
         !_isSpeaking &&
         !_onboardingDialogInProgress &&
         !_sttService.isListening &&
-        !_manualTextReadInProgress &&
-        !_sttWakeUnavailable;
+        !_manualTextReadInProgress;
     if (shouldRun) {
       await _initializeSttWakeIfNeeded();
-      _stopWakeFallbackLoop();
+      if (!_sttWakeUnavailable) {
+        _stopWakeFallbackLoop();
+        await _stopLegacyNativeWake(reason: 'stt_primary');
+        _setCircleState(CircleState.wake);
+        final started = await _startSttWake(reason: 'sync');
+        if (started) {
+          return;
+        }
+      }
+      await _stopSttWake(reason: 'stt_unavailable');
       _setCircleState(CircleState.wake);
-      await _startSttWake(reason: 'sync');
+      final nativeStarted = await _startLegacyNativeWake(
+        reason: 'stt_unavailable',
+      );
+      if (nativeStarted) {
+        _stopWakeFallbackLoop();
+        return;
+      }
+      if (_sttWakeLegacyFallbackEnabled &&
+          _micGranted &&
+          lifecycle == AppLifecycleState.resumed &&
+          !_onboardingDialogInProgress) {
+        _startWakeFallbackLoop();
+      } else {
+        _stopWakeFallbackLoop();
+      }
       return;
     }
     await _stopSttWake(reason: 'sync_blocked');
+    await _stopLegacyNativeWake(reason: 'sync_blocked');
     if (_sttWakeUnavailable &&
         _sttWakeLegacyFallbackEnabled &&
         _micGranted &&
@@ -2169,7 +2219,7 @@ class _JanarymHomeState extends State<JanarymHome>
     if (_useSttWakeEngine && !_sttWakeUnavailable) {
       return;
     }
-    if (_wakeFallbackActive || !_micGranted || _wakeWordOnlyMode) {
+    if (_wakeFallbackActive || !_micGranted) {
       return;
     }
     _wakeFallbackActive = true;
@@ -2672,6 +2722,10 @@ class _JanarymHomeState extends State<JanarymHome>
       return;
     }
 
+    if (await _maybeHandleExitCurrentModeCommand(userText)) {
+      return;
+    }
+
     final autoTriggeredMode = _detectContextTriggeredMode(userText);
     if (autoTriggeredMode != null && autoTriggeredMode != _assistantMode) {
       await _switchAssistantMode(
@@ -2846,6 +2900,54 @@ class _JanarymHomeState extends State<JanarymHome>
       'үйге апаршы',
     ];
     return containsMatches.any(normalized.contains);
+  }
+
+  bool _isExitCurrentModeCommand(String text) {
+    final normalized = _router.normalize(text);
+    if (normalized.isEmpty) return false;
+    const exactMatches = <String>{
+      'выключи режим',
+      'выйди из режима',
+      'выход из режима',
+      'выйти из режима',
+      'режимді өшір',
+      'режимнен шық',
+      'режимнен шығу',
+    };
+    if (exactMatches.contains(normalized)) return true;
+    const containsMatches = <String>[
+      'выключи этот режим',
+      'выключи текущий режим',
+      'выйди из этого режима',
+      'выйди из текущего режима',
+      'отключи режим',
+      'закрой режим',
+      'осы режимнен шық',
+      'осы режимді өшір',
+      'ағымдағы режимнен шық',
+    ];
+    return containsMatches.any(normalized.contains);
+  }
+
+  Future<bool> _maybeHandleExitCurrentModeCommand(String text) async {
+    if (!_isExitCurrentModeCommand(text)) return false;
+    if (_assistantMode == AssistantMode.general) {
+      await _speak(
+        _voiceText(
+          ru: 'Сейчас уже обычный режим.',
+          kk: 'Қазір қалыпты режим қосулы.',
+        ),
+      );
+      return true;
+    }
+    final changed = await _switchAssistantMode(
+      AssistantMode.general,
+      reason: 'voice_exit_mode',
+    );
+    if (changed) {
+      _triggerFastModeFeedback();
+    }
+    return true;
   }
 
   Future<void> _handleGoHomeShortcut(String rawText) async {
@@ -3855,6 +3957,18 @@ class _JanarymHomeState extends State<JanarymHome>
     );
   }
 
+  Future<void> _kickTextReaderAutoReadAfterModeSwitch() async {
+    await Future<void>.delayed(const Duration(milliseconds: 420));
+    if (!mounted || _assistantMode != AssistantMode.textReader) return;
+    if (_manualTextReadInProgress || _textReaderLoopBusy) return;
+    if (!_cameraGranted || !_cameraStreaming) {
+      await _initCameraLive();
+      if (!mounted || _assistantMode != AssistantMode.textReader) return;
+      if (!_cameraGranted || !_cameraStreaming) return;
+    }
+    await _runAutoTextReaderTick();
+  }
+
   Future<void> _runManualTextReadSession(
     String rawText, {
     required _TextReaderReadSource source,
@@ -3919,6 +4033,25 @@ class _JanarymHomeState extends State<JanarymHome>
         return;
       }
       if (candidates.isEmpty) {
+        if (source != _TextReaderReadSource.auto) {
+          final fallbackText = await _tryTextReaderVisionFallback();
+          if (fallbackText != null) {
+            appLog(
+              '[TextReader][manual_session] selected vision_fallback '
+              'reason=no_candidates',
+            );
+            _textReaderSessionState = _TextReaderSessionState.speaking;
+            if (mounted) {
+              setState(() {});
+            }
+            final answer = _buildDirectTextReadAnswer(fallbackText);
+            _lastAnswer = answer;
+            _rememberDialogTurn(rawText, answer);
+            await _ensureTtsLocaleForSpokenText(fallbackText, autoRead: false);
+            await _speak(answer, ensureLocale: false);
+            return;
+          }
+        }
         _textReaderSessionState = _TextReaderSessionState.failed;
         _lastTextReaderFailureReason = 'no_candidates';
         appLog('[TextReader][manual_session] fail reason=no_candidates');
@@ -4492,7 +4625,10 @@ class _JanarymHomeState extends State<JanarymHome>
     return true;
   }
 
-  bool _markAutoTextReaderCandidateSeen(String signature) {
+  bool _markAutoTextReaderCandidateSeen(
+    String signature, {
+    int? requiredSeenCount,
+  }) {
     final value = signature.trim();
     if (value.isEmpty) {
       _resetTextReaderAutoState();
@@ -4504,7 +4640,8 @@ class _JanarymHomeState extends State<JanarymHome>
       _pendingAutoTextReaderSignature = value;
       _pendingAutoTextReaderSeenCount = 1;
     }
-    return _pendingAutoTextReaderSeenCount >= _textReaderStableFramesRequired;
+    return _pendingAutoTextReaderSeenCount >=
+        (requiredSeenCount ?? _textReaderStableFramesRequired);
   }
 
   bool _shouldTriggerAutoExactTextRead(OnDeviceTextReadResult result) {
@@ -4513,6 +4650,8 @@ class _JanarymHomeState extends State<JanarymHome>
     final rawText = result.rawText.trim();
     final candidateText = resolvedText.isNotEmpty ? resolvedText : rawText;
     final candidateSignature = buildManualCandidateSignature(candidateText);
+    final inTextReaderMode = _assistantMode == AssistantMode.textReader;
+    final requiredSeenCount = inTextReaderMode ? 1 : null;
     if (candidateSignature.isEmpty) {
       _resetTextReaderAutoState();
       return false;
@@ -4522,11 +4661,15 @@ class _JanarymHomeState extends State<JanarymHome>
         rawText.length >= 48 ||
         resolvedText.length >= 24 ||
         result.lines.length >= 2 ||
-        result.manualSpeechLines.isNotEmpty;
+        result.manualSpeechLines.isNotEmpty ||
+        (inTextReaderMode && (rawText.length >= 24 || result.lines.isNotEmpty));
     if (!hasEnoughSignal) {
       return false;
     }
-    if (!_markAutoTextReaderCandidateSeen('exact:$candidateSignature')) {
+    if (!_markAutoTextReaderCandidateSeen(
+      'exact:$candidateSignature',
+      requiredSeenCount: requiredSeenCount,
+    )) {
       return false;
     }
 
@@ -4568,6 +4711,7 @@ class _JanarymHomeState extends State<JanarymHome>
 
   Future<void> _pauseWakeFallbackForAutoTextRead() async {
     var stoppedWakeFallback = false;
+    await _stopPrimaryWake(reason: 'auto_text_read');
     if (_wakeFallbackActive || _wakeFallbackLoopRunning) {
       _stopWakeFallbackLoop();
       stoppedWakeFallback = true;
@@ -4597,7 +4741,12 @@ class _JanarymHomeState extends State<JanarymHome>
     }
     final candidateSignature = buildManualCandidateSignature(rawText);
     if (candidateSignature.isEmpty ||
-        !_markAutoTextReaderCandidateSeen('vision:$candidateSignature')) {
+        !_markAutoTextReaderCandidateSeen(
+          'vision:$candidateSignature',
+          requiredSeenCount: _assistantMode == AssistantMode.textReader
+              ? 1
+              : null,
+        )) {
       return false;
     }
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -5039,6 +5188,9 @@ class _JanarymHomeState extends State<JanarymHome>
       autoTriggeredBy: reason,
     );
     unawaited(_syncHeavyServices());
+    if (target == AssistantMode.textReader) {
+      unawaited(_kickTextReaderAutoReadAfterModeSwitch());
+    }
 
     if (mounted) {
       setState(() {});
