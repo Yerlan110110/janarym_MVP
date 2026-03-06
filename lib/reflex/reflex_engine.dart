@@ -232,11 +232,13 @@ class ReflexEngine {
       final hazardLabel = _normalizeHazardLabel(sourceLabel) ?? sourceLabel;
       final score = _readDouble(item['score']);
       if (!_passesClassThreshold(hazardLabel, score)) continue;
-      final bbox = BoundingBox(
-        left: _readDouble(item['left']).clamp(0, 1),
-        top: _readDouble(item['top']).clamp(0, 1),
-        width: _readDouble(item['width']).clamp(0, 1),
-        height: _readDouble(item['height']).clamp(0, 1),
+      final bbox = _clampBoundingBox(
+        BoundingBox(
+          left: _readDouble(item['left']).clamp(0, 1),
+          top: _readDouble(item['top']).clamp(0, 1),
+          width: _readDouble(item['width']).clamp(0, 1),
+          height: _readDouble(item['height']).clamp(0, 1),
+        ),
       );
       if (bbox.width <= 0.02 || bbox.height <= 0.02) continue;
       result.add(
@@ -249,6 +251,19 @@ class ReflexEngine {
       );
     }
     return result;
+  }
+
+  BoundingBox _clampBoundingBox(BoundingBox bbox) {
+    final left = bbox.left.clamp(0.0, 1.0);
+    final top = bbox.top.clamp(0.0, 1.0);
+    final right = (bbox.left + bbox.width).clamp(0.0, 1.0);
+    final bottom = (bbox.top + bbox.height).clamp(0.0, 1.0);
+    return BoundingBox(
+      left: left,
+      top: top,
+      width: math.max(0.0, right - left),
+      height: math.max(0.0, bottom - top),
+    );
   }
 
   List<ReflexDetection> _trackAndScore(

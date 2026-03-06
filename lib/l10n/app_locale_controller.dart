@@ -20,11 +20,11 @@ extension AppLanguageX on AppLanguage {
 
   static AppLanguage fromStored(String? value) {
     switch ((value ?? '').toLowerCase()) {
-      case 'kk':
-        return AppLanguage.kk;
       case 'ru':
-      default:
         return AppLanguage.ru;
+      case 'kk':
+      default:
+        return AppLanguage.kk;
     }
   }
 
@@ -36,7 +36,7 @@ extension AppLanguageX on AppLanguage {
 class AppLocaleController extends ChangeNotifier {
   AppLocaleController();
 
-  AppLanguage _language = AppLanguage.ru;
+  AppLanguage _language = AppLanguage.kk;
   bool _initialized = false;
 
   AppLanguage get language => _language;
