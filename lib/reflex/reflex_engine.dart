@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../runtime/app_log.dart';
@@ -115,6 +116,12 @@ class ReflexEngine {
 
   Future<void> initialize() async {
     if (_initialized || !_enabled) return;
+    // ReflexEngine (YOLO) тек Android-та қолжетімді
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      appLog('[Reflex] skipped on non-Android platform');
+      _initialized = true;
+      return;
+    }
     await _channel.invokeMethod<bool>('initialize', <String, Object?>{
       'scoreThreshold': 0.22,
       'maxResults': 8,
@@ -124,6 +131,11 @@ class ReflexEngine {
 
   Future<void> start() async {
     if (!_enabled || _running) return;
+    // ReflexEngine тек Android-та жұмыс жасайды
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      appLog('[Reflex] start skipped on non-Android platform');
+      return;
+    }
     await initialize();
     _running = true;
     _restartTimer();

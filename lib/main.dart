@@ -1408,33 +1408,66 @@ class _JanarymHomeState extends State<JanarymHome>
     if (_cameraInitInProgress) return;
     _cameraInitInProgress = true;
     try {
-      var status = await Permission.camera.status;
-      if (!status.isGranted) {
-        status = await Permission.camera.request();
-      }
-      if (!mounted) return;
-      if (status.isGranted) {
-        setState(() {
-          _cameraGranted = true;
-          _cameraMessage = _l10n.cameraAvailable;
-          _cameraError = '';
-        });
-        await _startCameraStream(reason: 'init_camera_live');
-      } else if (status.isPermanentlyDenied) {
-        setState(() {
-          _cameraGranted = false;
-          _cameraMessage = _l10n.cameraAccessDenied;
-        });
+      if (defaultTargetPlatform == TargetPlatform.iOS) {
+        await _startCameraStreamForIos();
       } else {
-        setState(() {
-          _cameraGranted = false;
-          _cameraMessage = _l10n.cameraAccessRequired;
-        });
+        var status = await Permission.camera.status;
+        if (!status.isGranted) {
+          status = await Permission.camera.request();
+        }
+        if (!mounted) return;
+        if (status.isGranted) {
+          setState(() {
+            _cameraGranted = true;
+            _cameraMessage = _l10n.cameraAvailable;
+            _cameraError = '';
+          });
+          await _startCameraStream(reason: 'init_camera_live');
+        } else if (status.isPermanentlyDenied) {
+          setState(() {
+            _cameraGranted = false;
+            _cameraMessage = _l10n.cameraAccessDenied;
+          });
+        } else {
+          setState(() {
+            _cameraGranted = false;
+            _cameraMessage = _l10n.cameraAccessRequired;
+          });
+        }
       }
     } finally {
       _cameraInitInProgress = false;
     }
   }
+
+  Future<void> _startCameraStreamForIos() async {
+    try {
+      final cameras = await availableCameras();
+      if (!mounted) return;
+      if (cameras.isEmpty) {
+        setState(() {
+          _cameraGranted = false;
+          _cameraMessage = _l10n.cameraNotFound;
+        });
+        return;
+      }
+      setState(() {
+        _cameraGranted = true;
+        _cameraMessage = _l10n.cameraAvailable;
+        _cameraError = '';
+      });
+      await _startCameraStream(reason: 'init_camera_live_ios');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _cameraGranted = false;
+        _cameraMessage = _l10n.cameraAccessDenied;
+        _cameraError = e.toString();
+      });
+      appLog('[Camera][iOS] error: $e');
+    }
+  }
+
 
   Future<List<CameraDescription>> _getAvailableCameras() async {
     final cached = _cachedCameras;
