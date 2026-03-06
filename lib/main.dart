@@ -1358,6 +1358,23 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   Future<void> _initMicAndWake() async {
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      // iOS-та permission_handler iOS 26-да диалог шықпайды.
+      // record package өзі нативті mic диалог шығарады жазу кезінде.
+      if (!mounted) return;
+      setState(() {
+        _micGranted = true;
+        _micMessage = _l10n.micAvailable;
+      });
+      // iOS-та always-dialog режімі: пайдаланушы кез келген уақытта сөйлей алады
+      await _stopPrimaryWake(reason: 'ios_always_dialog_init');
+      _startWakeFallbackLoop();
+      _maybeStartOnboardingDialog();
+      unawaited(_announceModesOnStartup());
+      return;
+    }
+
+    // Android және басқа платформалар үшін бұрынғы логика
     final status = await Permission.microphone.request();
     if (!mounted) return;
 
