@@ -398,10 +398,11 @@ class _JanarymHomeState extends State<JanarymHome>
     'STT_WAKE_DEBUG_LOGS',
     fallback: true,
   );
-  final bool _requireWakeWord = _readEnvBool(
-    'ASSISTANT_REQUIRE_WAKE_WORD',
-    fallback: true,
-  );
+  // iOS-та AndroidSttWakeService жұмыс жасамайды,
+  // сондықтан iOS-та wake word талабын өшіреміз
+  final bool _requireWakeWord = defaultTargetPlatform == TargetPlatform.iOS
+      ? false
+      : _readEnvBool('ASSISTANT_REQUIRE_WAKE_WORD', fallback: true);
   final bool _wakeReplyEnabled = _readEnvBool(
     'ASSISTANT_WAKE_REPLY_ENABLED',
     fallback: false,
@@ -589,9 +590,12 @@ class _JanarymHomeState extends State<JanarymHome>
     _navigationController.state.addListener(_handleNavigationStateChange);
     _sttService.state.addListener(_handleSttStateChange);
     _wakeService.state.addListener(_handleWakeStateChange);
-    _sttWakeSubscription = _sttWakeService.events.listen(
-      (event) => unawaited(_handleSttWakeEvent(event)),
-    );
+    // Android-та ғана listen — iOS-та channel жоқ
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      _sttWakeSubscription = _sttWakeService.events.listen(
+        (event) => unawaited(_handleSttWakeEvent(event)),
+      );
+    }
     _modeOrchestrator.addListener(_handleModeOrchestratorChange);
     _personalizationController.addListener(_handlePersonalizationChange);
     WidgetsBinding.instance.addPostFrameCallback((_) {
