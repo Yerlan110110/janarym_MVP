@@ -1064,6 +1064,15 @@ class _JanarymHomeState extends State<JanarymHome>
     if (_voiceLanguage == AppLanguage.kk &&
         !_ttsConfiguredLocaleCode.toLowerCase().startsWith('kk')) {
       appLog('[TTS] kk fallback -> ru');
+      // Қазақша TTS жоқ → орысша дауыспен орысша мәтін оқу
+      // Interaction language орысшаға ауысады (AI орысша жауап береді)
+      if (mounted && _interactionLanguage != AppLanguage.ru) {
+        setState(() {
+          _interactionLanguage = AppLanguage.ru;
+        });
+        _sttService.setLanguage(AppLanguage.ru);
+        appLog('[TTS] interaction language switched to ru (no kk voice)');
+      }
     }
     appLog('[TTS] locale ensured: ${desiredLocaleCode.split('-').first}');
   }
