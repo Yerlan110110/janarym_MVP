@@ -662,18 +662,46 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   Future<void> _bootstrapRuntime() async {
-    await _initTts();
-    await _initVibration();
-    await _initMicAndWake();
+    try {
+      await _initTts();
+    } catch (e) {
+      appLog('[Bootstrap] _initTts error: $e');
+    }
+    try {
+      await _initVibration();
+    } catch (e) {
+      appLog('[Bootstrap] _initVibration error: $e');
+    }
+    try {
+      await _initMicAndWake();
+    } catch (e) {
+      appLog('[Bootstrap] _initMicAndWake error: $e');
+    }
     if (!mounted) return;
     _startCameraKeepAlive();
     if (_modeNeedsLiveCamera(_assistantMode)) {
-      await _initCameraLive();
+      try {
+        await _initCameraLive();
+      } catch (e) {
+        appLog('[Bootstrap] _initCameraLive error: $e');
+      }
     }
-    await _syncHeavyServices();
-    await _initPersonalization();
+    try {
+      await _syncHeavyServices();
+    } catch (e) {
+      appLog('[Bootstrap] _syncHeavyServices error: $e');
+    }
+    try {
+      await _initPersonalization();
+    } catch (e) {
+      appLog('[Bootstrap] _initPersonalization error: $e');
+    }
     if (!mounted) return;
-    await _announceModesOnStartup();
+    try {
+      await _announceModesOnStartup();
+    } catch (e) {
+      appLog('[Bootstrap] _announceModesOnStartup error: $e');
+    }
   }
 
   AppLocalizations get _voiceL10n =>

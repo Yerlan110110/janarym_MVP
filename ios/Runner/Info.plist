@@ -2,10 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Janarym App2</string>
+	<string>Жанарым</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -24,6 +26,16 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Айналаны сипаттау үшін камераға рұқсат қажет.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Маршрут құру және навигация үшін геолокацияға рұқсат қажет.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Дауыстық командалар үшін микрофонға рұқсат қажет.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Дауысыңызды тану үшін сөйлеу тануға рұқсат қажет.</string>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIMainStoryboardFile</key>
@@ -41,15 +53,5 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
-	<key>CADisableMinimumFrameDurationOnPhone</key>
-	<true/>
-	<key>UIApplicationSupportsIndirectInputEvents</key>
-	<true/>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>Нужен доступ к микрофону для голосовых команд.</string>
-	<key>NSCameraUsageDescription</key>
-	<string>Нужен доступ к камере для описания окружения.</string>
-	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>Нужен доступ к геопозиции для построения и ведения маршрута.</string>
 </dict>
 </plist>
