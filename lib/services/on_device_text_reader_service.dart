@@ -9,11 +9,7 @@ import 'text_reading_normalizer.dart';
 class OnDeviceTextReadResult {
   const OnDeviceTextReadResult({
     required this.rawText,
-    required this.lines,
-    required this.manualSpeechText,
-    required this.manualSpeechLines,
-    required this.autoSpeechText,
-    required this.autoSpeechLines,
+    required this.blocks,
     required this.manualFallbackText,
     required this.dominantScript,
     required this.isAutoSpeakSafe,
@@ -22,11 +18,7 @@ class OnDeviceTextReadResult {
   });
 
   final String rawText;
-  final List<String> lines;
-  final String manualSpeechText;
-  final List<String> manualSpeechLines;
-  final String autoSpeechText;
-  final List<String> autoSpeechLines;
+  final List<String> blocks;
   final String manualFallbackText;
   final DetectedTextScript dominantScript;
   final bool isAutoSpeakSafe;
@@ -34,17 +26,9 @@ class OnDeviceTextReadResult {
   final int? calories;
 
   bool get hasRawText => rawText.trim().isNotEmpty;
-
   bool get hasStructuredData => price != null || calories != null;
 
-  bool get hasManualText =>
-      manualSpeechText.trim().isNotEmpty ||
-      manualFallbackText.trim().isNotEmpty ||
-      hasStructuredData;
-
-  bool get hasAutoText => autoSpeechText.trim().isNotEmpty || hasStructuredData;
-
-  bool get hasText => hasManualText;
+  bool get hasText => blocks.isNotEmpty || manualFallbackText.trim().isNotEmpty || hasStructuredData;
 
   String get kind {
     if (price != null) return 'price';
@@ -136,39 +120,28 @@ class OnDeviceTextReaderService {
     );
     final recognized = await _textRecognizer.processImage(inputImage);
     final rawText = recognized.text.trim();
-    if (rawText.isEmpty) return null;
+    if (rawText.isEmpty) {
+      return null;
+    }
 
-    final lines = recognized.blocks
-        .expand((block) => block.lines)
-        .map((line) => _cleanWhitespace(line.text))
-        .where((line) => line.isNotEmpty)
-        .toList(growable: false);
-    if (lines.isEmpty) return null;
-
-    final normalizedText = TextReadingNormalizer.normalizeForAutoSpeech(
-      rawText,
-    );
+    final spatialBlocks = _buildSpatialTextBlocks(recognized.blocks);
+    final normalizedText = TextReadingNormalizer.normalizeForAutoSpeech(rawText);
     final dominantScript = TextReadingNormalizer.detectScript(normalizedText);
-    final manualSpeechLines = _buildManualSpeechLines(lines);
-    final manualSpeechText = manualSpeechLines.join('. ');
-    final autoSpeechLines = _buildAutoSpeechLines(lines);
-    final autoSpeechText = autoSpeechLines.join('. ');
+    
     final price = _extractPrice(normalizedText);
     final calories = _extractCalories(normalizedText);
     final manualFallbackText = buildManualFallbackText(rawText);
 
+    final autoSpeechText = spatialBlocks.join(' ');
+
     return OnDeviceTextReadResult(
       rawText: rawText,
-      lines: lines,
-      manualSpeechText: manualSpeechText,
-      manualSpeechLines: manualSpeechLines,
-      autoSpeechText: autoSpeechText,
-      autoSpeechLines: autoSpeechLines,
+      blocks: spatialBlocks,
       manualFallbackText: manualFallbackText,
       dominantScript: dominantScript,
       isAutoSpeakSafe: _isAutoSpeakSafe(
         dominantScript: dominantScript,
-        autoSpeechText: autoSpeechText,
+        autoSpeechText: autoAnswerText(spatialBlocks),
         price: price,
         calories: calories,
       ),
@@ -177,135 +150,62 @@ class OnDeviceTextReaderService {
     );
   }
 
-  List<String> _buildManualSpeechLines(List<String> rawLines) {
-    final filtered = <String>[];
-    final seen = <String>{};
-    for (final rawLine in rawLines) {
-      final compactRaw = _cleanWhitespace(rawLine);
-      if (compactRaw.isEmpty) continue;
-      final rawScript = TextReadingNormalizer.detectScript(compactRaw);
-      final normalizedLine = TextReadingNormalizer.normalizeForManualSpeech(
-        compactRaw,
-        script: rawScript,
-      );
-      final compactNormalized = _cleanWhitespace(normalizedLine);
-      final normalizedScript = TextReadingNormalizer.detectScript(
-        compactNormalized,
-      );
-      final effectiveScript = normalizedScript != DetectedTextScript.unknown
-          ? normalizedScript
-          : rawScript;
-      if (!_isUsableManualLine(
-        compactRaw,
-        compactNormalized,
-        effectiveScript,
-      )) {
-        continue;
-      }
-      final key = compactNormalized.toLowerCase();
-      if (seen.add(key)) {
-        filtered.add(compactNormalized);
-      }
-    }
-    return filtered;
+  String autoAnswerText(List<String> blocks) {
+    if (blocks.isEmpty) return '';
+    return blocks.first;
   }
 
-  List<String> _buildAutoSpeechLines(List<String> rawLines) {
-    final filtered = <String>[];
-    final seen = <String>{};
-    for (final rawLine in rawLines) {
-      final compactRaw = _cleanWhitespace(rawLine);
-      if (compactRaw.isEmpty) continue;
-      final normalizedLine = TextReadingNormalizer.normalizeForAutoSpeech(
-        compactRaw,
-      );
-      final compactNormalized = _cleanWhitespace(normalizedLine);
-      final normalizedScript = TextReadingNormalizer.detectScript(
-        compactNormalized,
-      );
-      if (!_isUsableAutoLine(compactNormalized, normalizedScript)) {
-        continue;
+  List<String> _buildSpatialTextBlocks(List<TextBlock> rawBlocks) {
+    if (rawBlocks.isEmpty) return const [];
+
+    // 1. Extract all lines with their bounding boxes
+    final allLines = rawBlocks.expand((b) => b.lines).toList();
+    if (allLines.isEmpty) return const [];
+
+    // 2. Sort primarily by Y, then by X
+    allLines.sort((a, b) {
+      final topDiff = a.boundingBox.top - b.boundingBox.top;
+      if (topDiff.abs() > 15) return topDiff.toInt();
+      return (a.boundingBox.left - b.boundingBox.left).toInt();
+    });
+
+    final groups = <List<TextLine>>[];
+    for (final line in allLines) {
+      // Filering out single/double char snippets early (often noise)
+      if (line.text.trim().length < 3) continue;
+
+      bool foundGroup = false;
+      for (final group in groups) {
+        final lastInGroup = group.last;
+        final verticalDist = (line.boundingBox.top - lastInGroup.boundingBox.bottom).abs();
+        final horizontalOverlap = _horizontalOverlap(line.boundingBox, lastInGroup.boundingBox);
+        final height = lastInGroup.boundingBox.height;
+        
+        // Stricter grouping: lines must be very close vertically and overlapping horizontally.
+        if (verticalDist < height * 0.7 && horizontalOverlap > 0) {
+          group.add(line);
+          foundGroup = true;
+          break;
+        }
       }
-      final key = compactNormalized.toLowerCase();
-      if (seen.add(key)) {
-        filtered.add(compactNormalized);
+      if (!foundGroup) {
+        groups.add([line]);
       }
     }
-    return filtered;
+
+    // 3. Convert groups to normalized text blocks
+    return groups.map((group) {
+      final text = group.map((l) => l.text).join(' ');
+      return TextReadingNormalizer.normalizeForAutoSpeech(text);
+    }).where((t) {
+      // Must be long enough to be meaningful and pass phonetic filter
+      return t.length >= 8 && TextReadingNormalizer.isSpeechSafe(t);
+    }).toList();
   }
 
-  bool _isUsableManualLine(
-    String rawLine,
-    String normalizedLine,
-    DetectedTextScript script,
-  ) {
-    if (normalizedLine.isEmpty) return false;
-    if (_structuredReadingPattern.hasMatch(normalizedLine)) return true;
-    if (!_containsLetterOrDigit(normalizedLine)) return false;
-
-    final alnumCount = _countMatches(normalizedLine, _alnumPattern);
-    if (alnumCount < 4) return false;
-    if (_noiseRatio(rawLine) > 0.45) return false;
-
-    final meaningfulTokens = _extractMeaningfulTokens(normalizedLine);
-    if (meaningfulTokens.isEmpty) return false;
-
-    switch (script) {
-      case DetectedTextScript.latin:
-        final latinTokens = _extractLatinTokens(normalizedLine);
-        if (latinTokens.isEmpty) return false;
-        final suspiciousCount = latinTokens
-            .where(TextReadingNormalizer.looksLikeRussianishLatin)
-            .length;
-        if (suspiciousCount == latinTokens.length) {
-          return false;
-        }
-        if (latinTokens.length >= 2) return true;
-        return latinTokens.first.length >= 5 && alnumCount >= 6;
-      case DetectedTextScript.cyrillic:
-        final cyrillicWords = _extractCyrillicWords(normalizedLine);
-        if (cyrillicWords.length >= 2) return true;
-        if (cyrillicWords.length == 1 &&
-            cyrillicWords.first.length >= 3 &&
-            alnumCount >= 6) {
-          return true;
-        }
-        if (normalizedLine.length >= 12 && cyrillicWords.isNotEmpty) {
-          return true;
-        }
-        return cyrillicWords.isNotEmpty &&
-            _digitPattern.hasMatch(normalizedLine);
-      case DetectedTextScript.mixed:
-        if (meaningfulTokens.length < 2) return false;
-        if (alnumCount < 8) return false;
-        if (_noiseRatio(rawLine) > 0.25) return false;
-        final hasUsefulCyrillic = _extractCyrillicWords(
-          normalizedLine,
-        ).any((word) => word.length >= 3);
-        final hasUsefulLatin = _extractLatinTokens(
-          normalizedLine,
-        ).any((word) => word.length >= 5);
-        return hasUsefulCyrillic || hasUsefulLatin;
-      case DetectedTextScript.unknown:
-        return false;
-    }
-  }
-
-  bool _isUsableAutoLine(String normalizedLine, DetectedTextScript script) {
-    if (normalizedLine.isEmpty) return false;
-    if (_structuredReadingPattern.hasMatch(normalizedLine)) return true;
-    if (script == DetectedTextScript.latin ||
-        script == DetectedTextScript.unknown) {
-      return false;
-    }
-    if (!TextReadingNormalizer.looksMostlyCyrillic(normalizedLine)) {
-      return false;
-    }
-    if (!_autoSafeSpeechPattern.hasMatch(normalizedLine)) {
-      return false;
-    }
-    final cyrillicWords = _extractCyrillicWords(normalizedLine);
-    return cyrillicWords.length >= 2;
+  double _horizontalOverlap(Rect a, Rect b) {
+    final overlap = (a.right < b.right ? a.right : b.right) - (a.left > b.left ? a.left : b.left);
+    return overlap;
   }
 
   bool _isAutoSpeakSafe({
@@ -315,8 +215,14 @@ class OnDeviceTextReaderService {
     required int? calories,
   }) {
     if (price != null || calories != null) return true;
-    if (autoSpeechText.trim().isEmpty) return false;
-    return dominantScript != DetectedTextScript.latin;
+    final text = autoSpeechText.trim();
+    if (text.length < 12) return false;
+    
+    // Safety: never auto-read pure Latin unless it's structured data (handled above)
+    // because most Latin on boxes in RU regions is technical gibberish.
+    if (dominantScript == DetectedTextScript.latin) return false;
+    
+    return TextReadingNormalizer.isSpeechSafe(text);
   }
 
   Future<void> dispose() async {

@@ -53,6 +53,7 @@ class CommandSttService {
   Timer? _timeoutTimer;
   Timer? _silenceTimer;
   Completer<String?>? _completer;
+  VoidCallback? _onRecordingFinishedCallback;
   bool _finishing = false;
   String? _currentPath;
   DateTime? _recordingStartedAt;
@@ -82,9 +83,11 @@ class CommandSttService {
     int? ampPollMs,
     int? restartCooldownMs,
     int? maxNoSpeechMs,
+    VoidCallback? onRecordingFinished,
   }) async {
     if (_completer != null) return _completer!.future;
     _completer = Completer<String?>();
+    _onRecordingFinishedCallback = onRecordingFinished;
     final completer = _completer!;
     _currentLanguageHint = languageHint;
     _currentAllowAutoLanguage = allowAutoLanguage;
@@ -206,6 +209,10 @@ class CommandSttService {
         await _recorder.stop();
       }
     } catch (_) {}
+    
+    // Notify the caller that they can play the "end" sound
+    _onRecordingFinishedCallback?.call();
+    _onRecordingFinishedCallback = null;
 
     final path = _currentPath;
     _currentPath = null;

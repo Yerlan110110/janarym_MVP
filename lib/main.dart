@@ -343,13 +343,20 @@ class _JanarymHomeState extends State<JanarymHome>
   int _wakeRecoveryAttempts = 0;
   bool _sttWakeArmed = false;
   bool _sttWakeUnavailable = false;
+  bool _sttWakeInitialized = false;
+  bool _sttWakeAcceptInFlight = false;
   DateTime? _sttWakeFatalErrorWindowStartedAt;
+  DateTime? _sttWakeUnavailableSince;
+  DateTime? _sttWakeLastEventAt;
   int _sttWakeFatalErrors = 0;
   String _lastSttWakeMatch = 'none';
   String _lastSttWakeReason = 'idle';
   StreamSubscription<SttWakeEvent>? _sttWakeSubscription;
+  Timer? _sttWakeWatchdogTimer;
   bool _textReaderLoopBusy = false;
   bool _manualTextReadInProgress = false;
+  final Set<String> _recentReadSegments = <String>{};
+  DateTime _lastReadClearTime = DateTime.now();
   bool _textReaderAutoPaused = false;
   bool _textReaderSessionCancelRequested = false;
   AssistantMode _assistantMode = AssistantMode.general;
@@ -397,6 +404,22 @@ class _JanarymHomeState extends State<JanarymHome>
   final bool _sttWakeDebugLogs = _readEnvBool(
     'STT_WAKE_DEBUG_LOGS',
     fallback: true,
+  );
+  final bool _sttWakePreferOffline = _readEnvBool(
+    'STT_WAKE_PREFER_OFFLINE',
+    fallback: true,
+  );
+  final int _sttWakeWatchdogMaxSilenceMs = _readEnvInt(
+    'STT_WAKE_WATCHDOG_MAX_SILENCE_MS',
+    fallback: 12000,
+    min: 3000,
+    max: 60000,
+  );
+  final int _sttWakeUnavailableRetryMs = _readEnvInt(
+    'STT_WAKE_UNAVAILABLE_RETRY_MS',
+    fallback: 20000,
+    min: 2000,
+    max: 180000,
   );
   final bool _requireWakeWord = _readEnvBool(
     'ASSISTANT_REQUIRE_WAKE_WORD',
@@ -484,15 +507,15 @@ class _JanarymHomeState extends State<JanarymHome>
   );
   final int _textReaderSpeechCooldownMs = _readEnvInt(
     'TEXT_READER_SPEECH_COOLDOWN_MS',
-    fallback: 900,
+    fallback: 1500,
     min: 700,
     max: 5000,
   );
   final int _textReaderStableFramesRequired = _readEnvInt(
     'TEXT_READER_STABLE_FRAMES',
-    fallback: 2,
+    fallback: 3,
     min: 2,
-    max: 3,
+    max: 5,
   );
   String _lastAutoTextReaderSignature = '';
   int _lastAutoTextReaderSpeakMs = 0;
@@ -653,6 +676,8 @@ class _JanarymHomeState extends State<JanarymHome>
     _wakeFallbackEscalationTimer = null;
     _wakeRecoveryTimer?.cancel();
     _wakeRecoveryTimer = null;
+    _sttWakeWatchdogTimer?.cancel();
+    _sttWakeWatchdogTimer = null;
     _disposeCamera();
     _sfxPlayer.dispose();
     _tts.stop();
@@ -667,7 +692,7 @@ class _JanarymHomeState extends State<JanarymHome>
     await _initMicAndWake();
     if (!mounted) return;
     _startCameraKeepAlive();
-    if (_modeNeedsLiveCamera(_assistantMode)) {
+    if (_featureFlags.aggressiveBackgroundCamera || _modeNeedsLiveCamera(_assistantMode)) {
       await _initCameraLive();
     }
     await _syncHeavyServices();
@@ -685,27 +710,99 @@ class _JanarymHomeState extends State<JanarymHome>
     return _voiceIsKazakh ? kk : ru;
   }
 
-  Future<void> _initializeSttWakeIfNeeded() async {
+  void _markSttWakeUnavailable(String reason) {
+    _sttWakeUnavailable = true;
+    _sttWakeUnavailableSince ??= DateTime.now();
+    _sttWakeInitialized = false;
+    _sttWakeArmed = false;
+    _stopSttWakeWatchdog();
+    appLog('[STTWake] unavailable reason=$reason');
+  }
+
+  void _markSttWakeRecovered(String reason) {
+    if (!_sttWakeUnavailable &&
+        _sttWakeUnavailableSince == null &&
+        _sttWakeInitialized) {
+      return;
+    }
+    _sttWakeUnavailable = false;
+    _sttWakeUnavailableSince = null;
+    _sttWakeFatalErrorWindowStartedAt = null;
+    _sttWakeFatalErrors = 0;
+    _sttWakeInitialized = true;
+    if (_sttWakeDebugLogs) {
+      appLog('[STTWake] recovered reason=$reason');
+    }
+  }
+
+  void _startSttWakeWatchdog() {
     if (!_useSttWakeEngine) return;
+    _sttWakeWatchdogTimer?.cancel();
+    final periodMs = (_sttWakeWatchdogMaxSilenceMs ~/ 3).clamp(1000, 5000);
+    _sttWakeWatchdogTimer = Timer.periodic(Duration(milliseconds: periodMs), (
+      _,
+    ) {
+      unawaited(_checkSttWakeWatchdog());
+    });
+  }
+
+  void _stopSttWakeWatchdog() {
+    _sttWakeWatchdogTimer?.cancel();
+    _sttWakeWatchdogTimer = null;
+  }
+
+  Future<void> _checkSttWakeWatchdog() async {
+    if (!_useSttWakeEngine || !mounted) return;
+    if (!_sttWakeArmed ||
+        _sttWakeUnavailable ||
+        _commandInFlight ||
+        _followUpActive ||
+        _wakeHandling ||
+        _isSpeaking ||
+        _onboardingDialogInProgress ||
+        _sttService.isListening) {
+      return;
+    }
+    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return;
+    }
+    final last = _sttWakeLastEventAt;
+    if (last == null) return;
+    final staleMs = DateTime.now().difference(last).inMilliseconds;
+    if (staleMs < _sttWakeWatchdogMaxSilenceMs) return;
+    appLog('[STTWake] watchdog restart stale_ms=$staleMs');
+    _sttWakeArmed = false;
+    _sttWakeInitialized = false;
+    try {
+      await _sttWakeService.cancel();
+    } catch (_) {}
+    await _syncPrimaryWakeMode();
+  }
+
+  Future<void> _initializeSttWakeIfNeeded({bool force = false}) async {
+    if (!_useSttWakeEngine) return;
+    if (_sttWakeInitialized && !force) return;
     try {
       await _sttWakeService.initialize(
         language: _sttWakeLanguage,
         partialResults: _sttWakePartialResultsEnabled,
+        preferOffline: _sttWakePreferOffline,
       );
       final available = await _sttWakeService.isAvailable();
       if (!available) {
-        _sttWakeUnavailable = true;
-        appLog('[STTWake] unavailable reason=not_available');
+        _markSttWakeUnavailable('not_available');
         return;
       }
+      _markSttWakeRecovered('initialize');
       if (_sttWakeDebugLogs) {
         appLog(
           '[STTWake] initialize language=$_sttWakeLanguage '
-          'partials=$_sttWakePartialResultsEnabled',
+          'partials=$_sttWakePartialResultsEnabled '
+          'offline=$_sttWakePreferOffline',
         );
       }
     } catch (error) {
-      _sttWakeUnavailable = true;
+      _markSttWakeUnavailable('initialize_failed');
       appLog('[STTWake] initialize failed: $error');
     }
   }
@@ -714,27 +811,50 @@ class _JanarymHomeState extends State<JanarymHome>
     if (!_useSttWakeEngine || _sttWakeUnavailable) return false;
     if (_sttWakeArmed) return true;
     try {
+      final status = await _sttWakeService.status();
+      if ((status['status']?.toString() ?? '') == 'listening') {
+        _sttWakeArmed = true;
+        _sttWakeAcceptInFlight = false;
+        _sttWakeLastEventAt = DateTime.now();
+        _startSttWakeWatchdog();
+        if (_sttWakeDebugLogs) {
+          appLog('[STTWake] start skipped already_listening reason=$reason');
+        }
+        return true;
+      }
       await _sttWakeService.start();
       _sttWakeArmed = true;
+      _sttWakeAcceptInFlight = false;
+      _sttWakeLastEventAt = DateTime.now();
+      _startSttWakeWatchdog();
       if (_sttWakeDebugLogs) {
         appLog('[STTWake] start reason=$reason');
       }
       return true;
     } catch (error) {
       _sttWakeArmed = false;
-      _sttWakeUnavailable = true;
+      _sttWakeInitialized = false;
+      _markSttWakeUnavailable('start_failed');
       appLog('[STTWake] start failed reason=$reason error=$error');
       return false;
     }
   }
 
-  Future<void> _stopSttWake({required String reason}) async {
+  Future<void> _stopSttWake({
+    required String reason,
+    bool cancel = false,
+  }) async {
     if (!_useSttWakeEngine) return;
-    if (!_sttWakeArmed && !_sttWakeUnavailable) return;
+    if (!_sttWakeArmed && !_sttWakeUnavailable && !cancel) return;
     try {
-      await _sttWakeService.stop();
+      if (cancel) {
+        await _sttWakeService.cancel();
+      } else {
+        await _sttWakeService.stop();
+      }
     } catch (_) {}
     _sttWakeArmed = false;
+    _stopSttWakeWatchdog();
     if (_sttWakeDebugLogs) {
       appLog('[STTWake] stop reason=$reason');
     }
@@ -760,7 +880,7 @@ class _JanarymHomeState extends State<JanarymHome>
 
   Future<void> _stopPrimaryWake({required String reason}) async {
     if (_useSttWakeEngine) {
-      await _stopSttWake(reason: reason);
+      await _stopSttWake(reason: reason, cancel: true);
       return;
     }
     await _wakeService.stop();
@@ -782,20 +902,23 @@ class _JanarymHomeState extends State<JanarymHome>
     }
     _sttWakeFatalErrors += 1;
     if (_sttWakeFatalErrors >= _sttWakeFatalErrorThreshold) {
-      _sttWakeUnavailable = true;
+      _markSttWakeUnavailable('fatal_error_window');
     }
   }
 
   Future<void> _handleSttWakeEvent(SttWakeEvent event) async {
     if (!_useSttWakeEngine || !mounted) return;
+    _sttWakeLastEventAt = DateTime.now();
     switch (event.status) {
       case 'ready':
       case 'listening':
         _sttWakeArmed = true;
         _lastSttWakeReason = event.status;
+        _startSttWakeWatchdog();
         return;
       case 'partial':
       case 'final':
+        if (_sttWakeAcceptInFlight) return;
         final text = (event.text ?? '').trim();
         if (text.isEmpty) return;
         if (_sttWakeDebugLogs) {
@@ -807,10 +930,8 @@ class _JanarymHomeState extends State<JanarymHome>
         );
         _lastSttWakeMatch = match.strength.name;
         _lastSttWakeReason = match.reason;
-        final accepted = event.status == 'partial'
-            ? match.strength == WakeMatchStrength.strong
-            : match.strength == WakeMatchStrength.strong ||
-                  match.strength == WakeMatchStrength.probable;
+        final accepted = match.strength == WakeMatchStrength.strong ||
+                         match.strength == WakeMatchStrength.probable;
         if (!accepted) {
           return;
         }
@@ -818,11 +939,17 @@ class _JanarymHomeState extends State<JanarymHome>
           '[STTWake] accepted ${event.status} '
           'match=${match.strength.name} reason=${match.reason}',
         );
-        await _stopSttWake(reason: 'accepted_${event.status}');
+        _sttWakeAcceptInFlight = true;
+        await _stopSttWake(reason: 'accepted_${event.status}', cancel: true);
         await _handleWakeDetected();
         return;
       case 'error':
         _sttWakeArmed = false;
+        _stopSttWakeWatchdog();
+        final reason = event.reason ?? 'error';
+        if (reason != 'no_match' && reason != 'timeout') {
+          _sttWakeInitialized = false;
+        }
         _lastSttWakeReason = event.reason ?? 'error';
         appLog(
           '[STTWake] error code=${event.errorCode ?? '-'} '
@@ -831,7 +958,6 @@ class _JanarymHomeState extends State<JanarymHome>
         if (_isFatalSttWakeEvent(event)) {
           _recordSttWakeFatalError();
           if (_sttWakeUnavailable) {
-            appLog('[STTWake] unavailable reason=${event.reason ?? 'fatal'}');
             await _syncPrimaryWakeMode();
             return;
           }
@@ -846,7 +972,11 @@ class _JanarymHomeState extends State<JanarymHome>
         return;
       case 'stopped':
         _sttWakeArmed = false;
+        _stopSttWakeWatchdog();
         _lastSttWakeReason = event.reason ?? 'stopped';
+        if (!_commandInFlight && !_wakeHandling) {
+          _sttWakeAcceptInFlight = false;
+        }
         return;
       default:
         return;
@@ -869,6 +999,17 @@ class _JanarymHomeState extends State<JanarymHome>
         !_sttService.isListening &&
         !_manualTextReadInProgress;
     if (shouldRun) {
+      if (_sttWakeUnavailable && _sttWakeUnavailableSince != null) {
+        final cooldownMs = DateTime.now()
+            .difference(_sttWakeUnavailableSince!)
+            .inMilliseconds;
+        if (cooldownMs >= _sttWakeUnavailableRetryMs) {
+          _sttWakeUnavailable = false;
+          _sttWakeUnavailableSince = null;
+          _sttWakeInitialized = false;
+          appLog('[STTWake] retry_unavailable cooldown_ms=$cooldownMs');
+        }
+      }
       await _initializeSttWakeIfNeeded();
       if (!_sttWakeUnavailable) {
         _stopWakeFallbackLoop();
@@ -879,7 +1020,7 @@ class _JanarymHomeState extends State<JanarymHome>
           return;
         }
       }
-      await _stopSttWake(reason: 'stt_unavailable');
+      await _stopSttWake(reason: 'stt_unavailable', cancel: true);
       _setCircleState(CircleState.wake);
       final nativeStarted = await _startLegacyNativeWake(
         reason: 'stt_unavailable',
@@ -898,7 +1039,7 @@ class _JanarymHomeState extends State<JanarymHome>
       }
       return;
     }
-    await _stopSttWake(reason: 'sync_blocked');
+    await _stopSttWake(reason: 'sync_blocked', cancel: true);
     await _stopLegacyNativeWake(reason: 'sync_blocked');
     if (_sttWakeUnavailable &&
         _sttWakeLegacyFallbackEnabled &&
@@ -1098,8 +1239,12 @@ class _JanarymHomeState extends State<JanarymHome>
     String spokenText, {
     required bool autoRead,
   }) async {
+    // In Text Reader mode, we want natural pronunciation for English even in auto-tick path
+    final inTextReaderMode = _assistantMode == AssistantMode.textReader;
     final useEnglishTts =
-        !autoRead && TextReadingNormalizer.shouldUseEnglishTts(spokenText);
+        (!autoRead || inTextReaderMode) &&
+        TextReadingNormalizer.shouldUseEnglishTts(spokenText);
+
     if (useEnglishTts) {
       await _configureTtsForLocaleCode('en-US');
       appLog('[TTS] locale ensured: en');
@@ -1131,7 +1276,12 @@ class _JanarymHomeState extends State<JanarymHome>
       if (locale.startsWith(localePrefix)) score += 160;
       if (locale == localeCode.toLowerCase()) score += 40;
       if (_looksLikeFemaleVoiceName(name)) score += 12;
-      if (!name.contains('network')) score += 4;
+      
+      // Prioritize modern high-quality voices to avoid "robotic" sound
+      if (name.contains('neural') || name.contains('natural')) score += 60;
+      if (name.contains('premium') || name.contains('enhanced')) score += 40;
+      if (name.contains('multilingual')) score += 20;
+      if (name.contains('network')) score += 10;
 
       if (score > bestScore) {
         bestScore = score;
@@ -1170,8 +1320,10 @@ class _JanarymHomeState extends State<JanarymHome>
 
       if (_looksLikeFemaleVoiceName(name)) score += 90;
       if (_looksLikeMaleVoiceName(name)) score -= 90;
-      if (name.contains('neural') || name.contains('natural')) score += 35;
-      if (name.contains('premium') || name.contains('enhanced')) score += 20;
+      if (name.contains('neural') || name.contains('natural')) score += 60;
+      if (name.contains('premium') || name.contains('enhanced')) score += 40;
+      if (name.contains('multilingual')) score += 20;
+      if (name.contains('network')) score += 10;
 
       if (score > bestScore) {
         bestScore = score;
@@ -1734,7 +1886,7 @@ class _JanarymHomeState extends State<JanarymHome>
           _startWakeFallbackLoop();
         }
       }
-      if (_modeNeedsLiveCamera(_assistantMode)) {
+      if (_featureFlags.aggressiveBackgroundCamera || _modeNeedsLiveCamera(_assistantMode)) {
         unawaited(_initCameraLive());
       }
       if (_featureFlags.aggressiveBackgroundCamera) {
@@ -1744,6 +1896,7 @@ class _JanarymHomeState extends State<JanarymHome>
         state == AppLifecycleState.detached) {
       unawaited(_stopCameraStream(reason: 'lifecycle_${state.name}'));
       unawaited(_stopSttWake(reason: 'lifecycle_${state.name}'));
+      _sttWakeInitialized = false;
       _stopWakeFallbackLoop();
       _wakeRecoveryTimer?.cancel();
       _wakeRecoveryTimer = null;
@@ -1761,6 +1914,7 @@ class _JanarymHomeState extends State<JanarymHome>
       _textReaderLoopTimer = null;
       unawaited(_syncReflexLoop());
       unawaited(_stopSttWake(reason: 'lifecycle_${state.name}'));
+      _sttWakeInitialized = false;
       _stopWakeFallbackLoop();
     }
   }
@@ -2516,6 +2670,8 @@ class _JanarymHomeState extends State<JanarymHome>
       setState(() => _lastWakeAt = DateTime.now());
     }
     _requestId++;
+    
+    // INSTANT INTERRUPTION
     await _tts.stop();
     await _stopPrimaryWake(reason: 'wake_detected');
     if (_followUpActive) {
@@ -2523,18 +2679,14 @@ class _JanarymHomeState extends State<JanarymHome>
       _followUpActive = false;
     }
     _commandInFlight = false;
+    
+    // Play the beep immediately and don't wait for any slow TTS voice responses
     unawaited(_playWakeCue());
     unawaited(_vibrateStart());
-    final ack = _resolvedWakeAckText();
-    if (ack.isNotEmpty) {
-      appLog('[WakeFlow] ack_start');
-      await _speakWakeAckFast(ack);
-      _lastWakeAckDoneMs = DateTime.now().millisecondsSinceEpoch;
-      appLog('[WakeFlow] ack_done');
-    } else {
-      _lastWakeAckDoneMs = DateTime.now().millisecondsSinceEpoch;
-      appLog('[WakeFlow] ack_skip');
-    }
+    _lastWakeAckDoneMs = DateTime.now().millisecondsSinceEpoch;
+    appLog('[WakeFlow] ack_skip_forced_for_speed');
+    
+    // Start listening immediately
     await _runCommandFlow(reason: 'wake');
   }
 
@@ -2630,6 +2782,12 @@ class _JanarymHomeState extends State<JanarymHome>
         profile: listenProfile,
         languageHint: _interactionLanguage,
         allowAutoLanguage: reason == 'wake',
+        onRecordingFinished: () {
+          // Play the ending cue INSTANTLY when the microphone stops, 
+          // before we even start the slow network upload to OpenAI.
+          unawaited(_playEndCue());
+          unawaited(_vibrateEnd());
+        },
       );
 
       // Re-arm dedicated wake engine immediately after command capture.
@@ -2663,14 +2821,10 @@ class _JanarymHomeState extends State<JanarymHome>
 
       if (wakeOnlyPhrase) {
         appLog('[STT] ignore wake-only phrase after activation: $cleaned');
-        await _playEndCue();
-        await _vibrateEnd();
         _setCircleState(CircleState.wake);
       } else if (cleaned.isNotEmpty) {
         await _handleUserText(cleaned);
       } else {
-        await _playEndCue();
-        await _vibrateEnd();
         _setCircleState(CircleState.wake);
       }
     } finally {
@@ -3981,6 +4135,9 @@ class _JanarymHomeState extends State<JanarymHome>
       return;
     }
 
+    // Reset loop state immediately to prevent "race condition" triggerings
+    _resetTextReaderAutoState();
+
     if (source != _TextReaderReadSource.auto) {
       _textReaderSessionCancelRequested = false;
     }
@@ -4185,7 +4342,7 @@ class _JanarymHomeState extends State<JanarymHome>
       );
       appLog(
         '[TextReader][manual_session] fallback_text_used='
-        '${result.manualSpeechText.trim().isEmpty && result.manualFallbackText.trim().isNotEmpty}',
+        '${result.blocks.isEmpty && result.manualFallbackText.trim().isNotEmpty}',
       );
 
       _textReaderSessionState = _TextReaderSessionState.speaking;
@@ -4332,7 +4489,12 @@ class _JanarymHomeState extends State<JanarymHome>
           appLog('[TextReader][manual_session] attempt=$attempt no_result');
         } else {
           final text = _resolveManualSpeechText(result);
-          final score = _scoreManualTextReadCandidate(result);
+          final score = scoreManualTextReadCandidate(
+              text: text, 
+              manualSpeechLinesCount: result.blocks.length,
+              dominantScript: result.dominantScript,
+              hasStructuredData: result.hasStructuredData,
+          );
           final effectiveScript = _effectiveManualScript(result, text);
           appLog(
             '[TextReader][manual_session] attempt=$attempt '
@@ -4381,29 +4543,26 @@ class _JanarymHomeState extends State<JanarymHome>
     final resolvedText = _resolveManualSpeechText(result);
     return scoreManualTextReadCandidate(
       text: resolvedText,
-      manualSpeechLinesCount: result.manualSpeechLines.length,
+      manualSpeechLinesCount: result.blocks.length,
       dominantScript: _effectiveManualScript(result, resolvedText),
       hasStructuredData: result.hasStructuredData,
     );
   }
 
   String _resolveManualSpeechText(OnDeviceTextReadResult result) {
-    final manual = result.manualSpeechText.trim();
-    final fallback = result.manualFallbackText.trim();
-    if (fallback.isNotEmpty) {
-      final fallbackScript = TextReadingNormalizer.detectScript(fallback);
-      final manualScript = TextReadingNormalizer.detectScript(manual);
-      final weakLatinManual =
-          manual.isNotEmpty &&
-          manualScript == DetectedTextScript.latin &&
-          !TextReadingNormalizer.shouldUseEnglishTts(manual);
-      if (manual.isEmpty ||
-          (fallbackScript == DetectedTextScript.cyrillic && weakLatinManual)) {
-        return fallback;
+    if (result.hasStructuredData) {
+      if (result.price != null && result.calories != null) {
+        return 'Цена ${result.price} тенге, калорийность ${result.calories} ккал';
       }
+      if (result.price != null) return 'Цена ${result.price} тенге';
+      if (result.calories != null) return '${result.calories} ккал';
     }
-    if (manual.isNotEmpty) return manual;
-    return '';
+    
+    if (result.blocks.isNotEmpty) {
+      return result.blocks.join('. ');
+    }
+    
+    return result.manualFallbackText;
   }
 
   int _countStableManualCandidates(
@@ -4460,34 +4619,26 @@ class _JanarymHomeState extends State<JanarymHome>
   }) {
     final override = overrideText?.trim() ?? '';
     if (override.isNotEmpty) {
-      final split = _splitTextReaderSpeechSegments(override);
-      if (split.isNotEmpty) return split;
+      return _splitTextReaderSpeechSegments(override);
     }
 
-    if (result.manualSpeechLines.isNotEmpty) {
-      return result.manualSpeechLines
+    if (result.blocks.isNotEmpty) {
+      return result.blocks
           .expand(_splitMixedLanguageSpeechSegments)
           .where((line) => line.isNotEmpty)
           .toList(growable: false);
     }
 
-    final resolvedText = _resolveManualSpeechText(result);
-    if (resolvedText.isEmpty) return const <String>[];
-    return _splitTextReaderSpeechSegments(resolvedText);
+    return _splitTextReaderSpeechSegments(_resolveManualSpeechText(result));
   }
 
   List<String> _buildAutoTextReaderSpeechSegments(
     OnDeviceTextReadResult result,
   ) {
-    if (result.autoSpeechLines.isNotEmpty) {
-      return result.autoSpeechLines
-          .expand(_splitMixedLanguageSpeechSegments)
-          .where((line) => line.isNotEmpty)
-          .toList(growable: false);
+    if (result.blocks.isNotEmpty) {
+      return result.blocks.take(1).toList();
     }
-    final resolvedText = result.autoSpeechText.trim();
-    if (resolvedText.isEmpty) return const <String>[];
-    return _splitTextReaderSpeechSegments(resolvedText);
+    return const <String>[];
   }
 
   List<String> _splitTextReaderSpeechSegments(String text) {
@@ -4651,7 +4802,8 @@ class _JanarymHomeState extends State<JanarymHome>
     final candidateText = resolvedText.isNotEmpty ? resolvedText : rawText;
     final candidateSignature = buildManualCandidateSignature(candidateText);
     final inTextReaderMode = _assistantMode == AssistantMode.textReader;
-    final requiredSeenCount = inTextReaderMode ? 1 : null;
+    // For specialized text reader mode, require 4 frames if short, else 3
+    final requiredSeenCount = inTextReaderMode ? (candidateText.length < 15 ? 4 : 3) : null;
     if (candidateSignature.isEmpty) {
       _resetTextReaderAutoState();
       return false;
@@ -4660,9 +4812,8 @@ class _JanarymHomeState extends State<JanarymHome>
         result.hasStructuredData ||
         rawText.length >= 48 ||
         resolvedText.length >= 24 ||
-        result.lines.length >= 2 ||
-        result.manualSpeechLines.isNotEmpty ||
-        (inTextReaderMode && (rawText.length >= 24 || result.lines.isNotEmpty));
+        result.blocks.length >= 2 ||
+        (inTextReaderMode && (rawText.length >= 24 || result.blocks.isNotEmpty));
     if (!hasEnoughSignal) {
       return false;
     }
@@ -4689,17 +4840,26 @@ class _JanarymHomeState extends State<JanarymHome>
           text: resolvedText,
           stableRepeats: _pendingAutoTextReaderSeenCount,
         );
+
+    // Critical: Filter out repetitive OCR garbage or non-phonetic soup
+    if (!TextReadingNormalizer.isSpeechSafe(resolvedText) && !result.hasStructuredData) {
+      if (score >= _manualTextReadAcceptScore) {
+        appLog('[TextReader][auto] ignoring unsafe text candidate: "$resolvedText"');
+      }
+      return false;
+    }
     final shouldUseVisionFallback = _shouldUseVisionTextReadFallback(
       result,
       resolvedText,
       score: score,
     );
+    final effectiveAcceptScore = inTextReaderMode ? 15.0 : _manualTextReadAcceptScore;
     final shouldTrigger =
-        score >= _manualTextReadAcceptScore ||
+        score >= effectiveAcceptScore ||
         structuredOnlyAccepted ||
         weakAccepted ||
         shouldUseVisionFallback ||
-        rawText.length >= 64;
+        (score >= 18 && rawText.length >= (inTextReaderMode ? 48 : 80));
     if (!shouldTrigger) {
       return false;
     }
@@ -4764,6 +4924,13 @@ class _JanarymHomeState extends State<JanarymHome>
     List<String> segments, {
     required bool autoRead,
   }) async {
+    _textReaderSessionCancelRequested = false;
+    final now = DateTime.now();
+    if (now.difference(_lastReadClearTime).inSeconds > 30) {
+      _recentReadSegments.clear();
+      _lastReadClearTime = now;
+    }
+
     for (final segment in segments) {
       if (_textReaderSessionCancelRequested) {
         appLog('[TextReader][speech] canceled');
@@ -4771,9 +4938,50 @@ class _JanarymHomeState extends State<JanarymHome>
       }
       final text = segment.trim();
       if (text.isEmpty) continue;
+      
+      // Filter out seen segments to avoid annoying loops
+      if (autoRead && _isAlreadyReadFuzzy(text)) {
+        continue;
+      }
+
+      final useEnglish = TextReadingNormalizer.shouldUseEnglishTts(text);
+
+      final speechText = TextReadingNormalizer.normalizeForTts(
+        text, 
+        useEnglishVoice: useEnglish,
+      );
+
+      // Secondary junk filter before deciding to speak AND before pausing mic
+      if (!TextReadingNormalizer.isSpeechSafe(speechText)) {
+        appLog('[TextReader][speech] skipping unsafe segment: "$speechText"');
+        continue;
+      }
+
+      // ONLY pause mic here, when we are 100% sure we will speak
+      if (autoRead) {
+        await _pauseWakeFallbackForAutoTextRead();
+      }
+
       await _ensureTtsLocaleForSpokenText(text, autoRead: autoRead);
-      await _speak(text, ensureLocale: false);
+      _recentReadSegments.add(speechText);
+      appLog('[TextReader][speech] speak: "$speechText" (english=$useEnglish)');
+      await _speak(speechText, ensureLocale: false);
     }
+  }
+
+  bool _isAlreadyReadFuzzy(String text) {
+    if (_recentReadSegments.isEmpty) return false;
+    final signature = buildManualCandidateSignature(text);
+    if (signature.isEmpty) return false;
+
+    for (final recent in _recentReadSegments) {
+      final recentSignature = buildManualCandidateSignature(recent);
+      // If we already read something that contains this new fragment, skip it.
+      if (recentSignature.contains(signature)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   bool _shouldUseVisionTextReadFallback(
@@ -4802,12 +5010,12 @@ class _JanarymHomeState extends State<JanarymHome>
     }
 
     final systemPrompt = _voiceText(
-      ru: 'Перепиши видимый текст с изображения максимально точно. Верни только сам текст без описаний, комментариев и домыслов. Сохрани исходный язык текста. Если текст не читается, ответь только NO_TEXT.',
-      kk: 'Суреттегі көрінетін мәтінді дәл көшіріп жаз. Тек мәтіннің өзін қайтар. Ешқандай сипаттама, түсініктеме немесе қосымша сөз қоспа. Бастапқы тілін сақта. Егер мәтін оқылмаса, тек NO_TEXT деп жауап бер.',
+      ru: 'Ты — ассистент для незрячих. Извлеки только печатный текст с изображения. Сохрани оригинальный язык. Верни ЧИСТЫЙ ТЕКСТ без своих комментариев. Если текста нет или он неразборчив, верни СТРОГО: NO_TEXT.',
+      kk: 'Сен — зағип жандарға көмекшісің. Суреттегі баспа мәтінді ғана тауып шығар. Түпнұсқа тілін сақта. Өз пікіріңсіз ТЕК МӘТІНДІ қайтар. Егер мәтін жоқ болса, СТРОГО: NO_TEXT деп жаз.',
     );
     final userPrompt = _voiceText(
-      ru: 'Верни только видимый текст.',
-      kk: 'Көрінетін мәтінді ғана қайтар.',
+      ru: 'Прочитай текст на картинке. Если его нет, ответь NO_TEXT.',
+      kk: 'Суреттегі мәтінді оқы. Егер мәтін жоқ болса, NO_TEXT деп жауап бер.',
     );
 
     try {
@@ -5519,14 +5727,9 @@ class _JanarymHomeState extends State<JanarymHome>
         label: result.kind,
         meta: <String, Object?>{
           'raw_text': result.rawText,
-          'speech_text': result.manualSpeechText,
-          'lines': result.lines,
-          'speech_lines': result.manualSpeechLines,
-          'manual_speech_text': result.manualSpeechText,
-          'manual_speech_lines': result.manualSpeechLines,
+          'blocks': result.blocks,
           'manual_fallback_text': result.manualFallbackText,
-          'auto_speech_text': result.autoSpeechText,
-          'auto_speech_lines': result.autoSpeechLines,
+          'auto_speech_text': result.blocks.isNotEmpty ? result.blocks.first : '',
           'dominant_script': result.dominantScript.name,
           'price': result.price,
           'calories': result.calories,
@@ -5544,7 +5747,7 @@ class _JanarymHomeState extends State<JanarymHome>
     required bool autoRead,
   }) {
     final spokenTextSource = autoRead
-        ? result.autoSpeechText
+        ? (result.blocks.isNotEmpty ? result.blocks.first : '')
         : _resolveManualSpeechText(result);
     final spokenText = _truncateForSpeech(spokenTextSource);
     final isLatinManual =
@@ -5706,26 +5909,39 @@ class _JanarymHomeState extends State<JanarymHome>
       final result = await _readTextFromCurrentFrame();
       if (result == null || !result.hasRawText) {
         _resetTextReaderAutoState();
-        appLog('[TextReader][auto] skip no_result');
+        if (_assistantMode == AssistantMode.textReader) {
+          // Log even if no result in text reader mode to help debug
+          appLog('[TextReader][auto] tick no_result');
+        }
         return;
       }
 
       if (_assistantMode == AssistantMode.textReader) {
         if (_shouldTriggerAutoExactTextRead(result)) {
-          final score = _scoreManualTextReadCandidate(result);
-          final resolvedText = _resolveManualSpeechText(result);
-          appLog(
-            '[TextReader][auto] trigger_exact_read '
-            'score=${score.toStringAsFixed(1)} '
-            'raw="${_truncateForLog(result.rawText)}" '
-            'text="${_truncateForLog(resolvedText)}"',
+          // Use more permissive segments for specialized Text Reader mode
+          final textSegments = _buildTextReaderSpeechSegments(result);
+          final signature = _buildTextReaderSpeechSignature(
+            textSegments,
+            result: result,
           );
-          await _pauseWakeFallbackForAutoTextRead();
-          _resetTextReaderAutoState();
-          await _runManualTextReadSession(
-            _voiceText(ru: 'авточтение', kk: 'автоматты оқу'),
-            source: _TextReaderReadSource.auto,
-          );
+          if (textSegments.isNotEmpty &&
+              signature != _lastAutoTextReaderSignature) {
+            final now = DateTime.now().millisecondsSinceEpoch;
+            _lastAutoTextReaderSignature = signature;
+            _lastAutoTextReaderSpeakMs = now;
+
+            appLog(
+              '[TextReader][auto] fast_read triggered length=${result.rawText.length}',
+            );
+            await _speakTextReaderSegments(textSegments, autoRead: true);
+          } else if (textSegments.isEmpty) {
+            appLog('[TextReader][auto] trigger session (no fast segments)');
+            _resetTextReaderAutoState();
+            await _runManualTextReadSession(
+              _voiceText(ru: 'авточтение', kk: 'автоматты оқу'),
+              source: _TextReaderReadSource.auto,
+            );
+          }
         }
         return;
       }
@@ -5753,7 +5969,7 @@ class _JanarymHomeState extends State<JanarymHome>
           _lastAnswer = autoAnswer;
           appLog(
             '[TextReader][auto] raw="${_truncateForLog(result.rawText)}" '
-            'auto="${_truncateForLog(result.autoSpeechText)}"',
+            'auto="${result.blocks.isNotEmpty ? _truncateForLog(result.blocks.first) : ''}"',
           );
           await _speakTextReaderSegments(autoSegments, autoRead: true);
           _resetTextReaderAutoState();
@@ -5822,7 +6038,7 @@ class _JanarymHomeState extends State<JanarymHome>
       appLog(
         '[TextReader][auto] skip $reason '
         'raw="${_truncateForLog(result.rawText)}" '
-        'auto="${_truncateForLog(result.autoSpeechText)}"',
+        'auto="${result.blocks.isNotEmpty ? _truncateForLog(result.blocks.first) : ''}"',
       );
     } finally {
       _textReaderLoopBusy = false;
@@ -7343,6 +7559,7 @@ class _JanarymHomeState extends State<JanarymHome>
 
   Future<void> _stopAll() async {
     appLog('[Stop] pressed');
+    _textReaderSessionCancelRequested = true;
     await _sttService.stop();
     await _tts.stop();
     _followUpActive = false;
@@ -7367,6 +7584,7 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   Future<void> _stopTtsOnly() async {
+    _textReaderSessionCancelRequested = true;
     await _tts.stop();
   }
 
@@ -8822,68 +9040,371 @@ class _JanarymHomeState extends State<JanarymHome>
   @override
   Widget build(BuildContext context) {
     final bottomPadding = MediaQuery.paddingOf(context).bottom;
-    final rightPadding = MediaQuery.paddingOf(context).right;
+    final topPadding = MediaQuery.paddingOf(context).top;
+    final statusColor = _circleStatusColor();
+
     return Scaffold(
       resizeToAvoidBottomInset: false,
       backgroundColor: const Color(0xFF020617),
-      body: Stack(
-        children: [
+      body: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTap: () async {
+          if (_isSpeaking || _textReaderSessionState == _TextReaderSessionState.speaking) {
+            await _stopTtsOnly();
+            _textReaderSessionCancelRequested = true;
+          }
+        },
+        child: Stack(
+          children: [
+          // --- Camera feed ---
           Positioned.fill(child: _buildCameraStage()),
+
+          // --- Top-to-bottom gradient overlay ---
           Positioned.fill(
             child: IgnorePointer(
               child: Container(
-                decoration: const BoxDecoration(
+                decoration: BoxDecoration(
                   gradient: LinearGradient(
                     begin: Alignment.topCenter,
                     end: Alignment.bottomCenter,
+                    stops: const [0.0, 0.35, 0.65, 1.0],
                     colors: [
-                      Color(0x42020617),
-                      Color(0x2209021A),
-                      Color(0x6409021A),
+                      const Color(0xFF020617).withOpacity(0.75),
+                      Colors.transparent,
+                      Colors.transparent,
+                      const Color(0xFF020617).withOpacity(0.90),
                     ],
                   ),
                 ),
               ),
             ),
           ),
-          if (_modePickerOpen)
-            Positioned.fill(
-              child: GestureDetector(
-                onTap: () => setState(() => _modePickerOpen = false),
-                child: Container(color: Colors.black.withOpacity(0.18)),
-              ),
-            ),
+
+          // --- Top status bar ---
           Positioned(
-            right: rightPadding + 16,
-            bottom: bottomPadding + 88,
-            child: _buildModePickerOverlay(),
+            top: topPadding + 12,
+            left: 16,
+            right: 16,
+            child: _buildTopStatusBar(statusColor),
           ),
-          if (_assistantMode == AssistantMode.textReader && !_modePickerOpen)
+
+          // --- Wake debug overlay (dev) ---
+          if (_wakeDebugOverlayEnabled)
             Positioned(
-              right: rightPadding + 16,
-              bottom: bottomPadding + 88,
+              left: 16,
+              bottom: bottomPadding + 130,
+              child: _buildWakeDebugOverlay(),
+            ),
+
+          // --- Text reader action button ---
+          if (_assistantMode == AssistantMode.textReader)
+            Positioned(
+              right: 20,
+              bottom: bottomPadding + 130,
               child: _buildTextReaderActionButton(),
             ),
+
+          // --- Main circle button (bottom center) ---
           Positioned(
-            left: 16,
-            top: MediaQuery.paddingOf(context).top + 16,
-            child: _buildWakeDebugOverlay(),
-          ),
-          Positioned(
-            top: MediaQuery.paddingOf(context).top + 16,
+            bottom: bottomPadding + 24,
             left: 0,
             right: 0,
-            child: IgnorePointer(
-              child: Center(child: _buildModeIndicatorPill()),
-            ),
-          ),
-          Positioned(
-            right: rightPadding + 16,
-            bottom: bottomPadding + 18,
-            child: _buildModeToggleButton(),
+            child: Center(child: _buildMainCircleButton(statusColor)),
           ),
         ],
       ),
+      ),
+    );
+  }
+
+  /// Immersive glass top bar: shows current mode + live status dot
+  Widget _buildTopStatusBar(Color statusColor) {
+    final descriptor = _modeOrchestrator.descriptorFor(
+      _modeOrchestrator.value.activeMode,
+    );
+    final accentColor = descriptor.ui.accentColor;
+    final modeLabel = descriptor.ui.label(
+      isKazakh: widget.appLanguage == AppLanguage.kk,
+    );
+    final statusLabel = _circleStatusLabel();
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(20),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOutCubic,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+          decoration: BoxDecoration(
+            color: Colors.black.withOpacity(0.38),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: accentColor.withOpacity(0.45), width: 1.2),
+            boxShadow: [
+              BoxShadow(
+                color: accentColor.withOpacity(0.12),
+                blurRadius: 24,
+                spreadRadius: 1,
+              ),
+            ],
+          ),
+          child: Row(
+            children: [
+              // Mode icon + name
+              Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: accentColor.withOpacity(0.18),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: accentColor.withOpacity(0.5)),
+                ),
+                child: Icon(descriptor.ui.icon, size: 18, color: accentColor),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      modeLabel,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 0.2,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Row(
+                      children: [
+                        // Pulsing colored dot
+                        AnimatedBuilder(
+                          animation: _modeFabPulse,
+                          builder: (_, __) => Container(
+                            width: 6,
+                            height: 6,
+                            decoration: BoxDecoration(
+                              color: statusColor,
+                              shape: BoxShape.circle,
+                              boxShadow: [
+                                BoxShadow(
+                                  color: statusColor.withOpacity(
+                                    0.4 * _modeFabPulse.value,
+                                  ),
+                                  blurRadius: 6,
+                                  spreadRadius: 2,
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          statusLabel,
+                          style: TextStyle(
+                            color: Colors.white.withOpacity(0.75),
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              // Mode grid button (top right)
+              GestureDetector(
+                onTap: () => _openModeBottomSheet(),
+                child: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.10),
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.white24),
+                  ),
+                  child: const Icon(
+                    Icons.grid_view_rounded,
+                    size: 18,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _circleStatusLabel() {
+    switch (_circleState) {
+      case CircleState.wake:
+        return widget.appLanguage == AppLanguage.kk ? 'Тыңдауда' : 'Слушаю...';
+      case CircleState.listening:
+        return widget.appLanguage == AppLanguage.kk ? 'Сөйлеңіз' : 'Говорите...';
+      case CircleState.thinking:
+        return widget.appLanguage == AppLanguage.kk ? 'Ойлануда' : 'Думаю...';
+      case CircleState.speaking:
+        return widget.appLanguage == AppLanguage.kk ? 'Жауап беруде' : 'Отвечаю...';
+      case CircleState.end:
+        return widget.appLanguage == AppLanguage.kk ? 'Дайын' : 'Готово';
+      default:
+        return widget.appLanguage == AppLanguage.kk ? 'Дайын' : 'Готов';
+    }
+  }
+
+  /// Large centered animated circle button
+  Widget _buildMainCircleButton(Color statusColor) {
+    return AnimatedBuilder(
+      animation: _modeFabPulse,
+      builder: (context, _) {
+        final pulseScale = 1.0 + (_modeFabPulse.value - 1.0) * 0.6;
+        final isActive = _circleState == CircleState.listening ||
+            _circleState == CircleState.thinking ||
+            _circleState == CircleState.speaking;
+
+        return GestureDetector(
+          onTap: () => _openModeBottomSheet(),
+          onLongPress: () async {
+            // Long press triggers command listening directly
+            if (!_commandInFlight && !_wakeHandling) {
+              await _handleWakeDetected();
+            }
+          },
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              // Outer glow ring (animated pulse)
+              if (isActive)
+                Transform.scale(
+                  scale: pulseScale,
+                  child: Container(
+                    width: 96,
+                    height: 96,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: statusColor.withOpacity(
+                          0.35 * (2.0 - _modeFabPulse.value),
+                        ),
+                        width: 2,
+                      ),
+                    ),
+                  ),
+                ),
+              // Second outer ring
+              if (isActive)
+                Transform.scale(
+                  scale: pulseScale * 1.18,
+                  child: Container(
+                    width: 96,
+                    height: 96,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: statusColor.withOpacity(
+                          0.15 * (2.0 - _modeFabPulse.value),
+                        ),
+                        width: 1.5,
+                      ),
+                    ),
+                  ),
+                ),
+              // Main circle
+              ClipRRect(
+                borderRadius: BorderRadius.circular(999),
+                child: BackdropFilter(
+                  filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 400),
+                    curve: Curves.easeOutCubic,
+                    width: 76,
+                    height: 76,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: RadialGradient(
+                        colors: [
+                          statusColor.withOpacity(0.55),
+                          statusColor.withOpacity(0.22),
+                        ],
+                      ),
+                      border: Border.all(
+                        color: statusColor.withOpacity(0.75),
+                        width: 1.5,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: statusColor.withOpacity(0.45),
+                          blurRadius: 28,
+                          spreadRadius: 4,
+                        ),
+                      ],
+                    ),
+                    child: Center(
+                      child: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 220),
+                        child: Icon(
+                          _circleStatusIcon(),
+                          key: ValueKey(_circleState),
+                          color: Colors.white,
+                          size: 30,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _openModeBottomSheet() {
+    final menuItems = _modeMenuItems();
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      barrierColor: Colors.black.withOpacity(0.50),
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (sheetCtx) {
+        return _ModePickerSheet(
+          menuItems: menuItems,
+          currentMode: _assistantMode,
+          appLanguage: widget.appLanguage,
+          modeDescriptorFor: _modeDescriptorForAssistantMode,
+          onModeSelected: (mode) async {
+            Navigator.of(sheetCtx).pop();
+            final changed = await _switchAssistantMode(
+              mode,
+              reason: 'mode_picker',
+            );
+            if (changed && mounted) {
+              _triggerFastModeFeedback();
+            }
+          },
+          onActionSelected: (actionId) async {
+            Navigator.of(sheetCtx).pop();
+            await _playEndCue();
+            switch (actionId) {
+              case 'go_home':
+                await _handleGoHomeShortcut(
+                  widget.appLanguage == AppLanguage.kk ? 'үйге' : 'домой',
+                );
+                break;
+              case 'voice_enrollment':
+                await _openWakeEnrollmentSheet();
+                break;
+            }
+          },
+        );
+      },
     );
   }
 
@@ -9587,6 +10108,86 @@ class _AssistantOrb extends StatelessWidget {
               ),
             ),
         ],
+      ),
+    );
+  }
+}
+
+class _ModePickerSheet extends StatelessWidget {
+  const _ModePickerSheet({
+    required this.menuItems,
+    required this.currentMode,
+    required this.appLanguage,
+    required this.modeDescriptorFor,
+    required this.onModeSelected,
+    required this.onActionSelected,
+  });
+
+  final List<_ModeMenuEntry> menuItems;
+  final AssistantMode currentMode;
+  final AppLanguage appLanguage;
+  final ModeDescriptor Function(AssistantMode) modeDescriptorFor;
+  final ValueChanged<AssistantMode> onModeSelected;
+  final ValueChanged<String> onActionSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final isKazakh = appLanguage == AppLanguage.kk;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: Theme.of(context).scaffoldBackgroundColor,
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 16),
+      child: SafeArea(
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Center(
+                child: Container(
+                  height: 4,
+                  width: 40,
+                  margin: const EdgeInsets.only(bottom: 24),
+                  decoration: BoxDecoration(
+                    color: Colors.grey.withOpacity(0.3),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              ...menuItems.map((item) {
+                final isSelected = item.isMode && item.mode == currentMode;
+                final subtitle = (item.isMode && item.mode != null)
+                    ? modeDescriptorFor(item.mode!).ui.shortLabel(isKazakh: isKazakh)
+                    : null;
+
+                return ListTile(
+                  leading: Icon(
+                    item.icon,
+                    color: isSelected ? Theme.of(context).colorScheme.primary : null,
+                  ),
+                  title: Text(
+                    item.label,
+                    style: TextStyle(
+                      fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                      color: isSelected ? Theme.of(context).colorScheme.primary : null,
+                    ),
+                  ),
+                  subtitle: subtitle != null ? Text(subtitle) : null,
+                  onTap: () {
+                    if (item.isMode && item.mode != null) {
+                      onModeSelected(item.mode!);
+                    } else if (item.actionId != null) {
+                      onActionSelected(item.actionId!);
+                    }
+                  },
+                );
+              }),
+            ],
+          ),
+        ),
       ),
     );
   }

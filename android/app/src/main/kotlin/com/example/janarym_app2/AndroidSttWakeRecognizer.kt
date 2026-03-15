@@ -20,14 +20,20 @@ class AndroidSttWakeRecognizer(private val context: Context) {
     private var speechRecognizer: SpeechRecognizer? = null
     private var language: String = "kk-KZ"
     private var partialResults: Boolean = true
+    private var preferOffline: Boolean = true
     private var listening = false
     private var disposed = false
+    private var stopRequested = false
+    private var recreateRecognizerOnNextStart = false
 
     fun initialize(args: Map<String, Any?>) {
         language = args["language"]?.toString()?.ifBlank { "kk-KZ" } ?: "kk-KZ"
         partialResults = args["partialResults"] as? Boolean ?: true
+        preferOffline = args["preferOffline"] as? Boolean ?: true
+        disposed = false
         runOnMain {
-            ensureRecognizer()
+            ensureRecognizer(forceRecreate = recreateRecognizerOnNextStart)
+            recreateRecognizerOnNextStart = false
         }
     }
 
@@ -39,10 +45,18 @@ class AndroidSttWakeRecognizer(private val context: Context) {
                 emitError(SpeechRecognizer.ERROR_CLIENT, "fatal")
                 return@runOnMain
             }
-            ensureRecognizer()
+            stopRequested = false
+            ensureRecognizer(forceRecreate = recreateRecognizerOnNextStart)
+            recreateRecognizerOnNextStart = false
             if (listening) return@runOnMain
+            val recognizer = speechRecognizer
+            if (recognizer == null) {
+                listening = false
+                emitError(SpeechRecognizer.ERROR_CLIENT, "fatal")
+                return@runOnMain
+            }
             try {
-                speechRecognizer?.startListening(buildIntent())
+                recognizer.startListening(buildIntent())
                 listening = true
                 emit(mapOf("status" to "listening", "locale" to language))
             } catch (_: Throwable) {
@@ -54,16 +68,26 @@ class AndroidSttWakeRecognizer(private val context: Context) {
 
     fun stop() {
         runOnMain {
+            stopRequested = true
             listening = false
-            speechRecognizer?.stopListening()
+            try {
+                speechRecognizer?.stopListening()
+            } catch (_: Throwable) {
+                recreateRecognizerOnNextStart = true
+            }
             emit(mapOf("status" to "stopped", "reason" to "stop", "locale" to language))
         }
     }
 
     fun cancel() {
         runOnMain {
+            stopRequested = true
             listening = false
-            speechRecognizer?.cancel()
+            try {
+                speechRecognizer?.cancel()
+            } catch (_: Throwable) {
+                recreateRecognizerOnNextStart = true
+            }
             emit(mapOf("status" to "stopped", "reason" to "cancel", "locale" to language))
         }
     }
@@ -71,6 +95,7 @@ class AndroidSttWakeRecognizer(private val context: Context) {
     fun dispose() {
         runOnMain {
             disposed = true
+            stopRequested = true
             listening = false
             speechRecognizer?.destroy()
             speechRecognizer = null
@@ -83,10 +108,24 @@ class AndroidSttWakeRecognizer(private val context: Context) {
         "locale" to language,
     )
 
-    private fun ensureRecognizer() {
-        if (speechRecognizer != null || disposed) return
+    private fun ensureRecognizer(forceRecreate: Boolean = false) {
+        if (disposed) return
+        if (forceRecreate) {
+            try {
+                speechRecognizer?.destroy()
+            } catch (_: Throwable) {}
+            speechRecognizer = null
+        }
+        if (speechRecognizer != null) return
         if (!isAvailable()) return
-        val recognizer = SpeechRecognizer.createSpeechRecognizer(context)
+        val recognizer = try {
+            SpeechRecognizer.createSpeechRecognizer(context)
+        } catch (_: Throwable) {
+            null
+        }
+        if (recognizer == null) {
+            return
+        }
         recognizer.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
                 emit(mapOf("status" to "ready", "locale" to language))
@@ -99,15 +138,36 @@ class AndroidSttWakeRecognizer(private val context: Context) {
 
             override fun onError(error: Int) {
                 listening = false
+                val expectedStopError =
+                    stopRequested && error == SpeechRecognizer.ERROR_CLIENT
+                stopRequested = false
+                if (expectedStopError) {
+                    emit(
+                        mapOf(
+                            "status" to "stopped",
+                            "reason" to "client_after_stop",
+                            "locale" to language,
+                        ),
+                    )
+                    return
+                }
                 emitError(error, mapErrorReason(error))
+                if (shouldRecreateRecognizer(error)) {
+                    recreateRecognizerOnNextStart = true
+                    ensureRecognizer(forceRecreate = true)
+                }
             }
 
             override fun onResults(results: Bundle?) {
                 listening = false
+                val shouldIgnore = stopRequested
+                stopRequested = false
+                if (shouldIgnore) return
                 emitText("final", results)
             }
 
             override fun onPartialResults(partialResultsBundle: Bundle?) {
+                if (stopRequested || !listening) return
                 emitText("partial", partialResultsBundle)
             }
 
@@ -135,8 +195,26 @@ class AndroidSttWakeRecognizer(private val context: Context) {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, language)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, language)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, partialResults)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, preferOffline)
+            // Allow up to 10 seconds of speech before forcing return
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 2000L)
+            // Wait at least 1500ms of silence before deciding speech is done
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
+            // After speech starts, wait 2000ms of silence before firing possibly-complete
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
+        }
+    }
+
+    private fun shouldRecreateRecognizer(error: Int): Boolean {
+        return when (error) {
+            SpeechRecognizer.ERROR_AUDIO,
+            SpeechRecognizer.ERROR_CLIENT,
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
+            SpeechRecognizer.ERROR_NETWORK,
+            SpeechRecognizer.ERROR_NETWORK_TIMEOUT,
+            SpeechRecognizer.ERROR_SERVER -> true
+            else -> false
         }
     }
 
@@ -167,6 +245,8 @@ class AndroidSttWakeRecognizer(private val context: Context) {
             SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "ERROR_RECOGNIZER_BUSY"
             SpeechRecognizer.ERROR_SERVER -> "ERROR_SERVER"
             SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "ERROR_SPEECH_TIMEOUT"
+            12 -> "ERROR_LANGUAGE_NOT_SUPPORTED"
+            13 -> "ERROR_LANGUAGE_UNAVAILABLE"
             else -> "ERROR_UNKNOWN_$code"
         }
     }
@@ -177,7 +257,12 @@ class AndroidSttWakeRecognizer(private val context: Context) {
             SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "timeout"
             SpeechRecognizer.ERROR_CLIENT -> "client"
             SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "busy"
+            SpeechRecognizer.ERROR_NETWORK,
+            SpeechRecognizer.ERROR_NETWORK_TIMEOUT,
+            SpeechRecognizer.ERROR_SERVER,
+            SpeechRecognizer.ERROR_AUDIO -> "recoverable"
             SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "fatal"
+            12, 13 -> "fatal"
             else -> "fatal"
         }
     }

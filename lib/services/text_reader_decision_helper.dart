@@ -102,17 +102,15 @@ String buildManualCandidateSignature(String text) {
       .allMatches(normalized)
       .map((match) {
         final token = match.group(0) ?? '';
-        final withoutVowels = token.replaceAll(
-          RegExp(r'[aeiouyаеёиоуыэюя]+', unicode: true),
-          '',
-        );
-        final collapsed = withoutVowels.replaceAllMapped(
+        // Keep vowels but collapse repeats and keep first vowel if possible
+        // This is less destructive than stripping all vowels
+        final collapsed = token.replaceAllMapped(
           RegExp(r'(.)\1+', unicode: true),
           (match) => match.group(1) ?? '',
         );
         return collapsed;
       })
-      .where((token) => token.length >= 3)
+      .where((token) => token.length >= 2)
       .toList(growable: false);
   final signature = tokens.take(4).join('_');
   if (signature.length <= 48) {

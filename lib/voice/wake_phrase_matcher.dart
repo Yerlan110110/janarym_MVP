@@ -18,28 +18,57 @@ class WakeMatchResult {
 
 class WakePhraseMatcher {
   static const List<String> _strongForms = <String>[
+    // Exact Kazakh + Latin equivalents
     'жанарым',
     'жан арым',
     'жан а рым',
+    'жана рым',
+    'жанарэм',
     'janarym',
     'zhanarym',
     'zhan a rym',
     'zhan-a-rym',
+    // Common Russian STT phonetic transcriptions
+    'женарым',
+    'женарим',
+    'джанарым',
+    'жанарым',
+    'жанарим',
+    'жанары м',
   ];
 
   static const List<String> _acceptableForms = <String>[
+    // Kazakh close variants
     'жанарим',
     'жанарум',
     'жанар',
     'жанара',
     'жанарм',
     'жанрым',
+    'жана аренда',
+    // Russian STT often splits or mishears
+    'жана',
+    'жанары',
+    'женары',
+    'джанары',
+    'жанаш',
+    'жана рим',
+    'жана рэм',
+    'женарэм',
+    'джанарим',
+    'джаным',
+    'жаным',
+    // Latin equivalents
     'janarim',
     'janarum',
     'janar',
+    'janara',
+    'janary',
     'zhanarim',
     'zhanarum',
     'zhanar',
+    'janara',
+    'djanarym',
   ];
 
   static WakeMatchResult match(String transcript, {bool isPartial = false}) {
@@ -157,14 +186,7 @@ class WakePhraseMatcher {
   static String _normalize(String input) {
     if (input.trim().isEmpty) return '';
     final lower = input.toLowerCase();
-    final lookalike = lower
-        .replaceAll('a', 'а')
-        .replaceAll('o', 'о')
-        .replaceAll('p', 'р')
-        .replaceAll('c', 'с')
-        .replaceAll('y', 'у')
-        .replaceAll('x', 'х');
-    final cleaned = lookalike
+    final cleaned = lower
         .replaceAll(RegExp(r'[^\p{L}\p{N}]+', unicode: true), ' ')
         .replaceAll(RegExp(r'\s+'), ' ')
         .trim();

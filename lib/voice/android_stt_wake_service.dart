@@ -47,6 +47,7 @@ class AndroidSttWakeService {
   Future<void> initialize({
     required String language,
     required bool partialResults,
+    bool preferOffline = true,
   }) async {
     if (defaultTargetPlatform != TargetPlatform.android) {
       return;
@@ -54,6 +55,7 @@ class AndroidSttWakeService {
     await _channel.invokeMethod<void>('initialize', {
       'language': language,
       'partialResults': partialResults,
+      'preferOffline': preferOffline,
     });
   }
 
@@ -91,6 +93,19 @@ class AndroidSttWakeService {
       return;
     }
     await _channel.invokeMethod<void>('dispose');
+  }
+
+  Future<Map<String, dynamic>> status() async {
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      return <String, dynamic>{'status': 'unavailable'};
+    }
+    final raw = await _channel.invokeMethod<dynamic>('status');
+    if (raw is Map) {
+      return raw.map<String, dynamic>(
+        (key, value) => MapEntry(key.toString(), value),
+      );
+    }
+    return <String, dynamic>{'status': 'unknown'};
   }
 
   Stream<SttWakeEvent> get events {
