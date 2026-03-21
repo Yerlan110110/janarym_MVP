@@ -1044,16 +1044,16 @@ class NavigationModeController {
         primary.exactTimes.isNotEmpty) {
       final exactTimes = primary.exactTimes.take(3).join(', ');
       if (_language == AppLanguage.kk) {
-        return 'Кестеге сәйкес, $routeName$directionPart автобусы $cleanStopName аялдамасына $exactTimes уақыттарында келуі тиіс.';
+        return '$cleanStopName аялдамасында $routeName$directionPart: $exactTimes.';
       }
-      return 'По расписанию автобус $routeName$directionPart должен приехать на остановку $cleanStopName в $exactTimes.';
+      return 'На остановке $cleanStopName маршрут $routeName$directionPart: $exactTimes.';
     }
 
     final interval = primary.intervalMinutes ?? 0;
     if (_language == AppLanguage.kk) {
-      return 'Кесте бойынша, $routeName$directionPart автобусы $cleanStopName аялдамасына шамамен әр $interval минут сайын келіп тұрады.';
+      return '$cleanStopName аялдамасында $routeName$directionPart шамамен әр $interval минут сайын жүреді.';
     }
-    return 'По расписанию автобус $routeName$directionPart должен приезжать на остановку $cleanStopName примерно каждые $interval минут.';
+    return 'На остановке $cleanStopName маршрут $routeName$directionPart ходит примерно каждые $interval минут.';
   }
 
   String _normalizeTransitRouteName(String routeName) {
