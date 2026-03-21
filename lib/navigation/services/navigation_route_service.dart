@@ -27,6 +27,8 @@ abstract class NavigationRouteService {
     required String query,
     required NavPoint origin,
     int limit = 3,
+    NavigationDestinationKind destinationKind =
+        NavigationDestinationKind.generic,
   });
 
   Future<RouteBuildResult> buildPedestrianRoute({
@@ -64,21 +66,35 @@ class YandexNavigationRouteService implements NavigationRouteService {
     required String query,
     required NavPoint origin,
     int limit = 3,
+    NavigationDestinationKind destinationKind =
+        NavigationDestinationKind.generic,
   }) async {
     // Interface keeps origin; Astana-only mode intentionally ignores it.
     final _ = origin;
-    final cleanQuery = _normalizeAstanaQuery(query.trim());
+    final cleanQuery = _normalizeAstanaQuery(
+      destinationKind == NavigationDestinationKind.transitStop
+          ? _normalizeTransitStopQuery(query.trim())
+          : query.trim(),
+    );
     if (cleanQuery.isEmpty) return const [];
-    return _searchInAstana(query: cleanQuery, limit: limit);
+    return _searchInAstana(
+      query: cleanQuery,
+      limit: limit,
+      destinationKind: destinationKind,
+    );
   }
 
   Future<List<DestinationCandidate>> _searchInAstana({
     required String query,
     required int limit,
+    required NavigationDestinationKind destinationKind,
   }) async {
     final geometry = Geometry.fromBoundingBox(_astanaBounds);
 
-    final resultPageSize = limit.clamp(1, 7).toInt();
+    final resultPageSize =
+        destinationKind == NavigationDestinationKind.transitStop
+        ? (limit * 2).clamp(4, 8).toInt()
+        : limit.clamp(1, 7).toInt();
     final (session, future) = await YandexSearch.searchByText(
       searchText: query,
       geometry: geometry,
@@ -98,27 +114,38 @@ class YandexNavigationRouteService implements NavigationRouteService {
 
       final items = result.items ?? const <SearchItem>[];
       final candidates = <DestinationCandidate>[];
+      final fallbackCandidates = <DestinationCandidate>[];
 
       for (final item in items) {
         final candidatePoint = _extractPoint(item);
         if (candidatePoint == null) continue;
         if (!_isInsideAstana(candidatePoint)) continue;
-
-        candidates.add(
-          DestinationCandidate(
-            title: item.name.trim().isEmpty
+        final candidate = DestinationCandidate(
+          title: _formatCandidateTitle(
+            item.name.trim().isEmpty
                 ? _l10n.routeTitleFallback
                 : item.name.trim(),
-            subtitle:
-                item.toponymMetadata?.address.formattedAddress.trim() ?? '',
-            point: candidatePoint,
+            destinationKind: destinationKind,
           ),
+          subtitle: item.toponymMetadata?.address.formattedAddress.trim() ?? '',
+          point: candidatePoint,
+          kind: destinationKind,
         );
+        fallbackCandidates.add(candidate);
+        if (destinationKind == NavigationDestinationKind.transitStop &&
+            !_looksLikeTransitStop(item)) {
+          continue;
+        }
+        candidates.add(candidate);
 
         if (candidates.length >= limit) break;
       }
 
-      return candidates;
+      if (candidates.isNotEmpty ||
+          destinationKind != NavigationDestinationKind.transitStop) {
+        return candidates;
+      }
+      return fallbackCandidates.take(limit).toList(growable: false);
     } finally {
       await session.close();
     }
@@ -257,5 +284,44 @@ class YandexNavigationRouteService implements NavigationRouteService {
       return query;
     }
     return '$query, ${_l10n.routeCityAstana}';
+  }
+
+  String _normalizeTransitStopQuery(String query) {
+    final compact = query.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (compact.isEmpty) return compact;
+    final lowered = compact.toLowerCase();
+    if (lowered.contains('останов')) return compact;
+    if (lowered.contains('аялдама')) return compact;
+    if (lowered.contains('bus stop')) return compact;
+    return _language == AppLanguage.kk
+        ? 'аялдама $compact'
+        : 'остановка $compact';
+  }
+
+  bool _looksLikeTransitStop(SearchItem item) {
+    final haystack = <String>[
+      item.name,
+      item.toponymMetadata?.address.formattedAddress ?? '',
+      item.businessMetadata?.name ?? '',
+    ].join(' ').toLowerCase();
+    return haystack.contains('останов') ||
+        haystack.contains('аялдама') ||
+        haystack.contains('bus stop');
+  }
+
+  String _formatCandidateTitle(
+    String rawTitle, {
+    required NavigationDestinationKind destinationKind,
+  }) {
+    final title = rawTitle.trim();
+    if (destinationKind != NavigationDestinationKind.transitStop ||
+        title.isEmpty) {
+      return title;
+    }
+    final lowered = title.toLowerCase();
+    if (lowered.contains('останов') || lowered.contains('аялдама')) {
+      return title;
+    }
+    return _language == AppLanguage.kk ? 'Аялдама $title' : 'Остановка $title';
   }
 }

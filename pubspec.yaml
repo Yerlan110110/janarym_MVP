@@ -86,7 +86,8 @@ flutter:
   uses-material-design: true
   assets:
     - icon.png
-    - .env
+    - .env.example
+    - assets/runtime/
     - assets/legal/
     - assets/keywords/
     - assets/sounds/

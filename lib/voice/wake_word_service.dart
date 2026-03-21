@@ -86,6 +86,8 @@ class WakeWordService {
   WakeWordService({required this.onWakeWordDetected});
 
   final VoidCallback onWakeWordDetected;
+  static bool get _isAndroid =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
   static const MethodChannel _channel = MethodChannel('janarym/wake_word');
   static const EventChannel _events = EventChannel('janarym/wake_word/events');
@@ -120,6 +122,10 @@ class WakeWordService {
   List<String> _activeKeywordLabels = const <String>[];
 
   Future<void> start() async {
+    if (!_isAndroid) {
+      _setUnsupported();
+      return;
+    }
     await _ensureInitialized();
     if (!_initialized) return;
     if (state.value.status == WakeWordStatus.listening) return;
@@ -132,6 +138,7 @@ class WakeWordService {
   }
 
   Future<void> stop() async {
+    if (!_isAndroid) return;
     if (!_initialized) return;
     if (state.value.status == WakeWordStatus.armed) return;
     try {
@@ -143,9 +150,11 @@ class WakeWordService {
   }
 
   Future<void> dispose() async {
-    try {
-      await _channel.invokeMethod<bool>('dispose');
-    } catch (_) {}
+    if (_isAndroid) {
+      try {
+        await _channel.invokeMethod<bool>('dispose');
+      } catch (_) {}
+    }
     await _eventsSub?.cancel();
     _eventsSub = null;
     enrollmentState.dispose();
@@ -154,6 +163,7 @@ class WakeWordService {
   }
 
   Future<bool> hasOwnerProfile() async {
+    if (!_isAndroid) return false;
     try {
       final hasProfile = await _channel.invokeMethod<bool>('hasOwnerProfile');
       return hasProfile ?? false;
@@ -163,6 +173,10 @@ class WakeWordService {
   }
 
   Future<void> startEnrollment({int sampleCount = 8}) async {
+    if (!_isAndroid) {
+      _setUnsupported();
+      return;
+    }
     await _ensureInitialized();
     if (!_initialized) return;
     await _channel.invokeMethod<bool>('startEnrollment', <String, Object?>{
@@ -177,6 +191,7 @@ class WakeWordService {
   }
 
   Future<void> cancelEnrollment() async {
+    if (!_isAndroid) return;
     if (!_initialized) return;
     await _channel.invokeMethod<bool>('cancelEnrollment');
     enrollmentState.value = const WakeEnrollmentState(state: 'cancelled');
@@ -184,6 +199,7 @@ class WakeWordService {
   }
 
   Future<void> clearOwnerProfile() async {
+    if (!_isAndroid) return;
     if (!_initialized) return;
     await _channel.invokeMethod<bool>('clearOwnerProfile');
     enrollmentState.value = const WakeEnrollmentState();
@@ -191,6 +207,10 @@ class WakeWordService {
   }
 
   Future<bool> recover({bool restartListening = true}) async {
+    if (!_isAndroid) {
+      _setUnsupported();
+      return false;
+    }
     try {
       try {
         await _channel.invokeMethod<bool>('stop');
@@ -222,6 +242,10 @@ class WakeWordService {
   }
 
   Future<void> _ensureInitialized() async {
+    if (!_isAndroid) {
+      _setUnsupported();
+      return;
+    }
     if (_initializing) return;
     final payload = await _buildConfigPayload();
     if (payload == null) return;
@@ -260,6 +284,7 @@ class WakeWordService {
   }
 
   Future<void> _attachEventsIfNeeded() async {
+    if (!_isAndroid) return;
     if (_eventsSub != null) return;
     _eventsSub = _events.receiveBroadcastStream().listen(
       _handleNativeEvent,
@@ -579,6 +604,10 @@ class WakeWordService {
           ? 'janarym'
           : _activeKeywordLabels.join(', '),
     );
+  }
+
+  void _setUnsupported() {
+    _setError('Wake word is unavailable on this platform');
   }
 
   void _setState({

@@ -1,3 +1,5 @@
+import 'voice/wake_phrase_matcher.dart';
+
 class LiveCommand {
   final String raw;
   final String intent;
@@ -6,25 +8,8 @@ class LiveCommand {
 }
 
 class LiveRouter {
-  static const _wakeWords = [
-    'жанарым',
-    'жанарим',
-    'жанарум',
-    'жан арым',
-    'жан а рым',
-    'жаным',
-    'janarym',
-    'janarim',
-    'zhanarym',
-    'zhanarim',
-    'zhanarum',
-    'zhan a rym',
-    'zhan-a-rym',
-  ];
-
   bool hasWakeWord(String text) {
-    final t = text.toLowerCase();
-    return _wakeWords.any(t.contains);
+    return WakePhraseMatcher.containsAcceptedWakeWord(text);
   }
 
   LiveCommand? parse(String text) {
@@ -32,11 +17,7 @@ class LiveRouter {
 
     if (!hasWakeWord(t)) return null;
 
-    // убираем wakeword из фразы
-    var cmd = t;
-    for (final w in _wakeWords) {
-      cmd = cmd.replaceAll(w, '').trim();
-    }
+    final cmd = WakePhraseMatcher.stripWakeWords(t).trim();
 
     // intents (минимальный набор; расширяется таблицей ниже)
     if (cmd.contains('что впереди') ||

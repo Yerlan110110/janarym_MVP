@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../runtime/app_log.dart';
@@ -91,6 +92,8 @@ class ReflexEngine {
     'janarym/reflex_detector',
   );
   static const int _trackRetentionMs = 1800;
+  static bool get _isAndroid =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
   final PerceptionEventBus _eventBus;
   final ReflexCaptureFrame _captureLatestFrame;
@@ -114,7 +117,7 @@ class ReflexEngine {
   bool _voicePriority = false;
 
   Future<void> initialize() async {
-    if (_initialized || !_enabled) return;
+    if (_initialized || !_enabled || !_isAndroid) return;
     await _channel.invokeMethod<bool>('initialize', <String, Object?>{
       'scoreThreshold': 0.22,
       'maxResults': 8,
@@ -123,7 +126,7 @@ class ReflexEngine {
   }
 
   Future<void> start() async {
-    if (!_enabled || _running) return;
+    if (!_enabled || _running || !_isAndroid) return;
     await initialize();
     _running = true;
     _restartTimer();
@@ -157,7 +160,7 @@ class ReflexEngine {
 
   Future<void> dispose() async {
     await stop();
-    if (_initialized) {
+    if (_initialized && _isAndroid) {
       try {
         await _channel.invokeMethod<bool>('dispose');
       } catch (_) {}
@@ -212,6 +215,7 @@ class ReflexEngine {
             : _normalInterval);
 
   Future<List<dynamic>> _detectNative(CameraFrameSnapshot frame) async {
+    if (!_isAndroid) return const <dynamic>[];
     final raw = await _channel.invokeMethod<List<dynamic>>(
       'detect',
       <String, Object?>{

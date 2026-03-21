@@ -46,21 +46,143 @@ void main() {
       expect(fallback, isEmpty);
     });
 
-    test('builds stable signature for weak repeated candidates', () {
+    test('builds non-empty fuzzy signatures for weak repeated candidates', () {
       final first = buildManualCandidateSignature('УТО CAenaTb сеńуас:');
       final second = buildManualCandidateSignature('УТО CnenaTb сеń4ас:');
 
       expect(first, isNotEmpty);
-      expect(first, equals(second));
+      expect(second, isNotEmpty);
+      expect(first.split('_').first, equals(second.split('_').first));
+      expect(first.split('_').length, equals(second.split('_').length));
     });
 
-    test('accepts weak manual candidate when it is stable', () {
+    test('rejects weak pseudo-russian candidate even when it is stable', () {
       expect(
         shouldAcceptWeakManualCandidate(
           score: 26.8,
           hasStructuredData: false,
-          text: 'УТО CAenaTb сеńуас:',
+          text: 'YTO CAenaTb ceńуас',
           stableRepeats: 3,
+          dominantScript: DetectedTextScript.mixed,
+          looksPseudoRussianOcr: true,
+        ),
+        isFalse,
+      );
+    });
+
+    test('prefers vision fallback for suspicious mixed OCR', () {
+      final assessment = assessTextReaderCandidate(
+        rawText: 'YTO CAenaTb nepesanycTM npunoKeHMe',
+        resolvedText: 'YTO CAenaTb nepesanycTM npunoKeHMe',
+        manualSpeechLinesCount: 2,
+        rawDominantScript: DetectedTextScript.mixed,
+        effectiveScript: DetectedTextScript.mixed,
+        hasStructuredData: false,
+        stableRepeats: 2,
+        acceptScore: 35,
+        allowVisionFallback: true,
+      );
+
+      expect(assessment.suspicious, isTrue);
+      expect(
+        assessment.disposition,
+        TextReaderCandidateDisposition.visionFallback,
+      );
+    });
+
+    test('keeps suspicious structured OCR in structured-only mode', () {
+      final assessment = assessTextReaderCandidate(
+        rawText: 'YTO 350 KZT',
+        resolvedText: 'Цена 350 тенге',
+        manualSpeechLinesCount: 1,
+        rawDominantScript: DetectedTextScript.mixed,
+        effectiveScript: DetectedTextScript.cyrillic,
+        hasStructuredData: true,
+        stableRepeats: 1,
+        acceptScore: 35,
+        allowVisionFallback: true,
+      );
+
+      expect(assessment.structuredOnlyAccepted, isTrue);
+      expect(
+        assessment.disposition,
+        TextReaderCandidateDisposition.structuredOnly,
+      );
+    });
+
+    test('accepts clear cyrillic candidate for on-device speech', () {
+      final assessment = assessTextReaderCandidate(
+        rawText: 'Что сделать сейчас полностью перезапусти приложение',
+        resolvedText: 'Что сделать сейчас полностью перезапусти приложение',
+        manualSpeechLinesCount: 2,
+        rawDominantScript: DetectedTextScript.cyrillic,
+        effectiveScript: DetectedTextScript.cyrillic,
+        hasStructuredData: false,
+        stableRepeats: 2,
+        acceptScore: 35,
+        allowVisionFallback: true,
+      );
+
+      expect(assessment.acceptsDirectSpeech, isTrue);
+      expect(
+        assessment.disposition,
+        TextReaderCandidateDisposition.speakOnDevice,
+      );
+    });
+
+    test('aggressive short-text mode accepts short stable cyrillic text', () {
+      final assessment = assessTextReaderCandidate(
+        rawText: 'аптека',
+        resolvedText: 'аптека',
+        manualSpeechLinesCount: 1,
+        rawDominantScript: DetectedTextScript.cyrillic,
+        effectiveScript: DetectedTextScript.cyrillic,
+        hasStructuredData: false,
+        stableRepeats: 2,
+        acceptScore: 24,
+        allowVisionFallback: true,
+        aggressiveShortText: true,
+      );
+
+      expect(assessment.acceptsDirectSpeech, isTrue);
+      expect(
+        assessment.disposition,
+        TextReaderCandidateDisposition.speakOnDevice,
+      );
+    });
+
+    test('aggressive fallback keeps short cyrillic text for manual speech', () {
+      final fallback = buildManualFallbackText(
+        'аптека',
+        aggressiveShortText: true,
+      );
+
+      expect(fallback, equals('аптека'));
+    });
+
+    test('aggressive weak acceptance rejects short single-token OCR', () {
+      expect(
+        shouldAcceptWeakManualCandidate(
+          score: 22,
+          hasStructuredData: false,
+          text: 'аптека',
+          stableRepeats: 2,
+          dominantScript: DetectedTextScript.cyrillic,
+          aggressiveShortText: true,
+        ),
+        isFalse,
+      );
+    });
+
+    test('aggressive weak acceptance keeps longer stable multi-token text', () {
+      expect(
+        shouldAcceptWeakManualCandidate(
+          score: 24,
+          hasStructuredData: false,
+          text: 'режим чтения',
+          stableRepeats: 3,
+          dominantScript: DetectedTextScript.cyrillic,
+          aggressiveShortText: true,
         ),
         isTrue,
       );

@@ -34,6 +34,8 @@ void main() {
         warningIntensity: 3,
         onboardingCompleted: false,
         onboardingStep: 4,
+        onboardingDeferredUntilEpochMs:
+            now + const Duration(hours: 1).inMilliseconds,
         createdAtEpochMs: now,
         updatedAtEpochMs: now,
       );
@@ -46,6 +48,10 @@ void main() {
       expect(loaded.responseLength, ResponseLength.short);
       expect(loaded.toneStyle, ToneStyle.direct);
       expect(loaded.warningIntensity, 3);
+      expect(
+        loaded.onboardingDeferredUntilEpochMs,
+        now + const Duration(hours: 1).inMilliseconds,
+      );
     });
 
     test('stores fears and labels', () async {

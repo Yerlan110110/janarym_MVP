@@ -7,6 +7,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../l10n/app_locale_controller.dart';
 import '../l10n/app_localizations.dart';
 import 'models/navigation_mode_state.dart';
+import 'services/dgis_transit_service.dart';
 import 'services/instruction_engine.dart';
 import 'services/location_provider.dart';
 import 'services/navigation_route_service.dart';
@@ -32,11 +33,14 @@ class NavigationRouteBuiltEvent {
   final NavPoint destination;
 }
 
+enum _PendingCandidateAction { routeBuild, stopRoutes, stopSchedule }
+
 class NavigationModeController {
   NavigationModeController({
     required NavigationSpeakFn speak,
     NavigationLogFn? log,
     NavigationRouteService? routeService,
+    NavigationTransitService? transitService,
     NavigationLocationProvider? locationProvider,
     InstructionEngine? instructionEngine,
     Future<bool> Function(Uri uri, {LaunchMode mode})? launchUrlFn,
@@ -46,6 +50,7 @@ class NavigationModeController {
   }) : _speak = speak,
        _log = log ?? debugPrint,
        _routeService = routeService ?? YandexNavigationRouteService(),
+       _transitService = transitService ?? DgisTransitService(),
        _locationProvider =
            locationProvider ?? const GeolocatorNavigationLocationProvider(),
        _instructionEngine = instructionEngine ?? InstructionEngine(),
@@ -62,11 +67,13 @@ class NavigationModeController {
        _language = language {
     _instructionEngine.setLanguage(language);
     _routeService.setLanguage(language);
+    _transitService.setLanguage(language);
   }
 
   final NavigationSpeakFn _speak;
   final NavigationLogFn _log;
   final NavigationRouteService _routeService;
+  final NavigationTransitService _transitService;
   final NavigationLocationProvider _locationProvider;
   final InstructionEngine _instructionEngine;
   final Future<bool> Function(Uri uri, {LaunchMode mode}) _launchUrlFn;
@@ -87,6 +94,9 @@ class NavigationModeController {
   bool _rerouteInProgress = false;
   String _lastRouteQuery = '';
   String _lastRouteSource = 'manual';
+  _PendingCandidateAction _pendingCandidateAction =
+      _PendingCandidateAction.routeBuild;
+  String? _pendingTransitRouteName;
 
   AppLocalizations get _l10n => lookupAppLocalizations(_language.locale);
 
@@ -95,6 +105,7 @@ class NavigationModeController {
     _language = language;
     _instructionEngine.setLanguage(language);
     _routeService.setLanguage(language);
+    _transitService.setLanguage(language);
   }
 
   void setInstructionAdapter(NavigationInstructionAdapter? adapter) {
@@ -153,6 +164,7 @@ class NavigationModeController {
     _lastRouteQuery = '';
     _lastRerouteAt = null;
     _rerouteInProgress = false;
+    _clearPendingCandidateAction();
 
     _setState(
       NavigationModeState.initial.copyWith(navStatus: NavigationStatus.idle),
@@ -162,6 +174,19 @@ class NavigationModeController {
   }
 
   Future<void> startRoute(String query, {String source = 'manual'}) async {
+    return startRouteWithKind(
+      query,
+      source: source,
+      destinationKind: NavigationDestinationKind.generic,
+    );
+  }
+
+  Future<void> startRouteWithKind(
+    String query, {
+    String source = 'manual',
+    NavigationDestinationKind destinationKind =
+        NavigationDestinationKind.generic,
+  }) async {
     if (!state.value.modeEnabled) {
       await _speak(_l10n.navEnableFirst);
       return;
@@ -190,10 +215,11 @@ class NavigationModeController {
     );
 
     try {
-      final candidates = await _routeService.searchCandidates(
+      final candidates = await _resolveCandidates(
         query: cleanQuery,
         origin: origin,
         limit: 3,
+        destinationKind: destinationKind,
       );
 
       if (candidates.isEmpty) {
@@ -212,6 +238,8 @@ class NavigationModeController {
         return;
       }
 
+      _pendingCandidateAction = _PendingCandidateAction.routeBuild;
+      _pendingTransitRouteName = null;
       _setState(
         state.value.copyWith(
           navStatus: NavigationStatus.awaitingChoice,
@@ -228,6 +256,16 @@ class NavigationModeController {
       }
       buffer.write(_l10n.navSayOptionFirstSecondThird);
       await _speak(buffer.toString());
+    } on TransitServiceUnavailable catch (error) {
+      _log('[NAV] transit stop lookup unavailable: $error');
+      _setState(
+        state.value.copyWith(
+          navStatus: NavigationStatus.error,
+          error: error.toString(),
+          clearActiveRoute: true,
+        ),
+      );
+      await _speak(_transitUnavailableMessage());
     } catch (error) {
       _log('[NAV] start error: $error');
       await _handleRouteBuildFailure(error.toString());
@@ -245,7 +283,25 @@ class NavigationModeController {
       await _speak(_l10n.navInvalidVariantNumber);
       return;
     }
-    await _buildRoute(candidates[index]);
+    final selected = candidates[index];
+    switch (_pendingCandidateAction) {
+      case _PendingCandidateAction.routeBuild:
+        await _buildRoute(selected);
+        return;
+      case _PendingCandidateAction.stopRoutes:
+        _clearPendingCandidateAction();
+        await _announceStopRoutes(selected);
+        return;
+      case _PendingCandidateAction.stopSchedule:
+        final routeName = _pendingTransitRouteName;
+        _clearPendingCandidateAction();
+        if (routeName == null || routeName.trim().isEmpty) {
+          await _speak(_transitUnavailableMessage());
+          return;
+        }
+        await _announceStopSchedule(selected, routeName.trim());
+        return;
+    }
   }
 
   Future<void> rejectCandidateSelection() async {
@@ -265,6 +321,7 @@ class NavigationModeController {
         clearLastInstruction: true,
       ),
     );
+    _clearPendingCandidateAction();
     _log('[NAV] candidates rejected');
     await _speak(_l10n.navDictateAnotherAddress);
   }
@@ -273,6 +330,7 @@ class NavigationModeController {
     final hasRoute = state.value.activeRoute != null;
     _offRouteSince = null;
     _rerouteInProgress = false;
+    _clearPendingCandidateAction();
 
     if (hasRoute) {
       _setState(
@@ -346,19 +404,90 @@ class NavigationModeController {
     await _speak(prompt);
   }
 
+  Future<void> speakStopRoutes(String query) async {
+    if (!state.value.modeEnabled) {
+      await _speak(_l10n.navEnableFirst);
+      return;
+    }
+    final stopQuery = query.trim();
+    if (stopQuery.isEmpty) {
+      await _speak(_transitSayStopNamePrompt());
+      return;
+    }
+    try {
+      final candidates = await _resolveTransitStops(stopQuery, limit: 3);
+      if (candidates.isEmpty) {
+        await _speak(_transitStopNotFoundMessage(stopQuery));
+        return;
+      }
+      if (candidates.length == 1) {
+        await _announceStopRoutes(candidates.first);
+        return;
+      }
+      _pendingCandidateAction = _PendingCandidateAction.stopRoutes;
+      _pendingTransitRouteName = null;
+      await _speakCandidateChoices(candidates);
+    } on TransitServiceUnavailable catch (error) {
+      _log('[TRANSIT] routes unavailable: $error');
+      await _speak(_transitUnavailableMessage());
+    } catch (error) {
+      _log('[TRANSIT] routes error: $error');
+      await _speak(_transitUnavailableMessage());
+    }
+  }
+
+  Future<void> speakScheduledArrivals({
+    required String stopQuery,
+    required String routeName,
+  }) async {
+    if (!state.value.modeEnabled) {
+      await _speak(_l10n.navEnableFirst);
+      return;
+    }
+    final cleanStopQuery = stopQuery.trim();
+    final cleanRouteName = routeName.trim();
+    if (cleanStopQuery.isEmpty || cleanRouteName.isEmpty) {
+      await _speak(_transitSchedulePrompt());
+      return;
+    }
+    try {
+      final candidates = await _resolveTransitStops(cleanStopQuery, limit: 3);
+      if (candidates.isEmpty) {
+        await _speak(_transitStopNotFoundMessage(cleanStopQuery));
+        return;
+      }
+      if (candidates.length == 1) {
+        await _announceStopSchedule(candidates.first, cleanRouteName);
+        return;
+      }
+      _pendingCandidateAction = _PendingCandidateAction.stopSchedule;
+      _pendingTransitRouteName = cleanRouteName;
+      await _speakCandidateChoices(candidates);
+    } on TransitServiceUnavailable catch (error) {
+      _log('[TRANSIT] schedule unavailable: $error');
+      await _speak(_transitUnavailableMessage());
+    } catch (error) {
+      _log('[TRANSIT] schedule error: $error');
+      await _speak(_transitUnavailableMessage());
+    }
+  }
+
   Future<DestinationCandidate?> resolveDestinationCandidate(
-    String query,
-  ) async {
+    String query, {
+    NavigationDestinationKind destinationKind =
+        NavigationDestinationKind.generic,
+  }) async {
     final cleanQuery = query.trim();
     if (cleanQuery.isEmpty) return null;
     final hasPermission = await _locationProvider.ensurePermission();
     if (!hasPermission) return null;
     final origin = await _ensureCurrentLocation();
     if (origin == null) return null;
-    final candidates = await _routeService.searchCandidates(
+    final candidates = await _resolveCandidates(
       query: cleanQuery,
       origin: origin,
       limit: 1,
+      destinationKind: destinationKind,
     );
     if (candidates.isEmpty) return null;
     return candidates.first;
@@ -367,6 +496,7 @@ class NavigationModeController {
   Future<void> dispose() async {
     await _positionSubscription?.cancel();
     _positionSubscription = null;
+    _transitService.dispose();
     state.dispose();
   }
 
@@ -530,15 +660,16 @@ class NavigationModeController {
     final destinationDistance = distanceMeters(point, route.destination.point);
     if (destinationDistance <= 16) {
       _log('[NAV] completed');
+      final arrivalMessage = _arrivalMessageForDestination(route.destination);
       _setState(
         state.value.copyWith(
           navStatus: NavigationStatus.completed,
           clearActiveRoute: true,
-          lastInstruction: _l10n.navArrivedDestination,
+          lastInstruction: arrivalMessage,
           candidates: const [],
         ),
       );
-      unawaited(_speak(_l10n.navArrivedDestination));
+      unawaited(_speak(arrivalMessage));
       return;
     }
 
@@ -691,5 +822,307 @@ class NavigationModeController {
     final adapted = adapter(text).trim();
     if (adapted.isEmpty) return text;
     return adapted;
+  }
+
+  String _arrivalMessageForDestination(DestinationCandidate destination) {
+    if (destination.kind != NavigationDestinationKind.transitStop) {
+      return _l10n.navArrivedDestination;
+    }
+    final rawLabel = destination.title.trim().isNotEmpty
+        ? destination.title.trim()
+        : destination.displayLabel.trim();
+    final label = _stripStopPrefix(rawLabel);
+    if (_language == AppLanguage.kk) {
+      return 'Сіз $label аялдамасына келдіңіз.';
+    }
+    return 'Вы у остановки $label.';
+  }
+
+  Future<List<DestinationCandidate>> _resolveCandidates({
+    required String query,
+    required NavPoint origin,
+    required int limit,
+    required NavigationDestinationKind destinationKind,
+  }) async {
+    if (destinationKind != NavigationDestinationKind.transitStop) {
+      _pendingCandidateAction = _PendingCandidateAction.routeBuild;
+      _pendingTransitRouteName = null;
+      return _routeService.searchCandidates(
+        query: query,
+        origin: origin,
+        limit: limit,
+        destinationKind: destinationKind,
+      );
+    }
+    return _resolveTransitStops(query, limit: limit);
+  }
+
+  Future<List<DestinationCandidate>> _resolveTransitStops(
+    String query, {
+    int limit = 3,
+  }) async {
+    final origin =
+        state.value.currentLocation ?? await _ensureCurrentLocation();
+    final nearLocation = origin ?? _astanaFallbackLocation();
+    final stops = await _transitService.searchStops(
+      query: query,
+      nearLocation: nearLocation,
+      limit: limit,
+    );
+    return stops
+        .map(
+          (stop) => DestinationCandidate(
+            title: stop.title,
+            subtitle: stop.subtitle,
+            point: stop.point,
+            kind: NavigationDestinationKind.transitStop,
+            transitStop: stop,
+          ),
+        )
+        .toList(growable: false);
+  }
+
+  Future<void> _speakCandidateChoices(
+    List<DestinationCandidate> candidates,
+  ) async {
+    _setState(
+      state.value.copyWith(
+        navStatus: NavigationStatus.awaitingChoice,
+        candidates: candidates,
+        clearError: true,
+      ),
+    );
+
+    final buffer = StringBuffer('${_l10n.navFoundMultipleVariantsIntro} ');
+    for (var i = 0; i < candidates.length; i++) {
+      buffer.write(
+        '${_l10n.navVariantItem(i + 1, _candidatePromptLabel(candidates[i]))} ',
+      );
+    }
+    buffer.write(_l10n.navSayOptionFirstSecondThird);
+    await _speak(buffer.toString());
+  }
+
+  Future<void> _announceStopRoutes(DestinationCandidate candidate) async {
+    final stop = candidate.transitStop;
+    if (stop == null) {
+      await _speak(_transitUnavailableMessage());
+      return;
+    }
+    final routes = await _transitService.getStopRoutes(
+      stop: stop,
+      nearLocation: state.value.currentLocation,
+    );
+    if (routes.isEmpty) {
+      final message = _transitStopRoutesUnavailableMessage(candidate.title);
+      _setState(
+        state.value.copyWith(lastInstruction: message, clearError: true),
+      );
+      await _speak(message);
+      return;
+    }
+
+    final labels = routes
+        .map((route) => _routeLabel(route))
+        .toList(growable: false);
+    final preview = labels.take(6).join(', ');
+    final extra = labels.length > 6
+        ? _transitExtraRoutesSuffix(labels.length - 6)
+        : '';
+    final cleanStopName = _stripStopPrefix(candidate.title);
+    final message = _language == AppLanguage.kk
+        ? '$cleanStopName аялдамасында: $preview$extra.'
+        : 'На остановке $cleanStopName: $preview$extra.';
+    _setState(state.value.copyWith(lastInstruction: message, clearError: true));
+    await _speak(message);
+  }
+
+  Future<void> _announceStopSchedule(
+    DestinationCandidate candidate,
+    String routeName,
+  ) async {
+    final stop = candidate.transitStop;
+    if (stop == null) {
+      await _speak(_transitUnavailableMessage());
+      return;
+    }
+
+    final routes = await _transitService.getStopRoutes(
+      stop: stop,
+      nearLocation: state.value.currentLocation,
+    );
+    final normalizedRouteName = _normalizeTransitRouteName(routeName);
+    final matchingRoute = routes.where((route) {
+      return _normalizeTransitRouteName(route.displayName) ==
+          normalizedRouteName;
+    }).toList();
+    if (matchingRoute.isEmpty) {
+      final message = _transitRouteMissingAtStopMessage(
+        routeName: routeName,
+        stopName: candidate.title,
+      );
+      _setState(
+        state.value.copyWith(lastInstruction: message, clearError: true),
+      );
+      await _speak(message);
+      return;
+    }
+
+    final entries = await _transitService.getScheduledArrivals(
+      stop: stop,
+      routeName: routeName,
+      nearLocation: state.value.currentLocation,
+    );
+    if (entries.isEmpty) {
+      final message = _transitScheduleUnavailableMessage(
+        routeName: routeName,
+        stopName: candidate.title,
+      );
+      _setState(
+        state.value.copyWith(lastInstruction: message, clearError: true),
+      );
+      await _speak(message);
+      return;
+    }
+
+    final message = _formatTransitScheduleMessage(
+      stopName: candidate.title,
+      routeName: routeName,
+      entries: entries,
+    );
+    _setState(state.value.copyWith(lastInstruction: message, clearError: true));
+    await _speak(message);
+  }
+
+  void _clearPendingCandidateAction() {
+    _pendingCandidateAction = _PendingCandidateAction.routeBuild;
+    _pendingTransitRouteName = null;
+  }
+
+  NavPoint _astanaFallbackLocation() {
+    return const NavPoint(latitude: 51.1284, longitude: 71.4304);
+  }
+
+  String _routeLabel(TransitRouteSummary route) {
+    final name = route.displayName.trim();
+    final type = route.transportType.trim().toLowerCase();
+    if (type.isEmpty) return name;
+    if (_language == AppLanguage.kk) {
+      if (type.contains('bus')) return 'автобус $name';
+      if (type.contains('tram')) return 'трамвай $name';
+      if (type.contains('trolley')) return 'троллейбус $name';
+      if (type.contains('shuttle')) return 'маршрутка $name';
+      return '$type $name';
+    }
+    if (type.contains('bus')) return 'автобус $name';
+    if (type.contains('tram')) return 'трамвай $name';
+    if (type.contains('trolley')) return 'троллейбус $name';
+    if (type.contains('shuttle')) return 'маршрутка $name';
+    return '$type $name';
+  }
+
+  String _formatTransitScheduleMessage({
+    required String stopName,
+    required String routeName,
+    required List<TransitScheduleEntry> entries,
+  }) {
+    final primary = entries.first;
+    final direction = primary.destinationLabel.trim();
+    final directionPart = direction.isEmpty
+        ? ''
+        : _language == AppLanguage.kk
+        ? ' $direction бағытымен'
+        : ' в сторону $direction';
+    final cleanStopName = _stripStopPrefix(stopName);
+    if (primary.sourceType == TransitScheduleSourceType.precise &&
+        primary.exactTimes.isNotEmpty) {
+      final exactTimes = primary.exactTimes.take(3).join(', ');
+      if (_language == AppLanguage.kk) {
+        return '$cleanStopName аялдамасында $routeName$directionPart: $exactTimes.';
+      }
+      return 'На остановке $cleanStopName маршрут $routeName$directionPart: $exactTimes.';
+    }
+
+    final interval = primary.intervalMinutes ?? 0;
+    if (_language == AppLanguage.kk) {
+      return '$cleanStopName аялдамасында $routeName$directionPart шамамен әр $interval минут сайын жүреді.';
+    }
+    return 'На остановке $cleanStopName маршрут $routeName$directionPart ходит примерно каждые $interval минут.';
+  }
+
+  String _normalizeTransitRouteName(String routeName) {
+    return routeName.replaceAll(RegExp(r'[\s-]+'), '').toUpperCase();
+  }
+
+  String _transitUnavailableMessage() {
+    return _language == AppLanguage.kk
+        ? 'Қазір аялдамалар мен кесте деректері уақытша қолжетімсіз.'
+        : 'Сейчас данные по остановкам и расписанию временно недоступны.';
+  }
+
+  String _transitStopNotFoundMessage(String stopQuery) {
+    return _language == AppLanguage.kk
+        ? '$stopQuery аялдамасын таба алмадым.'
+        : 'Не удалось найти остановку $stopQuery.';
+  }
+
+  String _transitSayStopNamePrompt() {
+    return _language == AppLanguage.kk
+        ? 'Аялдама атауын айтыңыз.'
+        : 'Скажите название остановки.';
+  }
+
+  String _transitSchedulePrompt() {
+    return _language == AppLanguage.kk
+        ? 'Автобус нөмірін және аялдама атауын айтыңыз.'
+        : 'Скажите номер автобуса и название остановки.';
+  }
+
+  String _transitStopRoutesUnavailableMessage(String stopName) {
+    final cleanStopName = _stripStopPrefix(stopName);
+    return _language == AppLanguage.kk
+        ? '$cleanStopName аялдамасы бойынша маршруттар тізімін ала алмадым.'
+        : 'Не удалось получить список маршрутов для остановки $cleanStopName.';
+  }
+
+  String _transitRouteMissingAtStopMessage({
+    required String routeName,
+    required String stopName,
+  }) {
+    final cleanStopName = _stripStopPrefix(stopName);
+    return _language == AppLanguage.kk
+        ? '$routeName бағыты $cleanStopName аялдамасында табылмады.'
+        : 'Маршрут $routeName не найден на остановке $cleanStopName.';
+  }
+
+  String _transitScheduleUnavailableMessage({
+    required String routeName,
+    required String stopName,
+  }) {
+    final cleanStopName = _stripStopPrefix(stopName);
+    return _language == AppLanguage.kk
+        ? '$routeName бағыты үшін $cleanStopName аялдамасындағы кестені ала алмадым.'
+        : 'Не удалось получить расписание для маршрута $routeName на остановке $cleanStopName.';
+  }
+
+  String _transitExtraRoutesSuffix(int extraCount) {
+    if (extraCount <= 0) return '';
+    if (_language == AppLanguage.kk) {
+      return ' және тағы $extraCount';
+    }
+    return ' и ещё $extraCount';
+  }
+
+  String _stripStopPrefix(String label) {
+    return label
+        .replaceFirst(
+          RegExp(
+            r'^(остановка|аялдама)\s+',
+            caseSensitive: false,
+            unicode: true,
+          ),
+          '',
+        )
+        .trim();
   }
 }

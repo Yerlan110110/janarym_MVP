@@ -6,7 +6,7 @@ class PersonalizationDatabase {
     : _databaseFactory = dbFactory ?? databaseFactory,
       _databaseName = databaseName ?? _defaultDbName;
 
-  static const int schemaVersion = 2;
+  static const int schemaVersion = 3;
   static const String _defaultDbName = 'janarym_personalization_v1.db';
 
   final DatabaseFactory _databaseFactory;
@@ -39,6 +39,9 @@ class PersonalizationDatabase {
     if (version >= 2) {
       await _migrateToV2(db);
     }
+    if (version >= 3) {
+      await _migrateToV3(db);
+    }
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
@@ -47,6 +50,9 @@ class PersonalizationDatabase {
     }
     if (oldVersion < 2) {
       await _migrateToV2(db);
+    }
+    if (oldVersion < 3) {
+      await _migrateToV3(db);
     }
   }
 
@@ -290,6 +296,13 @@ class PersonalizationDatabase {
     ''');
     await db.execute(
       'CREATE INDEX IF NOT EXISTS idx_ocr_reads_kind ON ocr_reads(read_kind);',
+    );
+  }
+
+  Future<void> _migrateToV3(DatabaseExecutor db) async {
+    await db.execute(
+      'ALTER TABLE user_profile '
+      'ADD COLUMN onboarding_deferred_until INTEGER',
     );
   }
 

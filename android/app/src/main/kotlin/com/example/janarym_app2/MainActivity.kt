@@ -35,6 +35,9 @@ class MainActivity : FlutterActivity() {
     val wakeEngine = getWakeEngine()
     val reflexDetector = getReflexDetector()
     val sttWakeRecognizer = getSttWakeRecognizer()
+    val wakeCuePlayer = getWakeCuePlayer()
+
+    wakeCuePlayer.preload()
 
     MethodChannel(
       flutterEngine.dartExecutor.binaryMessenger,
@@ -133,6 +136,17 @@ class MainActivity : FlutterActivity() {
         }
         "isAvailable" -> result.success(sttWakeRecognizer.isAvailable())
         "status" -> result.success(sttWakeRecognizer.status())
+        else -> result.notImplemented()
+      }
+    }
+
+    MethodChannel(
+      flutterEngine.dartExecutor.binaryMessenger,
+      WAKE_CUE_CHANNEL,
+    ).setMethodCallHandler { call, result ->
+      when (call.method) {
+        "preload" -> result.success(wakeCuePlayer.preload())
+        "play" -> result.success(wakeCuePlayer.play())
         else -> result.notImplemented()
       }
     }
@@ -242,6 +256,8 @@ class MainActivity : FlutterActivity() {
       sttWakeRecognizer = null
       reflexDetector?.dispose()
       reflexDetector = null
+      wakeCuePlayer?.release()
+      wakeCuePlayer = null
       reflexExecutor?.shutdownNow()
       reflexExecutor = null
     }
@@ -254,10 +270,12 @@ class MainActivity : FlutterActivity() {
     private const val WAKE_EVENTS_CHANNEL = "janarym/wake_word/events"
     private const val STT_WAKE_CHANNEL = "janarym/stt_wake"
     private const val STT_WAKE_EVENTS_CHANNEL = "janarym/stt_wake/events"
+    private const val WAKE_CUE_CHANNEL = "janarym/wake_cue"
     private const val REFLEX_CHANNEL = "janarym/reflex_detector"
     @Volatile private var wakeEngine: NativeWakeWordEngine? = null
     @Volatile private var sttWakeRecognizer: AndroidSttWakeRecognizer? = null
     @Volatile private var reflexDetector: ReflexNativeDetector? = null
+    @Volatile private var wakeCuePlayer: AndroidWakeCuePlayer? = null
     @Volatile private var reflexExecutor: ExecutorService? = null
   }
 
@@ -297,6 +315,16 @@ class MainActivity : FlutterActivity() {
     return synchronized(MainActivity::class.java) {
       reflexExecutor ?: Executors.newSingleThreadExecutor().also {
         reflexExecutor = it
+      }
+    }
+  }
+
+  private fun getWakeCuePlayer(): AndroidWakeCuePlayer {
+    val existing = wakeCuePlayer
+    if (existing != null) return existing
+    return synchronized(MainActivity::class.java) {
+      wakeCuePlayer ?: AndroidWakeCuePlayer(applicationContext).also {
+        wakeCuePlayer = it
       }
     }
   }

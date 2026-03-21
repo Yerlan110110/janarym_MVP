@@ -43,6 +43,7 @@ class UserProfile {
     this.warningIntensity = 2,
     this.onboardingCompleted = false,
     this.onboardingStep = 0,
+    this.onboardingDeferredUntilEpochMs,
     this.confirmAddressBeforeRoute = true,
     this.preferSaferRoute = true,
     required this.createdAtEpochMs,
@@ -56,6 +57,7 @@ class UserProfile {
   final int warningIntensity;
   final bool onboardingCompleted;
   final int onboardingStep;
+  final int? onboardingDeferredUntilEpochMs;
   final bool confirmAddressBeforeRoute;
   final bool preferSaferRoute;
   final int createdAtEpochMs;
@@ -76,6 +78,7 @@ class UserProfile {
     int? warningIntensity,
     bool? onboardingCompleted,
     int? onboardingStep,
+    Object? onboardingDeferredUntilEpochMs = _noChange,
     bool? confirmAddressBeforeRoute,
     bool? preferSaferRoute,
     int? createdAtEpochMs,
@@ -89,6 +92,10 @@ class UserProfile {
       warningIntensity: warningIntensity ?? this.warningIntensity,
       onboardingCompleted: onboardingCompleted ?? this.onboardingCompleted,
       onboardingStep: onboardingStep ?? this.onboardingStep,
+      onboardingDeferredUntilEpochMs:
+          onboardingDeferredUntilEpochMs == _noChange
+          ? this.onboardingDeferredUntilEpochMs
+          : onboardingDeferredUntilEpochMs as int?,
       confirmAddressBeforeRoute:
           confirmAddressBeforeRoute ?? this.confirmAddressBeforeRoute,
       preferSaferRoute: preferSaferRoute ?? this.preferSaferRoute,
@@ -96,6 +103,8 @@ class UserProfile {
       updatedAtEpochMs: updatedAtEpochMs ?? this.updatedAtEpochMs,
     );
   }
+
+  static const Object _noChange = Object();
 }
 
 class UserFear {

@@ -34,6 +34,10 @@ void main() {
         ),
         'Upgrade to Dev Mode',
       );
+      expect(
+        TextReadingNormalizer.normalizeForRussianSpeech('Upgrade to Dev Mode'),
+        'Upgrade to Dev Mode',
+      );
     });
 
     test('uses english tts only for clearly english text', () {
@@ -42,11 +46,23 @@ void main() {
         isTrue,
       );
       expect(
+        TextReadingNormalizer.shouldUseEnglishTts('Toyota service mode'),
+        isTrue,
+      );
+      expect(
         TextReadingNormalizer.shouldUseEnglishTts('YTO CAenaTb ceiyac'),
         isFalse,
       );
       expect(
+        TextReadingNormalizer.shouldUseEnglishTts('KAMEPA'),
+        isFalse,
+      );
+      expect(
         TextReadingNormalizer.shouldUseEnglishTts('Что сделать сейчас'),
+        isFalse,
+      );
+      expect(
+        TextReadingNormalizer.shouldUseEnglishTts('Dev Мode'),
         isFalse,
       );
     });

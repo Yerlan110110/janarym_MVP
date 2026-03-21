@@ -17,59 +17,121 @@ class WakeMatchResult {
 }
 
 class WakePhraseMatcher {
-  static const List<String> _strongForms = <String>[
-    // Exact Kazakh + Latin equivalents
-    'жанарым',
-    'жан арым',
-    'жан а рым',
-    'жана рым',
-    'жанарэм',
-    'janarym',
-    'zhanarym',
-    'zhan a rym',
-    'zhan-a-rym',
-    // Common Russian STT phonetic transcriptions
-    'женарым',
-    'женарим',
-    'джанарым',
-    'жанарым',
-    'жанарим',
-    'жанары м',
-  ];
+  static const String _canonicalWakeRoot = 'жанар';
+  static const int _minWakeLength = 5;
+  static const int _maxWakeLength = 8;
 
-  static const List<String> _acceptableForms = <String>[
-    // Kazakh close variants
+  static const List<String> _strongForms = <String>[
+    'жанарым',
     'жанарим',
     'жанарум',
     'жанар',
     'жанара',
-    'жанарм',
-    'жанрым',
-    'жана аренда',
-    // Russian STT often splits or mishears
-    'жана',
-    'жанары',
-    'женары',
-    'джанары',
-    'жанаш',
-    'жана рим',
-    'жана рэм',
-    'женарэм',
-    'джанарим',
-    'джаным',
-    'жаным',
-    // Latin equivalents
+    'janarym',
     'janarim',
     'janarum',
     'janar',
     'janara',
-    'janary',
+    'zhanarym',
     'zhanarim',
     'zhanarum',
     'zhanar',
-    'janara',
-    'djanarym',
+    'zhanara',
   ];
+
+  static const List<String> _acceptableForms = <String>[
+    'жан арым',
+    'жан а рым',
+    'жана рым',
+    'жана рим',
+    'жана рум',
+    'женарым',
+    'женарим',
+    'женарум',
+    'женар',
+    'женара',
+    'джанарым',
+    'джанарим',
+    'джанарум',
+    'джанар',
+    'джанара',
+    'жанарэм',
+    'женарэм',
+    'джанарэм',
+    'жанарм',
+    'жанрым',
+    'janary',
+    'zhanary',
+    'zhan a rym',
+    'zhan-a-rym',
+    'djanarym',
+    'djanarim',
+    'djanarum',
+    'djanar',
+  ];
+
+  static final List<String> _wakeLookupForms = _buildWakeLookupForms();
+  static final Set<String> _strongNormalizedForms = _buildNormalizedSet(
+    _strongForms,
+  );
+  static final Set<String> _acceptedNormalizedForms = _buildNormalizedSet(
+    <String>[..._strongForms, ..._acceptableForms],
+  );
+  static final Set<String> _acceptedPhoneticForms = _buildPhoneticSet(<String>[
+    ..._strongForms,
+    ..._acceptableForms,
+  ]);
+  static const List<String> _canonicalFullForms = <String>[
+    'жанар',
+    'жанара',
+    'жанарым',
+  ];
+
+  static List<String> get wakeLookupForms =>
+      List<String>.unmodifiable(_wakeLookupForms);
+
+  static bool isAccepted(WakeMatchResult result) {
+    return result.strength == WakeMatchStrength.strong ||
+        result.strength == WakeMatchStrength.probable;
+  }
+
+  static bool containsAcceptedWakeWord(
+    String transcript, {
+    bool isPartial = false,
+  }) {
+    return isAccepted(match(transcript, isPartial: isPartial));
+  }
+
+  static String stripWakeWords(String input) {
+    final normalized = _normalize(input);
+    if (normalized.isEmpty) return '';
+    final tokens = normalized
+        .split(' ')
+        .where((token) => token.isNotEmpty)
+        .toList(growable: false);
+    if (tokens.isEmpty) return '';
+
+    final kept = <String>[];
+    var index = 0;
+    while (index < tokens.length) {
+      var consumed = 0;
+      final maxWindow = math.min(3, tokens.length - index);
+      for (var window = maxWindow; window >= 1; window--) {
+        final candidate = tokens.sublist(index, index + window).join(' ');
+        if (_isStandaloneAccepted(candidate)) {
+          consumed = window;
+          break;
+        }
+      }
+      if (consumed > 0) {
+        index += consumed;
+        continue;
+      }
+      kept.add(tokens[index]);
+      index += 1;
+    }
+    return kept.join(' ');
+  }
 
   static WakeMatchResult match(String transcript, {bool isPartial = false}) {
     final normalized = _normalize(transcript);
@@ -81,60 +143,131 @@ class WakePhraseMatcher {
         reason: 'empty',
       );
     }
-    final compact = normalized.replaceAll(' ', '');
-    for (final strong in _strongForms) {
-      final strongNormalized = _normalize(strong);
-      final strongCompact = strongNormalized.replaceAll(' ', '');
-      if (normalized.contains(strongNormalized) ||
-          compact.contains(strongCompact)) {
-        return WakeMatchResult(
-          strength: WakeMatchStrength.strong,
-          score: 1,
-          normalized: normalized,
-          reason: 'strong_contains',
-        );
+
+    final direct = _matchStandalone(normalized, isPartial: isPartial);
+    if (direct.strength == WakeMatchStrength.strong ||
+        direct.strength == WakeMatchStrength.probable) {
+      return direct;
+    }
+
+    final tokens = normalized
+        .split(' ')
+        .where((token) => token.isNotEmpty)
+        .toList(growable: false);
+    WakeMatchResult? bestWeak;
+    WakeMatchResult? bestProbable;
+
+    for (var start = 0; start < tokens.length; start++) {
+      final maxWindow = math.min(3, tokens.length - start);
+      for (var window = maxWindow; window >= 1; window--) {
+        final candidate = tokens.sublist(start, start + window).join(' ');
+        final result = _matchStandalone(candidate, isPartial: isPartial);
+        if (result.strength == WakeMatchStrength.strong) {
+          return result;
+        }
+        if (result.strength == WakeMatchStrength.probable) {
+          if (bestProbable == null || result.score > bestProbable.score) {
+            bestProbable = result;
+          }
+          continue;
+        }
+        if (result.strength == WakeMatchStrength.weak && bestWeak == null) {
+          bestWeak = result;
+        }
       }
     }
 
-    if (isPartial) {
-      final tokens = normalized
-          .split(' ')
-          .where((token) => token.isNotEmpty)
-          .toList(growable: false);
-      if (tokens.length == 1) {
-        final token = tokens.first;
-        if (_isWakeRoot(token) && normalized.length <= 8) {
-          return WakeMatchResult(
-            strength: WakeMatchStrength.strong,
-            score: 0.92,
-            normalized: normalized,
-            reason: 'partial_root',
-          );
-        }
-      }
+    if (bestProbable != null) {
+      return bestProbable;
+    }
+    if (bestWeak != null) {
+      return bestWeak;
+    }
+    if (direct.strength == WakeMatchStrength.weak) {
+      return direct;
+    }
+
+    return WakeMatchResult(
+      strength: WakeMatchStrength.none,
+      score: 0,
+      normalized: normalized,
+      reason: isPartial ? 'partial_no_match' : 'no_match',
+    );
+  }
+
+  static WakeMatchResult _matchStandalone(
+    String transcript, {
+    required bool isPartial,
+  }) {
+    final normalized = _normalize(transcript);
+    if (normalized.isEmpty) {
+      return const WakeMatchResult(
+        strength: WakeMatchStrength.none,
+        score: 0,
+        normalized: '',
+        reason: 'empty',
+      );
+    }
+
+    final compact = normalized.replaceAll(' ', '');
+    final phonetic = _normalizePhonetic(compact);
+    if (compact.isEmpty || phonetic.isEmpty) {
       return WakeMatchResult(
         strength: WakeMatchStrength.none,
         score: 0,
         normalized: normalized,
-        reason: 'partial_no_match',
+        reason: 'empty',
       );
     }
 
-    if (_isProbable(normalized)) {
+    if (_strongNormalizedForms.contains(normalized)) {
+      return WakeMatchResult(
+        strength: WakeMatchStrength.strong,
+        score: 1,
+        normalized: normalized,
+        reason: 'surface_strong',
+      );
+    }
+    if (_acceptedNormalizedForms.contains(normalized) ||
+        _acceptedPhoneticForms.contains(phonetic)) {
+      return WakeMatchResult(
+        strength: WakeMatchStrength.strong,
+        score: 0.98,
+        normalized: normalized,
+        reason: 'surface_accept',
+      );
+    }
+
+    if (isPartial && _isCanonicalWakeShape(phonetic)) {
+      return WakeMatchResult(
+        strength: WakeMatchStrength.strong,
+        score: 0.92,
+        normalized: normalized,
+        reason: 'partial_root',
+      );
+    }
+    if (_isCanonicalWakeShape(phonetic)) {
       return WakeMatchResult(
         strength: WakeMatchStrength.probable,
-        score: 0.72,
+        score: 0.86,
         normalized: normalized,
-        reason: 'probable_match',
+        reason: 'root_canonical',
       );
     }
-
-    if (_isWeak(normalized)) {
+    if (_isNearCanonicalWakeShape(phonetic)) {
+      return WakeMatchResult(
+        strength: WakeMatchStrength.probable,
+        score: 0.76,
+        normalized: normalized,
+        reason: 'edit_distance',
+      );
+    }
+    if (_isWeakWakeHint(phonetic)) {
       return WakeMatchResult(
         strength: WakeMatchStrength.weak,
-        score: 0.45,
+        score: 0.42,
         normalized: normalized,
-        reason: 'weak_match',
+        reason: isPartial ? 'partial_weak' : 'weak_root',
       );
     }
 
@@ -142,55 +275,128 @@ class WakePhraseMatcher {
       strength: WakeMatchStrength.none,
       score: 0,
       normalized: normalized,
-      reason: 'no_match',
+      reason: isPartial ? 'partial_no_match' : 'no_match',
     );
   }
 
-  static bool _isProbable(String normalized) {
-    final compact = normalized.replaceAll(' ', '');
-    if (_isWakeRoot(compact)) {
-      return true;
+  static bool _isStandaloneAccepted(String transcript) {
+    return isAccepted(_matchStandalone(transcript, isPartial: false));
+  }
+
+  static bool _isCanonicalWakeShape(String phonetic) {
+    return phonetic.startsWith(_canonicalWakeRoot) &&
+        phonetic.length >= _minWakeLength &&
+        phonetic.length <= _maxWakeLength;
+  }
+
+  static String _normalize(String input) {
+    if (input.trim().isEmpty) return '';
+    final lower = input.toLowerCase();
+    return lower
+        .replaceAll(RegExp(r'[^\p{L}\p{N}]+', unicode: true), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+  }
+
+  static String _normalizePhonetic(String input) {
+    if (input.trim().isEmpty) return '';
+    var value = _normalize(input).replaceAll(' ', '');
+    if (value.isEmpty) return '';
+
+    value = value
+        .replaceAll('ё', 'е')
+        .replaceAll('э', 'е')
+        .replaceAll('dzh', 'дж')
+        .replaceAll('zh', 'ж');
+
+    const latinMap = <String, String>{
+      'a': 'а',
+      'b': 'б',
+      'c': 'к',
+      'd': 'д',
+      'e': 'е',
+      'f': 'ф',
+      'g': 'г',
+      'h': 'х',
+      'i': 'и',
+      'j': 'ж',
+      'k': 'к',
+      'l': 'л',
+      'm': 'м',
+      'n': 'н',
+      'o': 'о',
+      'p': 'п',
+      'q': 'к',
+      'r': 'р',
+      's': 'с',
+      't': 'т',
+      'u': 'у',
+      'v': 'в',
+      'w': 'в',
+      'x': 'кс',
+      'y': 'ы',
+      'z': 'з',
+    };
+
+    final buffer = StringBuffer();
+    for (final rune in value.runes) {
+      final char = String.fromCharCode(rune);
+      buffer.write(latinMap[char] ?? char);
     }
-    final tokens = normalized
-        .split(' ')
-        .where((token) => token.isNotEmpty)
-        .toList(growable: false);
-    if (tokens.isNotEmpty && _isWakeRoot(tokens.first) && tokens.length <= 2) {
-      final extra = tokens.length == 2 ? tokens.last : '';
-      if (extra.isEmpty || extra.length <= 3) {
-        return true;
-      }
+    value = buffer.toString();
+
+    value = value
+        .replaceFirst(RegExp(r'^джан'), 'жан')
+        .replaceFirst(RegExp(r'^зхан'), 'жан')
+        .replaceFirst(RegExp(r'^женар'), 'жанар')
+        .replaceFirst(RegExp(r'^жанар[иеуы]м$'), 'жанарым');
+
+    return value;
+  }
+
+  static bool _isNearCanonicalWakeShape(String phonetic) {
+    if (phonetic.length < 4 || phonetic.length > (_maxWakeLength + 1)) {
+      return false;
     }
-    for (final form in <String>[..._strongForms, ..._acceptableForms]) {
-      final formCompact = _normalize(form).replaceAll(' ', '');
-      if (_levenshtein(compact, formCompact) <= 1) {
+    if (!_hasWakeStemHint(phonetic)) {
+      return false;
+    }
+    for (final form in _canonicalFullForms) {
+      if (_levenshtein(phonetic, form) <= 2) {
         return true;
       }
     }
     return false;
   }
 
-  static bool _isWeak(String normalized) {
-    final compact = normalized.replaceAll(' ', '');
-    return compact.contains('жан') ||
-        compact.contains('jan') ||
-        compact.contains('zhan');
+  static bool _hasWakeStemHint(String phonetic) {
+    return phonetic.startsWith('жан') && phonetic.contains('р');
   }
 
-  static bool _isWakeRoot(String token) {
-    return token.startsWith('жанар') ||
-        token.startsWith('janar') ||
-        token.startsWith('zhanar');
+  static bool _isWeakWakeHint(String phonetic) {
+    return phonetic.startsWith('жан');
   }
 
-  static String _normalize(String input) {
-    if (input.trim().isEmpty) return '';
-    final lower = input.toLowerCase();
-    final cleaned = lower
-        .replaceAll(RegExp(r'[^\p{L}\p{N}]+', unicode: true), ' ')
-        .replaceAll(RegExp(r'\s+'), ' ')
-        .trim();
-    return cleaned;
+  static List<String> _buildWakeLookupForms() {
+    final forms = <String>{
+      ..._buildNormalizedSet(_strongForms),
+      ..._buildNormalizedSet(_acceptableForms),
+    }.toList(growable: false);
+    forms.sort((a, b) => b.length.compareTo(a.length));
+    return forms;
+  }
+
+  static Set<String> _buildNormalizedSet(List<String> values) {
+    return values.map(_normalize).where((value) => value.isNotEmpty).toSet();
+  }
+
+  static Set<String> _buildPhoneticSet(List<String> values) {
+    return values
+        .map(
+          (value) => _normalizePhonetic(_normalize(value).replaceAll(' ', '')),
+        )
+        .where((value) => value.isNotEmpty)
+        .toSet();
   }
 
   static int _levenshtein(String a, String b) {

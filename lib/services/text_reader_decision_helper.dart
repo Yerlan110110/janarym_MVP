@@ -1,17 +1,51 @@
 import 'text_reading_normalizer.dart';
 
+enum TextReaderCandidateDisposition {
+  reject,
+  speakOnDevice,
+  approximate,
+  structuredOnly,
+  visionFallback,
+}
+
+class TextReaderCandidateAssessment {
+  const TextReaderCandidateAssessment({
+    required this.score,
+    required this.suspicious,
+    required this.weakAccepted,
+    required this.structuredOnlyAccepted,
+    required this.disposition,
+  });
+
+  final double score;
+  final bool suspicious;
+  final bool weakAccepted;
+  final bool structuredOnlyAccepted;
+  final TextReaderCandidateDisposition disposition;
+
+  bool get acceptsDirectSpeech =>
+      disposition == TextReaderCandidateDisposition.speakOnDevice;
+  bool get acceptsApproximateSpeech =>
+      disposition == TextReaderCandidateDisposition.approximate;
+  bool get requiresVisionFallback =>
+      disposition == TextReaderCandidateDisposition.visionFallback;
+}
+
 double scoreManualTextReadCandidate({
   required String text,
   required int manualSpeechLinesCount,
   required DetectedTextScript dominantScript,
   required bool hasStructuredData,
+  bool aggressiveShortText = false,
 }) {
   final trimmed = text.trim();
   var score = 0.0;
+  final lengthDivisor = aggressiveShortText ? 3.0 : 4.0;
+  final shortTextPenaltyThreshold = aggressiveShortText ? 6 : 12;
 
   if (hasStructuredData) score += 40.0;
   if (trimmed.isNotEmpty) {
-    score += (trimmed.length.clamp(0, 120) / 4.0);
+    score += (trimmed.length.clamp(0, 120) / lengthDivisor);
   }
   score += (manualSpeechLinesCount.clamp(0, 3) * 10).toDouble();
 
@@ -31,19 +65,151 @@ double scoreManualTextReadCandidate({
   }
 
   if (trimmed.isEmpty) score -= 40.0;
-  if (trimmed.isNotEmpty && trimmed.length < 12) score -= 10.0;
+  if (trimmed.isNotEmpty && trimmed.length < shortTextPenaltyThreshold) {
+    score -= aggressiveShortText ? 8.0 : 10.0;
+  }
   if (dominantScript == DetectedTextScript.mixed && !hasStructuredData) {
     score -= 12.0;
+  }
+  if (!hasStructuredData && !TextReadingNormalizer.isSpeechSafe(trimmed)) {
+    score -= 18.0;
+  }
+  if (!hasStructuredData &&
+      TextReadingNormalizer.looksLikePseudoRussianOcr(trimmed)) {
+    score -= 30.0;
   }
 
   return score;
 }
 
-String buildManualFallbackText(String rawText) {
+bool isSuspiciousTextReadCandidate({
+  required String rawText,
+  required String resolvedText,
+  required DetectedTextScript rawDominantScript,
+  required DetectedTextScript effectiveScript,
+}) {
+  final raw = rawText.trim();
+  final resolved = resolvedText.trim();
+  if (raw.isEmpty && resolved.isEmpty) return true;
+  if (TextReadingNormalizer.looksLikePseudoRussianOcr(raw) ||
+      TextReadingNormalizer.looksLikePseudoRussianOcr(resolved)) {
+    return true;
+  }
+  if (rawDominantScript == DetectedTextScript.mixed ||
+      effectiveScript == DetectedTextScript.mixed) {
+    return true;
+  }
+  return rawDominantScript == DetectedTextScript.unknown &&
+      effectiveScript == DetectedTextScript.unknown;
+}
+
+TextReaderCandidateAssessment assessTextReaderCandidate({
+  required String rawText,
+  required String resolvedText,
+  required int manualSpeechLinesCount,
+  required DetectedTextScript rawDominantScript,
+  required DetectedTextScript effectiveScript,
+  required bool hasStructuredData,
+  required int stableRepeats,
+  required double acceptScore,
+  required bool allowVisionFallback,
+  bool aggressiveShortText = false,
+}) {
+  final score = scoreManualTextReadCandidate(
+    text: resolvedText,
+    manualSpeechLinesCount: manualSpeechLinesCount,
+    dominantScript: effectiveScript,
+    hasStructuredData: hasStructuredData,
+    aggressiveShortText: aggressiveShortText,
+  );
+  final suspicious = isSuspiciousTextReadCandidate(
+    rawText: rawText,
+    resolvedText: resolvedText,
+    rawDominantScript: rawDominantScript,
+    effectiveScript: effectiveScript,
+  );
+  final structuredOnlyAccepted =
+      hasStructuredData &&
+      (score < acceptScore || suspicious || resolvedText.trim().isEmpty);
+  final weakAccepted =
+      !structuredOnlyAccepted &&
+      shouldAcceptWeakManualCandidate(
+        score: score,
+        hasStructuredData: hasStructuredData,
+        text: resolvedText,
+        stableRepeats: stableRepeats,
+        dominantScript: effectiveScript,
+        looksPseudoRussianOcr: suspicious,
+        aggressiveShortText: aggressiveShortText,
+      );
+  final safeText =
+      resolvedText.trim().isNotEmpty &&
+      TextReadingNormalizer.isSpeechSafe(resolvedText);
+
+  if (structuredOnlyAccepted) {
+    return TextReaderCandidateAssessment(
+      score: score,
+      suspicious: suspicious,
+      weakAccepted: weakAccepted,
+      structuredOnlyAccepted: true,
+      disposition: TextReaderCandidateDisposition.structuredOnly,
+    );
+  }
+
+  if (suspicious) {
+    return TextReaderCandidateAssessment(
+      score: score,
+      suspicious: true,
+      weakAccepted: weakAccepted,
+      structuredOnlyAccepted: false,
+      disposition: allowVisionFallback
+          ? TextReaderCandidateDisposition.visionFallback
+          : TextReaderCandidateDisposition.reject,
+    );
+  }
+
+  if (safeText && score >= acceptScore) {
+    return TextReaderCandidateAssessment(
+      score: score,
+      suspicious: false,
+      weakAccepted: weakAccepted,
+      structuredOnlyAccepted: false,
+      disposition: TextReaderCandidateDisposition.speakOnDevice,
+    );
+  }
+
+  if (safeText && weakAccepted) {
+    return TextReaderCandidateAssessment(
+      score: score,
+      suspicious: false,
+      weakAccepted: true,
+      structuredOnlyAccepted: false,
+      disposition: TextReaderCandidateDisposition.approximate,
+    );
+  }
+
+  return TextReaderCandidateAssessment(
+    score: score,
+    suspicious: suspicious,
+    weakAccepted: weakAccepted,
+    structuredOnlyAccepted: false,
+    disposition: TextReaderCandidateDisposition.reject,
+  );
+}
+
+String buildManualFallbackText(
+  String rawText, {
+  bool aggressiveShortText = false,
+}) {
   final compact = rawText.replaceAll(RegExp(r'\s+'), ' ').trim();
   if (compact.isEmpty) return '';
+  if (TextReadingNormalizer.looksLikePseudoRussianOcr(compact)) return '';
 
   final rawScript = TextReadingNormalizer.detectScript(compact);
+  if (rawScript == DetectedTextScript.mixed ||
+      rawScript == DetectedTextScript.unknown) {
+    return '';
+  }
   final normalized = TextReadingNormalizer.normalizeForManualSpeech(
     compact,
     script: rawScript,
@@ -73,13 +239,17 @@ String buildManualFallbackText(String rawText) {
   final alnumCount = RegExp(
     r'[A-Za-zА-Яа-яЁё0-9]',
   ).allMatches(normalized).length;
-  if (alnumCount < 16) return '';
-  if (_noiseRatio(normalized) > 0.25) return '';
+  if (alnumCount < (aggressiveShortText ? 6 : 16)) return '';
+  if (_noiseRatio(normalized) > (aggressiveShortText ? 0.35 : 0.25)) {
+    return '';
+  }
 
-  if (script == DetectedTextScript.cyrillic && normalized.length >= 20) {
+  if (script == DetectedTextScript.cyrillic &&
+      normalized.length >= (aggressiveShortText ? 6 : 20)) {
     return normalized;
   }
-  if (script == DetectedTextScript.latin && normalized.length >= 24) {
+  if (script == DetectedTextScript.latin &&
+      normalized.length >= (aggressiveShortText ? 12 : 24)) {
     return normalized;
   }
   return '';
@@ -102,8 +272,6 @@ String buildManualCandidateSignature(String text) {
       .allMatches(normalized)
       .map((match) {
         final token = match.group(0) ?? '';
-        // Keep vowels but collapse repeats and keep first vowel if possible
-        // This is less destructive than stripping all vowels
         final collapsed = token.replaceAllMapped(
           RegExp(r'(.)\1+', unicode: true),
           (match) => match.group(1) ?? '',
@@ -124,13 +292,31 @@ bool shouldAcceptWeakManualCandidate({
   required bool hasStructuredData,
   required String text,
   required int stableRepeats,
+  required DetectedTextScript dominantScript,
+  bool looksPseudoRussianOcr = false,
+  bool aggressiveShortText = false,
 }) {
   final trimmed = text.trim();
   if (hasStructuredData) return true;
   if (trimmed.isEmpty) return false;
-  if (stableRepeats < 2) return false;
-  if (score < 20.0) return false;
-  if (trimmed.length < 12) return false;
+  if (stableRepeats < (aggressiveShortText ? 3 : 2)) return false;
+  if (score < (aggressiveShortText ? 18.0 : 20.0)) return false;
+  if (trimmed.length < (aggressiveShortText ? 8 : 12)) return false;
+  if (looksPseudoRussianOcr ||
+      dominantScript == DetectedTextScript.mixed ||
+      dominantScript == DetectedTextScript.unknown) {
+    return false;
+  }
+  if (aggressiveShortText) {
+    final meaningfulTokens = RegExp(
+      r'[A-Za-zА-Яа-яЁё0-9]{3,}',
+      unicode: true,
+    ).allMatches(trimmed).length;
+    if (meaningfulTokens == 0) return false;
+    if (meaningfulTokens < 2 && trimmed.length < 12) {
+      return false;
+    }
+  }
   return !TextReadingNormalizer.shouldUseEnglishTts(trimmed);
 }
 
