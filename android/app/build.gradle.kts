@@ -1,3 +1,4 @@
+import org.gradle.api.GradleException
 import java.util.Properties
 
 plugins {
@@ -18,6 +19,33 @@ val releaseSigningReady =
     listOf("storeFile", "storePassword", "keyAlias", "keyPassword").all { key ->
         !keystoreProperties.getProperty(key).isNullOrBlank()
     }
+val workspaceRoot = rootProject.projectDir.parentFile
+val primaryRuntimeEnv = workspaceRoot.resolve(".env")
+val fallbackRuntimeEnv = workspaceRoot.resolve(".env.example")
+val bundledRuntimeEnv = workspaceRoot.resolve("assets/runtime/env.runtime")
+
+val syncRuntimeEnvAsset by tasks.registering {
+    inputs.files(primaryRuntimeEnv, fallbackRuntimeEnv)
+    outputs.file(bundledRuntimeEnv)
+
+    doLast {
+        val source = when {
+            primaryRuntimeEnv.exists() && primaryRuntimeEnv.readText().isNotBlank() ->
+                primaryRuntimeEnv
+            fallbackRuntimeEnv.exists() -> fallbackRuntimeEnv
+            else -> null
+        } ?: throw GradleException(
+            "No runtime env source found. Expected .env or .env.example in ${workspaceRoot.path}",
+        )
+
+        bundledRuntimeEnv.parentFile.mkdirs()
+        source.copyTo(bundledRuntimeEnv, overwrite = true)
+    }
+}
+
+tasks.matching { it.name.startsWith("compileFlutterBuild") }.configureEach {
+    dependsOn(syncRuntimeEnvAsset)
+}
 
 android {
     namespace = "com.example.janarym_app2"

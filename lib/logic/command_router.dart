@@ -1,9 +1,13 @@
 import '../l10n/app_locale_controller.dart';
+import '../navigation/models/navigation_mode_state.dart';
+import '../voice/wake_phrase_matcher.dart';
 
 enum AssistantModeIntent {
   enterNavMode,
   exitNavMode,
   navStart,
+  navStopRoutes,
+  navStopSchedule,
   routeToPlaceLabel,
   setPlaceLabel,
   startOnboarding,
@@ -31,6 +35,8 @@ class CommandDecision {
   final String? placeLabelName;
   final String? freeAddressText;
   final String? fearText;
+  final NavigationDestinationKind destinationKindHint;
+  final String? transitRouteName;
   final bool isAffirmative;
   final bool isNegative;
   const CommandDecision({
@@ -42,37 +48,24 @@ class CommandDecision {
     this.placeLabelName,
     this.freeAddressText,
     this.fearText,
+    this.destinationKindHint = NavigationDestinationKind.generic,
+    this.transitRouteName,
     this.isAffirmative = false,
     this.isNegative = false,
   });
 }
 
-class CommandRouter {
-  static const List<String> wakeWordVariants = [
-    'жанар',
-    'жанара',
-    'жанарым',
-    'жанарим',
-    'жанарум',
-    'жан арым',
-    'жан а рым',
-    'жанаром',
-    'жанарам',
-    'жанрам',
-    'шмарым',
-    'janarym',
-    'janar',
-    'janara',
-    'janarim',
-    'zhanar',
-    'zhanara',
-    'zhanarym',
-    'zhanarim',
-    'zhanarum',
-    'zhan a rym',
-    'zhan-a-rym',
-  ];
+class _TransitScheduleQuery {
+  const _TransitScheduleQuery({
+    required this.stopQuery,
+    required this.routeName,
+  });
 
+  final String stopQuery;
+  final String routeName;
+}
+
+class CommandRouter {
   static const List<String> describeTriggers = [
     'опиши',
     'что вокруг',
@@ -163,6 +156,9 @@ class CommandRouter {
   ];
 
   static const List<String> navStartTriggers = [
+    'построй маршрут до остановки',
+    'проложи маршрут до остановки',
+    'маршрут до остановки',
     'построй маршрут до',
     'маршрут до',
     'веди до',
@@ -175,7 +171,56 @@ class CommandRouter {
     'дейін апар',
     'бағыт құр',
     'маршрут баста',
+    'аялдамаға дейін маршрут',
+    'аялдамага дейін маршрут',
     'үйге апар',
+  ];
+
+  static const List<String> transitStopTriggers = [
+    'остановка',
+    'остановки',
+    'остановке',
+    'до остановки',
+    'на остановке',
+    'на остановку',
+    'bus stop',
+    'аялдама',
+    'аялдамаға',
+    'аялдамага',
+    'аялдамада',
+    'аялдамасына',
+    'аялдамаға дейін',
+  ];
+
+  static const List<String> transitStopRoutesTriggers = [
+    'какие маршруты на остановке',
+    'какие автобусы на остановке',
+    'маршруты на остановке',
+    'автобусы на остановке',
+    'какие маршруты ходят на остановке',
+    'аялдамада қандай маршруттар',
+    'аялдамада қандай автобустар',
+  ];
+
+  static const List<String> transitScheduleQuestionTriggers = [
+    'когда',
+    'во сколько',
+    'через сколько',
+    'придет',
+    'придет автобус',
+    'придет маршрут',
+    'придет номер',
+    'придет ли',
+    'придёт',
+    'придёт автобус',
+    'придёт маршрут',
+    'приедет',
+    'подъедет',
+    'будет',
+    'кашан',
+    'қашан',
+    'келеді',
+    'келедi',
   ];
 
   static const List<String> navStopTriggers = [
@@ -228,9 +273,19 @@ class CommandRouter {
 
   static const List<String> onboardingTriggers = [
     'начать персонализацию',
+    'начни персонализацию',
+    'давай начнем персонализацию',
+    'давай начнём персонализацию',
+    'начнем персонализацию',
+    'начнём персонализацию',
     'пройти персонализацию',
     'пройти опрос',
     'начать опрос',
+    'начни опрос',
+    'давай начнем опрос',
+    'давай начнём опрос',
+    'начнем опрос',
+    'начнём опрос',
     'персонализация',
     'баптауды бастау',
     'персонализацияны бастау',
@@ -346,12 +401,7 @@ class CommandRouter {
   }
 
   String stripWakeWords(String text) {
-    var t = text;
-    for (final w in wakeWordVariants) {
-      t = t.replaceAll(RegExp(r'\b' + RegExp.escape(w) + r'\b'), ' ');
-    }
-    t = t.replaceAll(RegExp(r'\s+'), ' ').trim();
-    return t;
+    return WakePhraseMatcher.stripWakeWords(text);
   }
 
   CommandDecision route(String text) {
@@ -360,7 +410,12 @@ class CommandRouter {
     final target = cleaned.isEmpty ? normalized : cleaned;
     final direction = _directionFromText(target);
     final choiceIndex = _extractCandidateChoiceIndex(target);
-    final destination = _extractDestination(target);
+    final transitSchedule = _extractTransitSchedule(target);
+    final transitStopRoutesQuery = _extractTransitStopRoutesQuery(target);
+    final destination =
+        transitSchedule?.stopQuery ??
+        transitStopRoutesQuery ??
+        _extractDestination(target);
     final placeLabelName = _extractPlaceLabelName(target);
     final fearText = _extractFearText(target);
     final isYes = _isAffirmative(target);
@@ -379,6 +434,11 @@ class CommandRouter {
       modeIntent: intent,
       directionRu: direction,
       destinationQuery: destination,
+      destinationKindHint: _resolveDestinationKindHint(
+        target,
+        destination: destination,
+      ),
+      transitRouteName: transitSchedule?.routeName,
       candidateChoiceIndex: choiceIndex,
       placeLabelName: placeLabelName,
       freeAddressText: _extractFreeAddressText(target),
@@ -415,6 +475,12 @@ class CommandRouter {
     }
     if (navRejectChoiceTriggers.any(text.contains)) {
       return AssistantModeIntent.navRejectChoice;
+    }
+    if (_extractTransitSchedule(text) != null) {
+      return AssistantModeIntent.navStopSchedule;
+    }
+    if (_extractTransitStopRoutesQuery(text) != null) {
+      return AssistantModeIntent.navStopRoutes;
     }
     if (onboardingTriggers.any(text.contains)) {
       return AssistantModeIntent.startOnboarding;
@@ -473,12 +539,236 @@ class CommandRouter {
     return null;
   }
 
+  String? _extractTransitStopRoutesQuery(String text) {
+    for (final trigger in transitStopRoutesTriggers) {
+      final index = text.indexOf(trigger);
+      if (index < 0) continue;
+      final tail = text.substring(index + trigger.length).trim();
+      final query = _stripTransitStopPrefix(tail);
+      if (query.isNotEmpty) return query;
+    }
+
+    final ruRearMatch = RegExp(
+      r'^остановк[аеи]\s+(.+?)\s+(какие\s+(маршруты|автобусы)|маршруты|автобусы)$',
+      unicode: true,
+    ).firstMatch(text);
+    if (ruRearMatch != null) {
+      final query = _stripTransitStopPrefix(ruRearMatch.group(1) ?? '');
+      if (query.isNotEmpty) return query;
+    }
+
+    final kkRearMatch = RegExp(
+      r'^аялдама\s+(.+?)\s+қандай\s+(маршруттар|автобустар)$',
+      unicode: true,
+    ).firstMatch(text);
+    if (kkRearMatch != null) {
+      final query = _stripTransitStopPrefix(kkRearMatch.group(1) ?? '');
+      if (query.isNotEmpty) return query;
+    }
+
+    return null;
+  }
+
+  _TransitScheduleQuery? _extractTransitSchedule(String text) {
+    final patterns = <RegExp>[
+      RegExp(
+        r'^когда\s+(автобус|маршрут)\s+([0-9\p{L}-]+)\s+на\s+остановк[еаи]\s+(.+)$',
+        unicode: true,
+      ),
+      RegExp(
+        r'^(автобус|маршрут)\s+([0-9\p{L}-]+)\s+когда\s+на\s+остановк[еаи]\s+(.+)$',
+        unicode: true,
+      ),
+      RegExp(
+        r'^автобус\s+([0-9\p{L}-]+)\s+на\s+остановк[еаи]\s+(.+?)\s+когда$',
+        unicode: true,
+      ),
+      RegExp(
+        r'^аялдама\s+(.+?)\s+автобус\s+([0-9\p{L}-]+)\s+қашан$',
+        unicode: true,
+      ),
+      RegExp(
+        r'^аялдамада\s+(.+?)\s+([0-9\p{L}-]+)\s+автобус\s+қашан$',
+        unicode: true,
+      ),
+    ];
+
+    for (final pattern in patterns) {
+      final match = pattern.firstMatch(text);
+      if (match == null) continue;
+      String routeName;
+      String stopQuery;
+      if (pattern.pattern.startsWith('^аялдама')) {
+        stopQuery = match.group(1)?.trim() ?? '';
+        routeName = match.group(2)?.trim() ?? '';
+      } else if (match.groupCount >= 3 &&
+          (match.group(1) == 'автобус' || match.group(1) == 'маршрут')) {
+        routeName = match.group(2)?.trim() ?? '';
+        stopQuery = match.group(3)?.trim() ?? '';
+      } else {
+        routeName = match.group(1)?.trim() ?? '';
+        stopQuery = match.group(2)?.trim() ?? '';
+      }
+      stopQuery = _stripTransitStopPrefix(stopQuery);
+      if (routeName.isEmpty || stopQuery.isEmpty) continue;
+      return _TransitScheduleQuery(stopQuery: stopQuery, routeName: routeName);
+    }
+    final routeName = _extractTransitRouteName(text);
+    final stopQuery = _extractTransitStopQuery(text);
+    if (routeName == null || stopQuery == null) return null;
+    if (!_looksLikeTransitScheduleQuestion(text)) return null;
+    return _TransitScheduleQuery(stopQuery: stopQuery, routeName: routeName);
+  }
+
+  bool _looksLikeTransitScheduleQuestion(String text) {
+    if (!(_looksLikeTransitStopText(text) &&
+        _containsTransitRouteReference(text))) {
+      return false;
+    }
+    return transitScheduleQuestionTriggers.any(text.contains);
+  }
+
+  bool _containsTransitRouteReference(String text) {
+    return _extractTransitRouteName(text) != null;
+  }
+
+  String? _extractTransitRouteName(String text) {
+    final patterns = <RegExp>[
+      RegExp(
+        r'(?:^|\s)(?:автобус|маршрут)\s+номер\s+([0-9\p{L}-]+)(?:\s|$)',
+        unicode: true,
+      ),
+      RegExp(
+        r'(?:^|\s)(?:автобус|маршрут)\s+([0-9\p{L}-]+)(?:\s|$)',
+        unicode: true,
+      ),
+      RegExp(
+        r'(?:^|\s)номер\s+([0-9\p{L}-]+)\s+(?:автобус|маршрут)(?:\s|$)',
+        unicode: true,
+      ),
+      RegExp(
+        r'(?:^|\s)([0-9]{1,3}[a-zа-яқөүіңғәһ]?)\s+(?:автобус|маршрут)(?:\s|$)',
+        unicode: true,
+        caseSensitive: false,
+      ),
+    ];
+    for (final pattern in patterns) {
+      final match = pattern.firstMatch(text);
+      final routeName = match?.group(1)?.trim() ?? '';
+      if (routeName.isNotEmpty) {
+        return routeName;
+      }
+    }
+    return null;
+  }
+
+  String? _extractTransitStopQuery(String text) {
+    final patterns = <RegExp>[
+      RegExp(
+        r'(?:^|\s)(?:на|до|к)\s+остановк[аеиуы]\s+(.+?)\s+(?:когда|через сколько|во сколько|придет|придёт|приедет|подъедет|будет)(?:\s|$)',
+        unicode: true,
+      ),
+      RegExp(
+        r'(?:^|\s)остановк[аеиуы]\s+(.+?)\s+(?:когда|через сколько|во сколько|придет|придёт|приедет|подъедет|будет)(?:\s|$)',
+        unicode: true,
+      ),
+      RegExp(
+        r'(?:^|\s)(?:на|до|к)\s+остановк[аеиуы]\s+(.+)$',
+        unicode: true,
+      ),
+      RegExp(
+        r'(?:^|\s)остановк[аеиуы]\s+(.+)$',
+        unicode: true,
+      ),
+      RegExp(
+        r'(?:^|\s)аялдама(?:ға|га|да|ны|сына)?\s+(.+?)\s+(?:қашан|кашан|келеді|келедi)(?:\s|$)',
+        unicode: true,
+      ),
+      RegExp(
+        r'(?:^|\s)аялдама(?:ға|га|да|ны|сына)?\s+(.+)$',
+        unicode: true,
+      ),
+    ];
+    for (final pattern in patterns) {
+      final match = pattern.firstMatch(text);
+      if (match == null) continue;
+      final query = _sanitizeTransitStopQuery(match.group(1) ?? '');
+      if (query.isNotEmpty) return query;
+    }
+    return null;
+  }
+
+  String _sanitizeTransitStopQuery(String text) {
+    var query = _stripTransitStopPrefix(text).trim();
+    query = query.replaceFirst(
+      RegExp(
+        r'^(номер\s+[0-9\p{L}-]+\s+)?(?:автобус|маршрут)\s+',
+        caseSensitive: false,
+        unicode: true,
+      ),
+      '',
+    );
+    query = query.replaceFirst(
+      RegExp(
+        r'^(?:когда|через сколько|во сколько|придет|придёт|приедет|подъедет|будет|қашан|кашан)\s+',
+        caseSensitive: false,
+        unicode: true,
+      ),
+      '',
+    );
+    query = query.replaceFirst(
+      RegExp(
+        r'\s+(?:когда|через сколько|во сколько|придет|придёт|приедет|подъедет|будет|қашан|кашан|автобус|маршрут|номер)(?:\s|$).*$',
+        caseSensitive: false,
+        unicode: true,
+      ),
+      '',
+    );
+    return query.trim();
+  }
+
+  NavigationDestinationKind _resolveDestinationKindHint(
+    String text, {
+    required String? destination,
+  }) {
+    final destinationText = destination?.trim() ?? '';
+    if (_looksLikeTransitStopText(text) ||
+        (destinationText.isNotEmpty &&
+            _looksLikeTransitStopText(destinationText))) {
+      return NavigationDestinationKind.transitStop;
+    }
+    return NavigationDestinationKind.generic;
+  }
+
+  bool _looksLikeTransitStopText(String text) {
+    final compact = text.trim();
+    if (compact.isEmpty) return false;
+    return transitStopTriggers.any(compact.contains);
+  }
+
+  String _stripTransitStopPrefix(String text) {
+    return text
+        .replaceFirst(
+          RegExp(
+            r'^(остановк[аеи]?|аялдама(ға|га)?|аялдамасына)\s+',
+            caseSensitive: false,
+            unicode: true,
+          ),
+          '',
+        )
+        .trim();
+  }
+
   bool _looksLikeSetLabelCommand(String text) {
     return setLabelTriggers.any(text.contains);
   }
 
   bool _looksLikeRouteToLabel(String text, String? destination) {
     if (destination == null || destination.trim().isEmpty) return false;
+    if (_looksLikeTransitStopText(text) ||
+        _looksLikeTransitStopText(destination)) {
+      return false;
+    }
     final hasLabelCue =
         routeToLabelTriggers.any(text.contains) ||
         text.contains('метк') ||

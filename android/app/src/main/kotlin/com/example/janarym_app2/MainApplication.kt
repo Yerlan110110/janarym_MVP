@@ -26,18 +26,35 @@ class MainApplication : Application() {
   }
 
   private fun readYandexApiKeyFromFlutterAssets(): String {
-    return try {
-      assets.open("flutter_assets/.env").bufferedReader().useLines { lines ->
-        lines
-          .map { it.trim() }
-          .firstOrNull { it.startsWith("YANDEX_MAPKIT_API_KEY=") }
-          ?.substringAfter("=")
-          ?.trim()
-          ?: ""
+    val assetCandidates = listOf(
+      "flutter_assets/.env",
+      "flutter_assets/.env.example",
+    )
+    for (assetPath in assetCandidates) {
+      val apiKey = runCatching {
+        assets.open(assetPath).bufferedReader().useLines { lines ->
+          for (line in lines) {
+            val value = parseEnvValue(line.trim(), "YANDEX_MAPKIT_API_KEY")
+            if (value != null) {
+              return@useLines value
+            }
+          }
+          ""
+        }
+      }.getOrNull()
+      if (apiKey != null) {
+        return apiKey
       }
-    } catch (_: Exception) {
-      ""
     }
+    return ""
+  }
+
+  private fun parseEnvValue(line: String, key: String): String? {
+    val prefix = "$key="
+    if (!line.startsWith(prefix)) return null
+    val rawValue = line.substringAfter("=").trim()
+    val uncommented = rawValue.substringBefore("#").trim()
+    return uncommented.removeSurrounding("\"").removeSurrounding("'").trim()
   }
 
   private fun isDebuggableApp(): Boolean {

@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:janarym_app2/l10n/app_locale_controller.dart';
 import 'package:janarym_app2/navigation/models/navigation_mode_state.dart';
 import 'package:janarym_app2/navigation/navigation_mode_controller.dart';
+import 'package:janarym_app2/navigation/services/dgis_transit_service.dart';
 import 'package:janarym_app2/navigation/services/location_provider.dart';
 import 'package:janarym_app2/navigation/services/navigation_route_service.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -41,6 +42,7 @@ class _FakeRouteService implements NavigationRouteService {
   _FakeRouteService(this.destination);
 
   final DestinationCandidate destination;
+  NavigationDestinationKind lastSearchKind = NavigationDestinationKind.generic;
 
   @override
   void setLanguage(AppLanguage language) {}
@@ -71,9 +73,61 @@ class _FakeRouteService implements NavigationRouteService {
     required String query,
     required NavPoint origin,
     int limit = 3,
+    NavigationDestinationKind destinationKind =
+        NavigationDestinationKind.generic,
   }) async {
+    lastSearchKind = destinationKind;
     return [destination];
   }
+}
+
+class _FakeTransitService implements NavigationTransitService {
+  _FakeTransitService({
+    required this.stops,
+    this.routesByStop = const <String, List<TransitRouteSummary>>{},
+    this.schedulesByStopAndRoute = const <String, List<TransitScheduleEntry>>{},
+  });
+
+  final List<TransitStopCandidate> stops;
+  final Map<String, List<TransitRouteSummary>> routesByStop;
+  final Map<String, List<TransitScheduleEntry>> schedulesByStopAndRoute;
+
+  String? lastStopQuery;
+  String? lastScheduleRouteName;
+
+  @override
+  void setLanguage(AppLanguage language) {}
+
+  @override
+  Future<List<TransitStopCandidate>> searchStops({
+    required String query,
+    required NavPoint nearLocation,
+    int limit = 3,
+  }) async {
+    lastStopQuery = query;
+    return stops.take(limit).toList(growable: false);
+  }
+
+  @override
+  Future<List<TransitRouteSummary>> getStopRoutes({
+    required TransitStopCandidate stop,
+    NavPoint? nearLocation,
+  }) async {
+    return routesByStop[stop.id] ?? stop.routes;
+  }
+
+  @override
+  Future<List<TransitScheduleEntry>> getScheduledArrivals({
+    required TransitStopCandidate stop,
+    required String routeName,
+    NavPoint? nearLocation,
+  }) async {
+    lastScheduleRouteName = routeName;
+    return schedulesByStopAndRoute['${stop.id}|$routeName'] ?? const [];
+  }
+
+  @override
+  void dispose() {}
 }
 
 void main() {
@@ -81,10 +135,62 @@ void main() {
     late _FakeLocationProvider locationProvider;
     late List<String> spoken;
     late NavigationModeController controller;
+    late _FakeTransitService transitService;
 
     setUp(() {
       spoken = [];
       locationProvider = _FakeLocationProvider();
+      transitService = _FakeTransitService(
+        stops: const <TransitStopCandidate>[
+          TransitStopCandidate(
+            id: 'stop_university',
+            stationId: 'station_university',
+            platformIds: <String>['platform_1'],
+            title: 'Остановка Университет',
+            subtitle: 'Астана',
+            point: NavPoint(latitude: 43.2400, longitude: 76.9000),
+            routes: <TransitRouteSummary>[
+              TransitRouteSummary(
+                routeId: 'route_10',
+                displayName: '10',
+                transportType: 'bus',
+                directionLabels: <String>['Вокзал'],
+              ),
+              TransitRouteSummary(
+                routeId: 'route_12',
+                displayName: '12',
+                transportType: 'bus',
+              ),
+            ],
+          ),
+        ],
+        routesByStop: const <String, List<TransitRouteSummary>>{
+          'stop_university': <TransitRouteSummary>[
+            TransitRouteSummary(
+              routeId: 'route_10',
+              displayName: '10',
+              transportType: 'bus',
+              directionLabels: <String>['Вокзал'],
+            ),
+            TransitRouteSummary(
+              routeId: 'route_12',
+              displayName: '12',
+              transportType: 'bus',
+            ),
+          ],
+        },
+        schedulesByStopAndRoute: const <String, List<TransitScheduleEntry>>{
+          'stop_university|10': <TransitScheduleEntry>[
+            TransitScheduleEntry(
+              routeName: '10',
+              destinationLabel: 'Вокзал',
+              exactTimes: <String>['17:36', '17:42', '17:49'],
+              intervalMinutes: null,
+              sourceType: TransitScheduleSourceType.precise,
+            ),
+          ],
+        },
+      );
       controller = NavigationModeController(
         speak: (text) async => spoken.add(text),
         routeService: _FakeRouteService(
@@ -94,6 +200,7 @@ void main() {
             point: NavPoint(latitude: 43.2400, longitude: 76.9000),
           ),
         ),
+        transitService: transitService,
         locationProvider: locationProvider,
         launchUrlFn: (uri, {mode = LaunchMode.platformDefault}) async => false,
       );
@@ -132,6 +239,53 @@ void main() {
       expect(controller.state.value.navStatus, NavigationStatus.idle);
     });
 
+    test(
+      'routes to stop with transit stop hint and announces stop arrival',
+      () async {
+        final stopRouteService = _FakeRouteService(
+          const DestinationCandidate(
+            title: 'Остановка Университет',
+            subtitle: 'Астана',
+            point: NavPoint(latitude: 43.2400, longitude: 76.9000),
+            kind: NavigationDestinationKind.transitStop,
+          ),
+        );
+        await controller.dispose();
+        controller = NavigationModeController(
+          speak: (text) async => spoken.add(text),
+          routeService: stopRouteService,
+          transitService: transitService,
+          locationProvider: locationProvider,
+          launchUrlFn: (uri, {mode = LaunchMode.platformDefault}) async =>
+              false,
+        );
+
+        await controller.enterMode();
+        await controller.startRouteWithKind(
+          'университет',
+          destinationKind: NavigationDestinationKind.transitStop,
+        );
+
+        expect(transitService.lastStopQuery, 'университет');
+        expect(
+          controller.state.value.activeRoute?.destination.kind,
+          NavigationDestinationKind.transitStop,
+        );
+        expect(
+          controller.state.value.activeRoute?.destination.transitStop?.id,
+          'stop_university',
+        );
+
+        await locationProvider.emit(
+          const NavPoint(latitude: 43.2400, longitude: 76.9000),
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        expect(spoken.last, contains('Вы у остановки'));
+        expect(spoken.last, contains('Университет'));
+      },
+    );
+
     test('speaks in kazakh when language is kk', () async {
       final kkSpoken = <String>[];
       final kkController = NavigationModeController(
@@ -153,6 +307,27 @@ void main() {
       expect(kkSpoken.last, contains('Маршрут режимі қосылды'));
 
       await kkController.dispose();
+    });
+
+    test('speaks compact route list for stop', () async {
+      await controller.enterMode();
+      await controller.speakStopRoutes('университет');
+
+      expect(spoken.last, contains('Университет'));
+      expect(spoken.last, contains('автобус 10'));
+      expect(spoken.last, contains('автобус 12'));
+    });
+
+    test('speaks exact schedule for route at stop', () async {
+      await controller.enterMode();
+      await controller.speakScheduledArrivals(
+        stopQuery: 'университет',
+        routeName: '10',
+      );
+
+      expect(transitService.lastScheduleRouteName, '10');
+      expect(spoken.last, contains('маршрут 10'));
+      expect(spoken.last, contains('17:36'));
     });
   });
 }

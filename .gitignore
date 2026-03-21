@@ -75,3 +75,4 @@ assets/models/vosk-model-ru-0.42.zip
 .env
 .env.local
 .env.backup.*
+assets/runtime/env.runtime

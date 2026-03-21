@@ -167,6 +167,8 @@ class OpenAiClient {
     Map<String, Object?>? perceptionSnapshot,
     String? taskMode,
     int maxOutputTokens = 220,
+    Duration? requestTimeout,
+    int maxAttempts = 3,
   }) async {
     final apiKey = _resolveOpenAiApiKey();
     if (apiKey.isEmpty) {
@@ -220,6 +222,8 @@ class OpenAiClient {
         'Authorization': 'Bearer $apiKey',
       },
       body: jsonEncode(body),
+      requestTimeout: requestTimeout,
+      maxAttempts: maxAttempts,
     );
 
     if (res.statusCode < 200 || res.statusCode >= 300) {
@@ -284,8 +288,10 @@ class OpenAiClient {
     Uri uri, {
     required Map<String, String> headers,
     required String body,
+    Duration? requestTimeout,
+    int maxAttempts = 3,
   }) async {
-    const maxAttempts = 3;
+    final effectiveMaxAttempts = maxAttempts.clamp(1, 3).toInt();
     var attempt = 0;
     Duration? nextDelay;
     while (true) {
@@ -293,8 +299,9 @@ class OpenAiClient {
       try {
         final response = await _httpClient
             .post(uri, headers: headers, body: body)
-            .timeout(_requestTimeout);
-        if (_isRetriableStatus(response.statusCode) && attempt < maxAttempts) {
+            .timeout(requestTimeout ?? _requestTimeout);
+        if (_isRetriableStatus(response.statusCode) &&
+            attempt < effectiveMaxAttempts) {
           nextDelay = _retryDelayForAttempt(
             attempt,
             retryAfter: _extractRetryAfter(response),
@@ -304,7 +311,7 @@ class OpenAiClient {
         }
         return response;
       } on Exception {
-        if (attempt >= maxAttempts) rethrow;
+        if (attempt >= effectiveMaxAttempts) rethrow;
         nextDelay = _retryDelayForAttempt(attempt);
         await Future.delayed(nextDelay);
       }

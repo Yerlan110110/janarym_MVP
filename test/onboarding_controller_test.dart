@@ -7,6 +7,30 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 void main() {
   sqfliteFfiInit();
 
+  group('Onboarding reminder parser', () {
+    test('parses deferred reminder phrases', () {
+      final later = parseOnboardingReminderRequest('позже');
+      expect(later, isNotNull);
+      expect(later!.delay, const Duration(hours: 1));
+
+      final doLater = parseOnboardingReminderRequest('сделаю позже');
+      expect(doLater, isNotNull);
+      expect(doLater!.delay, const Duration(hours: 1));
+
+      final inHour = parseOnboardingReminderRequest('напомни через час');
+      expect(inHour, isNotNull);
+      expect(inHour!.delay, const Duration(hours: 1));
+
+      final tomorrow = parseOnboardingReminderRequest('завтра');
+      expect(tomorrow, isNotNull);
+      expect(tomorrow!.delay, const Duration(days: 1));
+    });
+
+    test('does not treat answer fragments as reminder intent', () {
+      expect(parseOnboardingReminderRequest('да позже'), isNull);
+    });
+  });
+
   group('PersonalizationController onboarding', () {
     late PersonalizationRepository repository;
     late PersonalizationController controller;
@@ -83,6 +107,36 @@ void main() {
       expect(controller.onboardingActive, isTrue);
       expect(controller.snapshot.answers, isEmpty);
       expect(controller.snapshot.profile.displayName, isEmpty);
+    });
+
+    test('persists deferred onboarding and supports force resume', () async {
+      await controller.init();
+      await controller.startOrResumeOnboarding();
+
+      await controller.deferOnboarding(const Duration(hours: 1));
+
+      final deferredUntil =
+          controller.snapshot.profile.onboardingDeferredUntilEpochMs;
+      expect(deferredUntil, isNotNull);
+      expect(controller.onboardingDeferred, isTrue);
+      expect(controller.onboardingActive, isFalse);
+      expect(controller.onboardingPaused, isTrue);
+
+      final loaded = await repository.getProfile();
+      expect(loaded, isNotNull);
+      expect(loaded!.onboardingDeferredUntilEpochMs, deferredUntil);
+
+      await controller.startOrResumeOnboarding();
+      expect(controller.onboardingActive, isFalse);
+      expect(controller.onboardingPaused, isTrue);
+
+      await controller.startOrResumeOnboarding(force: true);
+      expect(controller.onboardingActive, isTrue);
+      expect(controller.onboardingPaused, isFalse);
+      expect(
+        controller.snapshot.profile.onboardingDeferredUntilEpochMs,
+        isNull,
+      );
     });
   });
 }

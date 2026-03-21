@@ -14,6 +14,18 @@ enum CommandSttStatus { idle, listening, error }
 
 enum CommandListenProfile { quickWake, normal, navigation }
 
+bool shouldTranscribeRecordedCommand({
+  required bool skipNoVoice,
+  required bool hadVoice,
+  required int listenMs,
+  required int minForceMs,
+  required bool alwaysTranscribe,
+}) {
+  if (alwaysTranscribe) return true;
+  if (!skipNoVoice) return true;
+  return hadVoice || listenMs >= minForceMs;
+}
+
 class CommandSttState {
   final CommandSttStatus status;
   final String liveWords;
@@ -64,6 +76,7 @@ class CommandSttService {
   AppLanguage _language;
   AppLanguage? _currentLanguageHint;
   bool _currentAllowAutoLanguage = true;
+  bool _currentAlwaysTranscribe = false;
 
   bool get isListening => state.value.isListening;
   AppLocalizations get _l10n => lookupAppLocalizations(_language.locale);
@@ -83,6 +96,7 @@ class CommandSttService {
     int? ampPollMs,
     int? restartCooldownMs,
     int? maxNoSpeechMs,
+    bool alwaysTranscribe = false,
     VoidCallback? onRecordingFinished,
   }) async {
     if (_completer != null) return _completer!.future;
@@ -91,6 +105,7 @@ class CommandSttService {
     final completer = _completer!;
     _currentLanguageHint = languageHint;
     _currentAllowAutoLanguage = allowAutoLanguage;
+    _currentAlwaysTranscribe = alwaysTranscribe;
 
     _setState(
       status: CommandSttStatus.listening,
@@ -203,13 +218,15 @@ class CommandSttService {
     _lastFinishedAt = DateTime.now();
     _currentLanguageHint = null;
     _currentAllowAutoLanguage = true;
+    final alwaysTranscribe = _currentAlwaysTranscribe;
+    _currentAlwaysTranscribe = false;
 
     try {
       if (await _recorder.isRecording()) {
         await _recorder.stop();
       }
     } catch (_) {}
-    
+
     // Notify the caller that they can play the "end" sound
     _onRecordingFinishedCallback?.call();
     _onRecordingFinishedCallback = null;
@@ -227,8 +244,13 @@ class CommandSttService {
           'STT_TRANSCRIBE_FORCE_MS',
           7000,
         ).clamp(1000, 30000);
-        final shouldTranscribe =
-            !skipNoVoice || hadVoice || listenMs >= minForceMs;
+        final shouldTranscribe = shouldTranscribeRecordedCommand(
+          skipNoVoice: skipNoVoice,
+          hadVoice: hadVoice,
+          listenMs: listenMs,
+          minForceMs: minForceMs,
+          alwaysTranscribe: alwaysTranscribe,
+        );
         try {
           if (shouldTranscribe) {
             final text = await _transcribeFile(file);
@@ -345,7 +367,7 @@ class CommandSttService {
   int _defaultDurationSeconds(CommandListenProfile profile) {
     switch (profile) {
       case CommandListenProfile.quickWake:
-        return _readIntEnv('STT_WAKE_QUICK_DURATION_SECONDS', 5).clamp(3, 10);
+        return _readIntEnv('STT_WAKE_QUICK_DURATION_SECONDS', 6).clamp(3, 10);
       case CommandListenProfile.navigation:
         return 8;
       case CommandListenProfile.normal:
@@ -358,7 +380,7 @@ class CommandSttService {
       case CommandListenProfile.quickWake:
         return _readIntEnv(
           'STT_WAKE_QUICK_MIN_LISTEN_MS',
-          260,
+          420,
         ).clamp(200, 3000);
       case CommandListenProfile.navigation:
         return 850;
@@ -372,7 +394,7 @@ class CommandSttService {
       case CommandListenProfile.quickWake:
         return _readIntEnv(
           'STT_WAKE_QUICK_SILENCE_HOLD_MS',
-          420,
+          900,
         ).clamp(300, 3000);
       case CommandListenProfile.navigation:
         return 1100;
@@ -384,7 +406,7 @@ class CommandSttService {
   int _defaultAmpPollMs(CommandListenProfile profile) {
     switch (profile) {
       case CommandListenProfile.quickWake:
-        return _readIntEnv('STT_WAKE_QUICK_AMP_POLL_MS', 70).clamp(60, 200);
+        return _readIntEnv('STT_WAKE_QUICK_AMP_POLL_MS', 85).clamp(60, 200);
       case CommandListenProfile.navigation:
         return 95;
       case CommandListenProfile.normal:
@@ -397,7 +419,7 @@ class CommandSttService {
       case CommandListenProfile.quickWake:
         return _readIntEnv(
           'STT_WAKE_QUICK_RESTART_COOLDOWN_MS',
-          60,
+          90,
         ).clamp(0, 1000);
       case CommandListenProfile.navigation:
         return 180;

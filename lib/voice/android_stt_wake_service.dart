@@ -38,6 +38,8 @@ class AndroidSttWakeService {
   AndroidSttWakeService({this.debugLogs = false});
 
   final bool debugLogs;
+  static bool get _isAndroid =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
   static const MethodChannel _channel = MethodChannel('janarym/stt_wake');
   static const EventChannel _events = EventChannel('janarym/stt_wake/events');
@@ -49,7 +51,7 @@ class AndroidSttWakeService {
     required bool partialResults,
     bool preferOffline = true,
   }) async {
-    if (defaultTargetPlatform != TargetPlatform.android) {
+    if (!_isAndroid) {
       return;
     }
     await _channel.invokeMethod<void>('initialize', {
@@ -60,7 +62,7 @@ class AndroidSttWakeService {
   }
 
   Future<bool> isAvailable() async {
-    if (defaultTargetPlatform != TargetPlatform.android) {
+    if (!_isAndroid) {
       return false;
     }
     final value = await _channel.invokeMethod<bool>('isAvailable');
@@ -68,35 +70,35 @@ class AndroidSttWakeService {
   }
 
   Future<void> start() async {
-    if (defaultTargetPlatform != TargetPlatform.android) {
+    if (!_isAndroid) {
       return;
     }
     await _channel.invokeMethod<void>('start');
   }
 
   Future<void> stop() async {
-    if (defaultTargetPlatform != TargetPlatform.android) {
+    if (!_isAndroid) {
       return;
     }
     await _channel.invokeMethod<void>('stop');
   }
 
   Future<void> cancel() async {
-    if (defaultTargetPlatform != TargetPlatform.android) {
+    if (!_isAndroid) {
       return;
     }
     await _channel.invokeMethod<void>('cancel');
   }
 
   Future<void> dispose() async {
-    if (defaultTargetPlatform != TargetPlatform.android) {
+    if (!_isAndroid) {
       return;
     }
     await _channel.invokeMethod<void>('dispose');
   }
 
   Future<Map<String, dynamic>> status() async {
-    if (defaultTargetPlatform != TargetPlatform.android) {
+    if (!_isAndroid) {
       return <String, dynamic>{'status': 'unavailable'};
     }
     final raw = await _channel.invokeMethod<dynamic>('status');
@@ -109,6 +111,9 @@ class AndroidSttWakeService {
   }
 
   Stream<SttWakeEvent> get events {
+    if (!_isAndroid) {
+      return _sharedStream ??= Stream<SttWakeEvent>.empty().asBroadcastStream();
+    }
     return _sharedStream ??= _events
         .receiveBroadcastStream()
         .map((event) => SttWakeEvent.fromMap(event as Map<dynamic, dynamic>))

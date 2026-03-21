@@ -11,7 +11,8 @@ class OnDeviceTextReadResult {
     required this.rawText,
     required this.blocks,
     required this.manualFallbackText,
-    required this.dominantScript,
+    required this.rawDominantScript,
+    required this.looksPseudoRussianOcr,
     required this.isAutoSpeakSafe,
     this.price,
     this.calories,
@@ -20,15 +21,21 @@ class OnDeviceTextReadResult {
   final String rawText;
   final List<String> blocks;
   final String manualFallbackText;
-  final DetectedTextScript dominantScript;
+  final DetectedTextScript rawDominantScript;
+  final bool looksPseudoRussianOcr;
   final bool isAutoSpeakSafe;
   final double? price;
   final int? calories;
 
+  List<String> get orderedLines => blocks;
+
   bool get hasRawText => rawText.trim().isNotEmpty;
   bool get hasStructuredData => price != null || calories != null;
 
-  bool get hasText => blocks.isNotEmpty || manualFallbackText.trim().isNotEmpty || hasStructuredData;
+  bool get hasText =>
+      blocks.isNotEmpty ||
+      manualFallbackText.trim().isNotEmpty ||
+      hasStructuredData;
 
   String get kind {
     if (price != null) return 'price';
@@ -79,6 +86,7 @@ class OnDeviceTextReaderService {
     CameraFrameSnapshot frame, {
     Duration minInterval = _defaultMinInterval,
     bool force = false,
+    bool aggressiveShortText = false,
   }) async {
     if (frame.nv21Bytes.isEmpty) return null;
     final now = DateTime.now();
@@ -92,7 +100,10 @@ class OnDeviceTextReaderService {
     if (inFlight != null) {
       return inFlight;
     }
-    final future = _readFrameInternal(frame);
+    final future = _readFrameInternal(
+      frame,
+      aggressiveShortText: aggressiveShortText,
+    );
     _inFlightRead = future;
     try {
       final result = await future;
@@ -107,8 +118,9 @@ class OnDeviceTextReaderService {
   }
 
   Future<OnDeviceTextReadResult?> _readFrameInternal(
-    CameraFrameSnapshot frame,
-  ) async {
+    CameraFrameSnapshot frame, {
+    required bool aggressiveShortText,
+  }) async {
     final inputImage = InputImage.fromBytes(
       bytes: frame.nv21Bytes,
       metadata: InputImageMetadata(
@@ -119,31 +131,38 @@ class OnDeviceTextReaderService {
       ),
     );
     final recognized = await _textRecognizer.processImage(inputImage);
-    final rawText = recognized.text.trim();
+    final rawText = _cleanWhitespace(recognized.text);
     if (rawText.isEmpty) {
       return null;
     }
 
-    final spatialBlocks = _buildSpatialTextBlocks(recognized.blocks);
-    final normalizedText = TextReadingNormalizer.normalizeForAutoSpeech(rawText);
-    final dominantScript = TextReadingNormalizer.detectScript(normalizedText);
-    
-    final price = _extractPrice(normalizedText);
-    final calories = _extractCalories(normalizedText);
-    final manualFallbackText = buildManualFallbackText(rawText);
-
-    final autoSpeechText = spatialBlocks.join(' ');
+    final spatialBlocks = _buildSpatialTextBlocks(
+      recognized.blocks,
+      aggressiveShortText: aggressiveShortText,
+    );
+    final rawDominantScript = TextReadingNormalizer.detectScript(rawText);
+    final looksPseudoRussianOcr =
+        TextReadingNormalizer.looksLikePseudoRussianOcr(rawText);
+    final price = _extractPrice(rawText);
+    final calories = _extractCalories(rawText);
+    final manualFallbackText = buildManualFallbackText(
+      rawText,
+      aggressiveShortText: aggressiveShortText,
+    );
 
     return OnDeviceTextReadResult(
       rawText: rawText,
       blocks: spatialBlocks,
       manualFallbackText: manualFallbackText,
-      dominantScript: dominantScript,
+      rawDominantScript: rawDominantScript,
+      looksPseudoRussianOcr: looksPseudoRussianOcr,
       isAutoSpeakSafe: _isAutoSpeakSafe(
-        dominantScript: dominantScript,
+        rawDominantScript: rawDominantScript,
+        looksPseudoRussianOcr: looksPseudoRussianOcr,
         autoSpeechText: autoAnswerText(spatialBlocks),
         price: price,
         calories: calories,
+        aggressiveShortText: aggressiveShortText,
       ),
       price: price,
       calories: calories,
@@ -155,73 +174,57 @@ class OnDeviceTextReaderService {
     return blocks.first;
   }
 
-  List<String> _buildSpatialTextBlocks(List<TextBlock> rawBlocks) {
+  List<String> _buildSpatialTextBlocks(
+    List<TextBlock> rawBlocks, {
+    required bool aggressiveShortText,
+  }) {
     if (rawBlocks.isEmpty) return const [];
 
-    // 1. Extract all lines with their bounding boxes
     final allLines = rawBlocks.expand((b) => b.lines).toList();
     if (allLines.isEmpty) return const [];
 
-    // 2. Sort primarily by Y, then by X
     allLines.sort((a, b) {
       final topDiff = a.boundingBox.top - b.boundingBox.top;
       if (topDiff.abs() > 15) return topDiff.toInt();
       return (a.boundingBox.left - b.boundingBox.left).toInt();
     });
 
-    final groups = <List<TextLine>>[];
-    for (final line in allLines) {
-      // Filering out single/double char snippets early (often noise)
-      if (line.text.trim().length < 3) continue;
-
-      bool foundGroup = false;
-      for (final group in groups) {
-        final lastInGroup = group.last;
-        final verticalDist = (line.boundingBox.top - lastInGroup.boundingBox.bottom).abs();
-        final horizontalOverlap = _horizontalOverlap(line.boundingBox, lastInGroup.boundingBox);
-        final height = lastInGroup.boundingBox.height;
-        
-        // Stricter grouping: lines must be very close vertically and overlapping horizontally.
-        if (verticalDist < height * 0.7 && horizontalOverlap > 0) {
-          group.add(line);
-          foundGroup = true;
-          break;
-        }
-      }
-      if (!foundGroup) {
-        groups.add([line]);
-      }
-    }
-
-    // 3. Convert groups to normalized text blocks
-    return groups.map((group) {
-      final text = group.map((l) => l.text).join(' ');
-      return TextReadingNormalizer.normalizeForAutoSpeech(text);
-    }).where((t) {
-      // Must be long enough to be meaningful and pass phonetic filter
-      return t.length >= 8 && TextReadingNormalizer.isSpeechSafe(t);
-    }).toList();
+    return allLines
+        .map((line) => _cleanWhitespace(line.text))
+        .map(TextReadingNormalizer.normalizeCyrillicLookalikes)
+        .where((line) => line.isNotEmpty)
+        .where(_containsLetterOrDigit)
+        .toList(growable: false);
   }
 
   double _horizontalOverlap(Rect a, Rect b) {
-    final overlap = (a.right < b.right ? a.right : b.right) - (a.left > b.left ? a.left : b.left);
+    final overlap =
+        (a.right < b.right ? a.right : b.right) -
+        (a.left > b.left ? a.left : b.left);
     return overlap;
   }
 
   bool _isAutoSpeakSafe({
-    required DetectedTextScript dominantScript,
+    required DetectedTextScript rawDominantScript,
+    required bool looksPseudoRussianOcr,
     required String autoSpeechText,
     required double? price,
     required int? calories,
+    required bool aggressiveShortText,
   }) {
     if (price != null || calories != null) return true;
     final text = autoSpeechText.trim();
-    if (text.length < 12) return false;
-    
-    // Safety: never auto-read pure Latin unless it's structured data (handled above)
-    // because most Latin on boxes in RU regions is technical gibberish.
-    if (dominantScript == DetectedTextScript.latin) return false;
-    
+    if (text.length < (aggressiveShortText ? 4 : 8)) return false;
+
+    if (looksPseudoRussianOcr) return false;
+    if (rawDominantScript == DetectedTextScript.unknown) {
+      return false;
+    }
+    if (rawDominantScript == DetectedTextScript.latin &&
+        !TextReadingNormalizer.shouldUseEnglishTts(text)) {
+      return false;
+    }
+
     return TextReadingNormalizer.isSpeechSafe(text);
   }
 

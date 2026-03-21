@@ -5,7 +5,7 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart' show DeviceOrientation;
+import 'package:flutter/services.dart' show DeviceOrientation, rootBundle;
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:geolocator/geolocator.dart';
@@ -37,10 +37,15 @@ import 'services/scene_memory_service.dart';
 import 'services/shopping_mode_service.dart';
 import 'services/text_reader_decision_helper.dart';
 import 'services/text_reading_normalizer.dart';
+import 'text_reader/text_reader_controller.dart';
+import 'text_reader/text_reader_engine.dart';
+import 'text_reader/text_reader_types.dart';
 import 'widgets/bbox_painter.dart';
 import 'voice/android_stt_wake_service.dart';
 import 'voice/command_stt_service.dart';
+import 'voice/mic_cue_policy.dart';
 import 'voice/spoken_language_detector.dart';
+import 'voice/wake_cue_service.dart';
 import 'voice/wake_engine_mode.dart';
 import 'voice/wake_phrase_matcher.dart';
 import 'voice/wake_word_service.dart';
@@ -106,9 +111,38 @@ String _readEnvString(String key, {String fallback = ''}) {
   }
 }
 
+Future<void> _loadRuntimeEnv() async {
+  Future<String> loadOptionalAsset(String assetPath) async {
+    try {
+      return await rootBundle.loadString(assetPath);
+    } catch (_) {
+      return '';
+    }
+  }
+
+  final defaults = await loadOptionalAsset('.env.example');
+  final runtime = await loadOptionalAsset('assets/runtime/env.runtime');
+
+  dotenv.loadFromString(
+    envString: defaults,
+    overrideWith: runtime.isEmpty ? const [] : [runtime],
+    isOptional: true,
+  );
+
+  final openAiKeyLoaded =
+      (dotenv.maybeGet('OPENAI_API_KEY') ?? dotenv.maybeGet('OPENAI_KEY') ?? '')
+          .trim()
+          .isNotEmpty;
+  debugPrint(
+    '[Env] defaults_loaded=${defaults.isNotEmpty} '
+    'runtime_loaded=${runtime.isNotEmpty} '
+    'openai_key_loaded=$openAiKeyLoaded',
+  );
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await dotenv.load(fileName: '.env');
+  await _loadRuntimeEnv();
   runApp(const JanarymApp());
 }
 
@@ -179,7 +213,7 @@ enum _DialogBrevityMode { auto, short, detailed }
 
 enum _TextReaderReadSource { voice, tap, auto }
 
-enum _TextReaderSessionState { idle, preparing, scanning, speaking, failed }
+enum _TextReaderSessionState { idle, scanning, speaking, paused, failed }
 
 class _LabelCorrectionDraft {
   const _LabelCorrectionDraft({this.labelName, this.addressText});
@@ -243,6 +277,7 @@ class _JanarymHomeState extends State<JanarymHome>
     with WidgetsBindingObserver, TickerProviderStateMixin {
   final FlutterTts _tts = FlutterTts();
   final AudioPlayer _sfxPlayer = AudioPlayer();
+  final WakeCueService _wakeCueService = WakeCueService();
   final CommandRouter _router = CommandRouter();
   final OpenAiClient _openAi = OpenAiClient();
   final PersonalizationDatabase _personalizationDatabase =
@@ -263,6 +298,8 @@ class _JanarymHomeState extends State<JanarymHome>
   late final PerceptionEventBus _perceptionEventBus;
   late final ReflexEngine _reflexEngine;
   late final OnDeviceTextReaderService _textReaderService;
+  late final TextReaderEngine _textReaderEngine;
+  late final TextReaderController _textReaderController;
   late final OpenMeteoService _openMeteoService;
   late final SceneMemoryService _sceneMemoryService;
   late final ShoppingModeService _shoppingModeService;
@@ -311,8 +348,10 @@ class _JanarymHomeState extends State<JanarymHome>
   bool _personalizationReady = false;
   bool _showOnboardingOverlay = true;
   bool _onboardingDialogInProgress = false;
+  Timer? _onboardingReminderTimer;
   static const int _maxFrameAgeMs = 8000;
   static const double _manualTextReadAcceptScore = 35.0;
+  static const double _manualTextReadAggressiveAcceptScore = 24.0;
   static const int _manualTextReadAttempts = 3;
   static const int _manualTextReadFirstTimeoutMs = 850;
   static const int _manualTextReadRetryTimeoutMs = 550;
@@ -348,11 +387,13 @@ class _JanarymHomeState extends State<JanarymHome>
   DateTime? _sttWakeFatalErrorWindowStartedAt;
   DateTime? _sttWakeUnavailableSince;
   DateTime? _sttWakeLastEventAt;
+  String? _sttWakeLanguageOverride;
   int _sttWakeFatalErrors = 0;
   String _lastSttWakeMatch = 'none';
   String _lastSttWakeReason = 'idle';
   StreamSubscription<SttWakeEvent>? _sttWakeSubscription;
   Timer? _sttWakeWatchdogTimer;
+  Future<void> _permissionRequestTail = Future<void>.value();
   bool _textReaderLoopBusy = false;
   bool _manualTextReadInProgress = false;
   final Set<String> _recentReadSegments = <String>{};
@@ -373,7 +414,7 @@ class _JanarymHomeState extends State<JanarymHome>
   final bool _sttWakeEnabled = _readEnvBool('STT_WAKE_ENABLED', fallback: true);
   final String _sttWakeLanguage = _readEnvString(
     'STT_WAKE_LANGUAGE',
-    fallback: 'kk-KZ',
+    fallback: 'ru-RU',
   );
   final bool _sttWakePartialResultsEnabled = _readEnvBool(
     'STT_WAKE_PARTIAL_RESULTS_ENABLED',
@@ -407,7 +448,7 @@ class _JanarymHomeState extends State<JanarymHome>
   );
   final bool _sttWakePreferOffline = _readEnvBool(
     'STT_WAKE_PREFER_OFFLINE',
-    fallback: true,
+    fallback: false,
   );
   final int _sttWakeWatchdogMaxSilenceMs = _readEnvInt(
     'STT_WAKE_WATCHDOG_MAX_SILENCE_MS',
@@ -501,15 +542,27 @@ class _JanarymHomeState extends State<JanarymHome>
   );
   final int _textReaderFrameIntervalMs = _readEnvInt(
     'TEXT_READER_FRAME_INTERVAL_MS',
-    fallback: 550,
-    min: 450,
-    max: 1000,
+    fallback: 320,
+    min: 300,
+    max: 900,
   );
   final int _textReaderSpeechCooldownMs = _readEnvInt(
     'TEXT_READER_SPEECH_COOLDOWN_MS',
     fallback: 1500,
     min: 700,
     max: 5000,
+  );
+  final int _textReaderVisionCooldownMs = _readEnvInt(
+    'TEXT_READER_GPT_COOLDOWN_MS',
+    fallback: 2200,
+    min: 1200,
+    max: 10000,
+  );
+  final int _textReaderVisionTimeoutMs = _readEnvInt(
+    'TEXT_READER_GPT_TIMEOUT_MS',
+    fallback: 4500,
+    min: 2500,
+    max: 12000,
   );
   final int _textReaderStableFramesRequired = _readEnvInt(
     'TEXT_READER_STABLE_FRAMES',
@@ -523,8 +576,9 @@ class _JanarymHomeState extends State<JanarymHome>
   int _lastAutoTextReaderExactMs = 0;
   String _pendingAutoTextReaderSignature = '';
   int _pendingAutoTextReaderSeenCount = 0;
-  String _lastAutoTextReaderVisionFallbackSignature = '';
-  int _lastAutoTextReaderVisionFallbackMs = 0;
+  String _lastTextReaderVisionSignature = '';
+  int _lastTextReaderVisionMs = 0;
+  bool _textReaderVisionRequestInFlight = false;
   bool get _wakeDebugOverlayEnabled =>
       _featureFlags.developerDiagnosticsEnabled &&
       _readEnvBool('WAKE_DEBUG_OVERLAY', fallback: true);
@@ -541,11 +595,15 @@ class _JanarymHomeState extends State<JanarymHome>
   );
   static const int _wakeRecoveryMaxAttempts = 2;
   static const int _textReaderAutoExactCooldownMs = 6000;
-  static const int _textReaderAutoVisionFallbackCooldownMs = 6000;
   DateTime? _lastWakeRecoveryAttemptAt;
 
   bool get _useSttWakeEngine =>
-      _wakeEngineMode == WakeEngineMode.sttAndroid && _sttWakeEnabled;
+      // SpeechRecognizer may still show system mic UX/audio on some Android
+      // devices. The app only suppresses its own cues outside wake accept.
+      !kIsWeb &&
+      defaultTargetPlatform == TargetPlatform.android &&
+      _wakeEngineMode == WakeEngineMode.sttAndroid &&
+      _sttWakeEnabled;
 
   @override
   void initState() {
@@ -564,6 +622,29 @@ class _JanarymHomeState extends State<JanarymHome>
       enabled: _featureFlags.reflexEnabled,
     );
     _textReaderService = OnDeviceTextReaderService();
+    _textReaderEngine = const TextReaderEngine();
+    _textReaderController = TextReaderController(
+      engine: _textReaderEngine,
+      readOnDevice: ({required bool force, required Duration timeout}) =>
+          _readTextFromCurrentFrame(force: force, timeout: timeout),
+      readVisionFallback:
+          ({
+            required bool autoRead,
+            required String reason,
+            required int timeoutMs,
+            required int maxAttempts,
+          }) => _tryTextReaderVisionFallback(
+            fastMode: true,
+            autoRead: autoRead,
+            reason: reason,
+            timeoutMs: timeoutMs,
+            maxAttempts: maxAttempts,
+          ),
+      autoGptCooldownMs: _textReaderVisionCooldownMs,
+      autoGptTimeoutMs: 2500,
+      manualGptTimeoutMs: 3500,
+      tapBurstCount: 3,
+    );
     _openMeteoService = OpenMeteoService();
     _sceneMemoryService = SceneMemoryService(
       database: _personalizationDatabase,
@@ -605,6 +686,7 @@ class _JanarymHomeState extends State<JanarymHome>
     _sttService = CommandSttService(language: _interactionLanguage);
     _wakeService = WakeWordService(onWakeWordDetected: _handleWakeDetected);
     _sttWakeService = AndroidSttWakeService(debugLogs: _sttWakeDebugLogs);
+    unawaited(_wakeCueService.preload());
     _openAi.setLanguage(_interactionLanguage);
     _dialogBrevityMode = _parseInitialBrevityMode(_dialogBrevityDefaultRaw);
     _micMessage = _l10n.checkingMic;
@@ -672,6 +754,8 @@ class _JanarymHomeState extends State<JanarymHome>
     _modePickerAutoCloseTimer = null;
     _textReaderLoopTimer?.cancel();
     _textReaderLoopTimer = null;
+    _onboardingReminderTimer?.cancel();
+    _onboardingReminderTimer = null;
     _wakeFallbackEscalationTimer?.cancel();
     _wakeFallbackEscalationTimer = null;
     _wakeRecoveryTimer?.cancel();
@@ -692,13 +776,13 @@ class _JanarymHomeState extends State<JanarymHome>
     await _initMicAndWake();
     if (!mounted) return;
     _startCameraKeepAlive();
-    if (_featureFlags.aggressiveBackgroundCamera || _modeNeedsLiveCamera(_assistantMode)) {
+    if (_featureFlags.aggressiveBackgroundCamera ||
+        _modeNeedsLiveCamera(_assistantMode)) {
       await _initCameraLive();
     }
     await _syncHeavyServices();
     await _initPersonalization();
     if (!mounted) return;
-    await _announceModesOnStartup();
   }
 
   AppLocalizations get _voiceL10n =>
@@ -751,6 +835,47 @@ class _JanarymHomeState extends State<JanarymHome>
     _sttWakeWatchdogTimer = null;
   }
 
+  String get _effectiveSttWakeLanguage {
+    final override = _sttWakeLanguageOverride?.trim() ?? '';
+    if (override.isNotEmpty) return override;
+    final configured = _sttWakeLanguage.trim();
+    if (configured.isNotEmpty) return configured;
+    return 'ru-RU';
+  }
+
+  String? _fallbackSttWakeLanguageFor(String currentLanguage) {
+    final normalizedCurrent = currentLanguage.trim().toLowerCase();
+    final candidates = <String>[
+      _sttWakeLanguage.trim(),
+      'ru-RU',
+      'ru',
+      'en-US',
+    ];
+    for (final candidate in candidates) {
+      final value = candidate.trim();
+      if (value.isEmpty) continue;
+      if (value.toLowerCase() == normalizedCurrent) continue;
+      return value;
+    }
+    return null;
+  }
+
+  Future<T> _runSerializedPermissionRequest<T>(
+    Future<T> Function() action,
+  ) async {
+    final previous = _permissionRequestTail;
+    final completer = Completer<void>();
+    _permissionRequestTail = completer.future;
+    await previous;
+    try {
+      return await action();
+    } finally {
+      if (!completer.isCompleted) {
+        completer.complete();
+      }
+    }
+  }
+
   Future<void> _checkSttWakeWatchdog() async {
     if (!_useSttWakeEngine || !mounted) return;
     if (!_sttWakeArmed ||
@@ -782,9 +907,10 @@ class _JanarymHomeState extends State<JanarymHome>
   Future<void> _initializeSttWakeIfNeeded({bool force = false}) async {
     if (!_useSttWakeEngine) return;
     if (_sttWakeInitialized && !force) return;
+    final language = _effectiveSttWakeLanguage;
     try {
       await _sttWakeService.initialize(
-        language: _sttWakeLanguage,
+        language: language,
         partialResults: _sttWakePartialResultsEnabled,
         preferOffline: _sttWakePreferOffline,
       );
@@ -796,7 +922,7 @@ class _JanarymHomeState extends State<JanarymHome>
       _markSttWakeRecovered('initialize');
       if (_sttWakeDebugLogs) {
         appLog(
-          '[STTWake] initialize language=$_sttWakeLanguage '
+          '[STTWake] initialize language=$language '
           'partials=$_sttWakePartialResultsEnabled '
           'offline=$_sttWakePreferOffline',
         );
@@ -891,6 +1017,13 @@ class _JanarymHomeState extends State<JanarymHome>
         event.errorName == 'ERROR_INSUFFICIENT_PERMISSIONS';
   }
 
+  bool _isUnsupportedSttWakeLanguageEvent(SttWakeEvent event) {
+    return event.errorCode == 12 ||
+        event.errorCode == 13 ||
+        event.errorName == 'ERROR_LANGUAGE_NOT_SUPPORTED' ||
+        event.errorName == 'ERROR_LANGUAGE_UNAVAILABLE';
+  }
+
   void _recordSttWakeFatalError() {
     final now = DateTime.now();
     final startedAt = _sttWakeFatalErrorWindowStartedAt;
@@ -921,23 +1054,27 @@ class _JanarymHomeState extends State<JanarymHome>
         if (_sttWakeAcceptInFlight) return;
         final text = (event.text ?? '').trim();
         if (text.isEmpty) return;
-        if (_sttWakeDebugLogs) {
-          appLog('[STTWake] ${event.status}="${_truncateForLog(text)}"');
-        }
         final match = WakePhraseMatcher.match(
           text,
           isPartial: event.status == 'partial',
         );
+        if (_sttWakeDebugLogs) {
+          appLog(
+            '[STTWake] ${event.status}="${_truncateForLog(text)}" '
+            'match=${match.strength.name} reason=${match.reason} '
+            'candidate="${match.normalized}"',
+          );
+        }
         _lastSttWakeMatch = match.strength.name;
         _lastSttWakeReason = match.reason;
-        final accepted = match.strength == WakeMatchStrength.strong ||
-                         match.strength == WakeMatchStrength.probable;
+        final accepted = WakePhraseMatcher.isAccepted(match);
         if (!accepted) {
           return;
         }
         appLog(
           '[STTWake] accepted ${event.status} '
-          'match=${match.strength.name} reason=${match.reason}',
+          'match=${match.strength.name} reason=${match.reason} '
+          'candidate="${match.normalized}"',
         );
         _sttWakeAcceptInFlight = true;
         await _stopSttWake(reason: 'accepted_${event.status}', cancel: true);
@@ -955,6 +1092,29 @@ class _JanarymHomeState extends State<JanarymHome>
           '[STTWake] error code=${event.errorCode ?? '-'} '
           'name=${event.errorName ?? '-'} reason=${event.reason ?? '-'}',
         );
+        if (_isUnsupportedSttWakeLanguageEvent(event)) {
+          final currentLanguage = (event.locale ?? _effectiveSttWakeLanguage)
+              .trim();
+          final fallbackLanguage = _fallbackSttWakeLanguageFor(currentLanguage);
+          if (fallbackLanguage != null) {
+            _sttWakeLanguageOverride = fallbackLanguage;
+            appLog(
+              '[STTWake] language fallback '
+              '$currentLanguage -> $fallbackLanguage',
+            );
+            Future<void>.delayed(
+              Duration(milliseconds: _sttWakeRestartDelayMs),
+              () async {
+                if (!mounted || !_useSttWakeEngine) return;
+                await _syncPrimaryWakeMode();
+              },
+            );
+            return;
+          }
+          _markSttWakeUnavailable('language_unsupported');
+          await _syncPrimaryWakeMode();
+          return;
+        }
         if (_isFatalSttWakeEvent(event)) {
           _recordSttWakeFatalError();
           if (_sttWakeUnavailable) {
@@ -1276,7 +1436,7 @@ class _JanarymHomeState extends State<JanarymHome>
       if (locale.startsWith(localePrefix)) score += 160;
       if (locale == localeCode.toLowerCase()) score += 40;
       if (_looksLikeFemaleVoiceName(name)) score += 12;
-      
+
       // Prioritize modern high-quality voices to avoid "robotic" sound
       if (name.contains('neural') || name.contains('natural')) score += 60;
       if (name.contains('premium') || name.contains('enhanced')) score += 40;
@@ -1407,28 +1567,9 @@ class _JanarymHomeState extends State<JanarymHome>
     } catch (_) {}
   }
 
-  Future<void> _playStartCue() async {
-    if (!_audioCuesEnabled) return;
-    try {
-      await _sfxPlayer.stop();
-      await _sfxPlayer.play(AssetSource('sounds/start.wav'), volume: 0.7);
-    } catch (_) {}
-  }
-
   Future<void> _playWakeCue() async {
     if (!_wakeCueEnabled) return;
-    try {
-      await _sfxPlayer.stop();
-      await _sfxPlayer.play(AssetSource('sounds/start.wav'), volume: 0.85);
-    } catch (_) {}
-  }
-
-  Future<void> _playEndCue() async {
-    if (!_audioCuesEnabled) return;
-    try {
-      await _sfxPlayer.stop();
-      await _sfxPlayer.play(AssetSource('sounds/end.wav'), volume: 0.7);
-    } catch (_) {}
+    await _wakeCueService.play();
   }
 
   Future<void> _playThinkingCue() async {
@@ -1478,17 +1619,99 @@ class _JanarymHomeState extends State<JanarymHome>
     }
     _interactionLanguagePinned = false;
     _setCircleState(CircleState.wake);
-    if (_useSttWakeEngine) {
+    _maybeStartOnboardingDialog();
+    if (_useSttWakeEngine && !_onboardingDialogInProgress) {
       unawaited(_syncPrimaryWakeMode());
     }
   }
 
+  bool get _canPromptOnboardingNow =>
+      mounted &&
+      _micGranted &&
+      !_commandInFlight &&
+      !_followUpActive &&
+      !_wakeHandling &&
+      !_isSpeaking &&
+      !_sttService.isListening &&
+      !_manualTextReadInProgress &&
+      _gptStatus != GptStatus.loading &&
+      !_onboardingDialogInProgress;
+
+  void _syncOnboardingReminderTimer() {
+    _onboardingReminderTimer?.cancel();
+    _onboardingReminderTimer = null;
+    if (!_personalizationReady ||
+        !_personalizationController.onboardingRequired) {
+      return;
+    }
+    final until = _personalizationController
+        .snapshot
+        .profile
+        .onboardingDeferredUntilEpochMs;
+    if (until == null) return;
+    final delayMs = until - DateTime.now().millisecondsSinceEpoch;
+    if (delayMs <= 0) {
+      unawaited(_resumeDeferredOnboardingIfReady());
+      return;
+    }
+    _onboardingReminderTimer = Timer(Duration(milliseconds: delayMs), () {
+      unawaited(_resumeDeferredOnboardingIfReady());
+    });
+  }
+
+  Future<void> _resumeDeferredOnboardingIfReady() async {
+    if (!mounted ||
+        !_personalizationReady ||
+        !_personalizationController.onboardingRequired) {
+      return;
+    }
+    await _personalizationController.startOrResumeOnboarding();
+    if (!mounted) return;
+    _syncOnboardingReminderTimer();
+    if (_personalizationController.onboardingActive) {
+      if (!_showOnboardingOverlay) {
+        setState(() {
+          _showOnboardingOverlay = true;
+        });
+      }
+      if (_canPromptOnboardingNow) {
+        _maybeStartOnboardingDialog();
+      }
+    }
+  }
+
+  Future<void> _deferOnboarding(
+    OnboardingReminderRequest request, {
+    bool speakAck = true,
+  }) async {
+    await _personalizationController.deferOnboarding(request.delay);
+    if (!mounted) return;
+    _syncOnboardingReminderTimer();
+    setState(() {
+      _showOnboardingOverlay = false;
+    });
+    if (!speakAck) return;
+    await _speakOnboardingLine(
+      _voiceText(
+        ru: 'Хорошо, напомню ${request.labelRu}.',
+        kk: 'Жақсы, ${request.labelKk} қайта еске саламын.',
+      ),
+    );
+  }
+
   Future<bool> _ensureNotificationPermission() async {
     if (defaultTargetPlatform != TargetPlatform.android) return true;
-    var status = await Permission.notification.status;
-    if (status.isGranted || status.isLimited) return true;
-    status = await Permission.notification.request();
-    return status.isGranted || status.isLimited;
+    try {
+      var status = await Permission.notification.status;
+      if (status.isGranted || status.isLimited) return true;
+      status = await _runSerializedPermissionRequest(
+        () => Permission.notification.request(),
+      );
+      return status.isGranted || status.isLimited;
+    } catch (e) {
+      appLog('[Perm] notification request failed: $e');
+      return false;
+    }
   }
 
   Future<bool> _ensureLocationPermission() async {
@@ -1503,32 +1726,57 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   Future<bool> _ensureMicPermission() async {
-    var status = await Permission.microphone.status;
-    if (!mounted) return false;
-    if (!status.isGranted) {
-      status = await Permission.microphone.request();
-    }
-    if (!mounted) return false;
+    try {
+      var status = await Permission.microphone.status;
+      if (!mounted) return false;
+      if (!status.isGranted) {
+        status = await _runSerializedPermissionRequest(
+          () => Permission.microphone.request(),
+        );
+      }
+      if (!mounted) return false;
 
-    if (status.isGranted) {
+      if (status.isGranted) {
+        setState(() {
+          _micGranted = true;
+          _micMessage = _l10n.micAvailable;
+        });
+        return true;
+      }
+
       setState(() {
-        _micGranted = true;
-        _micMessage = _l10n.micAvailable;
+        _micGranted = false;
+        _micMessage = status.isPermanentlyDenied
+            ? _l10n.micAccessDenied
+            : _l10n.micAccessRequired;
       });
-      return true;
+      return false;
+    } catch (e) {
+      appLog('[Perm] microphone request failed: $e');
+      if (!mounted) return false;
+      setState(() {
+        _micGranted = false;
+        _micMessage = _l10n.micAccessRequired;
+      });
+      return false;
     }
-
-    setState(() {
-      _micGranted = false;
-      _micMessage = status.isPermanentlyDenied
-          ? _l10n.micAccessDenied
-          : _l10n.micAccessRequired;
-    });
-    return false;
   }
 
   Future<void> _initMicAndWake() async {
-    final status = await Permission.microphone.request();
+    PermissionStatus status;
+    try {
+      status = await _runSerializedPermissionRequest(
+        () => Permission.microphone.request(),
+      );
+    } catch (e) {
+      appLog('[Perm] initial microphone request failed: $e');
+      if (!mounted) return;
+      setState(() {
+        _micGranted = false;
+        _micMessage = _l10n.micAccessRequired;
+      });
+      return;
+    }
     if (!mounted) return;
 
     if (status.isGranted) {
@@ -1560,7 +1808,6 @@ class _JanarymHomeState extends State<JanarymHome>
         }
       }
       _maybeStartOnboardingDialog();
-      unawaited(_announceModesOnStartup());
     } else if (status.isPermanentlyDenied) {
       setState(() {
         _micGranted = false;
@@ -1584,7 +1831,9 @@ class _JanarymHomeState extends State<JanarymHome>
     try {
       var status = await Permission.camera.status;
       if (!status.isGranted) {
-        status = await Permission.camera.request();
+        status = await _runSerializedPermissionRequest(
+          () => Permission.camera.request(),
+        );
       }
       if (!mounted) return;
       if (status.isGranted) {
@@ -1605,6 +1854,13 @@ class _JanarymHomeState extends State<JanarymHome>
           _cameraMessage = _l10n.cameraAccessRequired;
         });
       }
+    } catch (e) {
+      appLog('[Perm] camera request failed: $e');
+      if (!mounted) return;
+      setState(() {
+        _cameraGranted = false;
+        _cameraMessage = _l10n.cameraAccessRequired;
+      });
     } finally {
       _cameraInitInProgress = false;
     }
@@ -1872,6 +2128,7 @@ class _JanarymHomeState extends State<JanarymHome>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       unawaited(_syncHeavyServices());
+      unawaited(_resumeDeferredOnboardingIfReady());
       if (_micGranted) {
         if (_useSttWakeEngine) {
           unawaited(_syncPrimaryWakeMode());
@@ -1886,7 +2143,8 @@ class _JanarymHomeState extends State<JanarymHome>
           _startWakeFallbackLoop();
         }
       }
-      if (_featureFlags.aggressiveBackgroundCamera || _modeNeedsLiveCamera(_assistantMode)) {
+      if (_featureFlags.aggressiveBackgroundCamera ||
+          _modeNeedsLiveCamera(_assistantMode)) {
         unawaited(_initCameraLive());
       }
       if (_featureFlags.aggressiveBackgroundCamera) {
@@ -2216,30 +2474,27 @@ class _JanarymHomeState extends State<JanarymHome>
     }
   }
 
-  Future<void> _announceModesOnStartup() async {
-    if (!_micGranted) return;
-    if (_followUpActive || _commandInFlight || _isSpeaking) return;
-    if (_featureFlags.mostlySilentNarration) return;
-    final available = _availableModes().map(_spokenModeDisplayName).join(', ');
-    if (available.isEmpty) return;
-    final line = _voiceText(
-      ru: 'Доступные режимы: $available.',
-      kk: 'Қолжетімді режимдер: $available.',
-    );
-    await _speak(line);
-  }
-
   Future<void> _initPersonalization() async {
     try {
       await _personalizationController.init();
       if (!mounted) return;
       setState(() {
         _personalizationReady = true;
+        _showOnboardingOverlay =
+            _personalizationController.onboardingRequired &&
+            !_personalizationController.onboardingDeferred;
       });
       if (_personalizationController.onboardingRequired) {
         await _personalizationController.startOrResumeOnboarding();
-        _maybeStartOnboardingDialog();
+        if (!mounted) return;
+        setState(() {
+          _showOnboardingOverlay =
+              _personalizationController.onboardingRequired &&
+              !_personalizationController.onboardingDeferred;
+        });
       }
+      _syncOnboardingReminderTimer();
+      _maybeStartOnboardingDialog();
     } catch (e) {
       appLog('[Personalization] init error: $e');
     }
@@ -2247,7 +2502,18 @@ class _JanarymHomeState extends State<JanarymHome>
 
   void _handlePersonalizationChange() {
     if (!mounted) return;
-    setState(() {});
+    _syncOnboardingReminderTimer();
+    setState(() {
+      if (!_personalizationController.onboardingRequired ||
+          _personalizationController.onboardingDeferred) {
+        _showOnboardingOverlay = false;
+      } else if (_personalizationController.onboardingActive) {
+        _showOnboardingOverlay = true;
+      }
+    });
+    if (_canPromptOnboardingNow) {
+      _maybeStartOnboardingDialog();
+    }
   }
 
   Future<void> _handleRouteBuilt(NavigationRouteBuiltEvent event) async {
@@ -2475,9 +2741,7 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   bool _containsWakeWordCandidate(String text) {
-    final match = WakePhraseMatcher.match(text, isPartial: false);
-    return match.strength == WakeMatchStrength.strong ||
-        match.strength == WakeMatchStrength.probable;
+    return WakePhraseMatcher.containsAcceptedWakeWord(text);
   }
 
   bool _shouldProcessSpeechInterruption(String text) {
@@ -2492,6 +2756,8 @@ class _JanarymHomeState extends State<JanarymHome>
 
     switch (decision.modeIntent) {
       case AssistantModeIntent.navStart:
+      case AssistantModeIntent.navStopRoutes:
+      case AssistantModeIntent.navStopSchedule:
       case AssistantModeIntent.routeToPlaceLabel:
       case AssistantModeIntent.navStop:
       case AssistantModeIntent.navStatus:
@@ -2564,6 +2830,8 @@ class _JanarymHomeState extends State<JanarymHome>
       }
       switch (decision.modeIntent) {
         case AssistantModeIntent.navStart:
+        case AssistantModeIntent.navStopRoutes:
+        case AssistantModeIntent.navStopSchedule:
         case AssistantModeIntent.routeToPlaceLabel:
         case AssistantModeIntent.navStop:
         case AssistantModeIntent.navStatus:
@@ -2608,7 +2876,6 @@ class _JanarymHomeState extends State<JanarymHome>
       _wakeWordOnlyMode = false;
       _requestId++;
       await _tts.stop();
-      await _playStartCue();
       await _vibrateStart();
       _setCircleState(CircleState.listening);
       await _handleUserText(text);
@@ -2670,7 +2937,7 @@ class _JanarymHomeState extends State<JanarymHome>
       setState(() => _lastWakeAt = DateTime.now());
     }
     _requestId++;
-    
+
     // INSTANT INTERRUPTION
     await _tts.stop();
     await _stopPrimaryWake(reason: 'wake_detected');
@@ -2679,13 +2946,15 @@ class _JanarymHomeState extends State<JanarymHome>
       _followUpActive = false;
     }
     _commandInFlight = false;
-    
-    // Play the beep immediately and don't wait for any slow TTS voice responses
-    unawaited(_playWakeCue());
+
+    // App-controlled mic cue is allowed only after a confirmed wake word.
+    if (shouldPlayMicCue(MicCueEvent.wakeAccepted)) {
+      unawaited(_playWakeCue());
+    }
     unawaited(_vibrateStart());
     _lastWakeAckDoneMs = DateTime.now().millisecondsSinceEpoch;
     appLog('[WakeFlow] ack_skip_forced_for_speed');
-    
+
     // Start listening immediately
     await _runCommandFlow(reason: 'wake');
   }
@@ -2771,24 +3040,49 @@ class _JanarymHomeState extends State<JanarymHome>
             ? '[WakeFlow] stt_open profile=${listenProfile.name}'
             : '[STT] start ($reason) profile=${listenProfile.name}',
       );
-      _lastWakeSttOpenedMs = DateTime.now().millisecondsSinceEpoch;
-      if (reason != 'wake') {
-        await _playStartCue();
-        await _vibrateStart();
-      }
-      _setCircleState(CircleState.listening);
+      String cleaned = '';
+      var wakeOnlyPhrase = false;
+      final maxWakeAttempts = reason == 'wake' ? 2 : 1;
+      for (var attempt = 0; attempt < maxWakeAttempts; attempt++) {
+        if (reason == 'wake' && attempt > 0) {
+          appLog('[WakeFlow] stt_retry attempt=${attempt + 1}');
+        }
+        _lastWakeSttOpenedMs = DateTime.now().millisecondsSinceEpoch;
+        _setCircleState(CircleState.listening);
 
-      final text = await _sttService.startCommandListening(
-        profile: listenProfile,
-        languageHint: _interactionLanguage,
-        allowAutoLanguage: reason == 'wake',
-        onRecordingFinished: () {
-          // Play the ending cue INSTANTLY when the microphone stops, 
-          // before we even start the slow network upload to OpenAI.
-          unawaited(_playEndCue());
-          unawaited(_vibrateEnd());
-        },
-      );
+        final text = await _sttService.startCommandListening(
+          profile: listenProfile,
+          languageHint: _interactionLanguage,
+          allowAutoLanguage: reason == 'wake',
+          maxNoSpeechMs: reason == 'wake' ? 3200 : null,
+        );
+
+        if (localRequestId != _requestId) return;
+        cleaned = (text ?? '').trim();
+        final normalized = _router.normalize(cleaned);
+        final strippedWake = _router.stripWakeWords(normalized);
+        wakeOnlyPhrase =
+            cleaned.isNotEmpty &&
+            _containsWakeWordCandidate(cleaned) &&
+            strippedWake.isEmpty;
+        if (reason == 'wake') {
+          final sttDoneAt = DateTime.now().millisecondsSinceEpoch;
+          appLog(
+            '[WakeFlow] stt_done text="$cleaned" '
+            'attempt=${attempt + 1} '
+            'wake_to_ack=${_lastWakeAckDoneMs - _lastWakeDetectedMs}ms '
+            'ack_to_stt=${_lastWakeSttOpenedMs - _lastWakeAckDoneMs}ms '
+            'stt_total=${sttDoneAt - _lastWakeSttOpenedMs}ms',
+          );
+        }
+        final shouldRetryWake =
+            reason == 'wake' &&
+            attempt == 0 &&
+            (cleaned.isEmpty || wakeOnlyPhrase);
+        if (!shouldRetryWake) {
+          break;
+        }
+      }
 
       // Re-arm dedicated wake engine immediately after command capture.
       if (_useSttWakeEngine) {
@@ -2798,25 +3092,9 @@ class _JanarymHomeState extends State<JanarymHome>
       }
 
       if (localRequestId != _requestId) return;
-      final cleaned = (text ?? '').trim();
       _modePickerAutoCloseTimer?.cancel();
       if (_modePickerOpen && mounted) {
         setState(() => _modePickerOpen = false);
-      }
-      final normalized = _router.normalize(cleaned);
-      final strippedWake = _router.stripWakeWords(normalized);
-      final wakeOnlyPhrase =
-          cleaned.isNotEmpty &&
-          _containsWakeWordCandidate(cleaned) &&
-          strippedWake.isEmpty;
-      if (reason == 'wake') {
-        final sttDoneAt = DateTime.now().millisecondsSinceEpoch;
-        appLog(
-          '[WakeFlow] stt_done text="$cleaned" '
-          'wake_to_ack=${_lastWakeAckDoneMs - _lastWakeDetectedMs}ms '
-          'ack_to_stt=${_lastWakeSttOpenedMs - _lastWakeAckDoneMs}ms '
-          'stt_total=${sttDoneAt - _lastWakeSttOpenedMs}ms',
-        );
       }
 
       if (wakeOnlyPhrase) {
@@ -2998,6 +3276,8 @@ class _JanarymHomeState extends State<JanarymHome>
   ) async {
     switch (decision.modeIntent) {
       case AssistantModeIntent.navStart:
+      case AssistantModeIntent.navStopRoutes:
+      case AssistantModeIntent.navStopSchedule:
       case AssistantModeIntent.routeToPlaceLabel:
       case AssistantModeIntent.navStop:
       case AssistantModeIntent.navStatus:
@@ -3154,7 +3434,9 @@ class _JanarymHomeState extends State<JanarymHome>
         _showOnboardingOverlay = true;
       });
     }
-    await _personalizationController.startOrResumeOnboarding();
+    await _personalizationController.startOrResumeOnboarding(force: true);
+    if (!mounted) return;
+    _syncOnboardingReminderTimer();
     _maybeStartOnboardingDialog();
   }
 
@@ -3178,22 +3460,9 @@ class _JanarymHomeState extends State<JanarymHome>
     CommandDecision decision, {
     bool promptNextQuestion = true,
   }) async {
-    final normalized = _router.normalize(rawText);
-    final pauseRequested =
-        normalized.contains('позже') ||
-        normalized.contains('потом') ||
-        normalized.contains('кейін');
-    if (pauseRequested) {
-      _personalizationController.pauseOnboarding();
-      setState(() {
-        _showOnboardingOverlay = false;
-      });
-      await _speakOnboardingLine(
-        _voiceText(
-          ru: 'Хорошо, продолжим позже.',
-          kk: 'Жақсы, кейін жалғастырамыз.',
-        ),
-      );
+    final reminderRequest = parseOnboardingReminderRequest(rawText);
+    if (reminderRequest != null) {
+      await _deferOnboarding(reminderRequest);
       return _OnboardingTurnResult.paused;
     }
 
@@ -3277,10 +3546,15 @@ class _JanarymHomeState extends State<JanarymHome>
           ampPollMs: 95,
           restartCooldownMs: 120,
           maxNoSpeechMs: 4500,
+          alwaysTranscribe: true,
         );
         if (!mounted) return;
 
         final rawText = (heard ?? '').trim();
+        appLog(
+          '[Onboarding] heard="${_truncateForLog(rawText)}" '
+          'stt_error=${_sttService.state.value.lastError ?? '-'}',
+        );
         final decision = _router.route(rawText);
         if (decision.modeIntent == AssistantModeIntent.restartOnboarding) {
           await _personalizationController.restartOnboardingFromScratch();
@@ -3637,6 +3911,8 @@ class _JanarymHomeState extends State<JanarymHome>
   ) async {
     switch (decision.modeIntent) {
       case AssistantModeIntent.navStart:
+      case AssistantModeIntent.navStopRoutes:
+      case AssistantModeIntent.navStopSchedule:
       case AssistantModeIntent.routeToPlaceLabel:
       case AssistantModeIntent.navStop:
       case AssistantModeIntent.navStatus:
@@ -3723,6 +3999,8 @@ class _JanarymHomeState extends State<JanarymHome>
 
     switch (decision.modeIntent) {
       case AssistantModeIntent.navStart:
+      case AssistantModeIntent.navStopRoutes:
+      case AssistantModeIntent.navStopSchedule:
       case AssistantModeIntent.routeToPlaceLabel:
         var destination = decision.destinationQuery?.trim() ?? '';
         if (destination.isEmpty) {
@@ -3732,18 +4010,36 @@ class _JanarymHomeState extends State<JanarymHome>
           await _speak(_voiceL10n.sayAddressAfterRoutePhrase);
           return;
         }
-        final byLabel = await _findPlaceLabelForRouteCommand(
-          decision,
-          fallbackDestination: destination,
-        );
-        if (byLabel != null) {
-          await _startRouteWithConfirmation(
-            byLabel.addressText,
-            routeSource: 'label',
+        if (decision.destinationKindHint !=
+            NavigationDestinationKind.transitStop) {
+          final byLabel = await _findPlaceLabelForRouteCommand(
+            decision,
+            fallbackDestination: destination,
           );
-          return;
+          if (byLabel != null) {
+            await _startRouteWithConfirmation(
+              byLabel.addressText,
+              routeSource: 'label',
+            );
+            return;
+          }
         }
-        await _startRouteWithConfirmation(destination, routeSource: 'manual');
+        await _startRouteWithConfirmation(
+          destination,
+          routeSource: 'manual',
+          destinationKindHint: decision.destinationKindHint,
+        );
+        return;
+      case AssistantModeIntent.navStopRoutes:
+        await _navigationController.speakStopRoutes(
+          decision.destinationQuery?.trim() ?? '',
+        );
+        return;
+      case AssistantModeIntent.navStopSchedule:
+        await _navigationController.speakScheduledArrivals(
+          stopQuery: decision.destinationQuery?.trim() ?? '',
+          routeName: decision.transitRouteName?.trim() ?? '',
+        );
         return;
       case AssistantModeIntent.navStop:
         await _navigationController.stopRoute();
@@ -3814,6 +4110,8 @@ class _JanarymHomeState extends State<JanarymHome>
   ) async {
     switch (decision.modeIntent) {
       case AssistantModeIntent.navStart:
+      case AssistantModeIntent.navStopRoutes:
+      case AssistantModeIntent.navStopSchedule:
       case AssistantModeIntent.routeToPlaceLabel:
       case AssistantModeIntent.navStop:
       case AssistantModeIntent.navStatus:
@@ -4021,6 +4319,48 @@ class _JanarymHomeState extends State<JanarymHome>
     return false;
   }
 
+  TextReaderReadSource _toTextReaderReadSource(_TextReaderReadSource source) {
+    switch (source) {
+      case _TextReaderReadSource.voice:
+        return TextReaderReadSource.voice;
+      case _TextReaderReadSource.tap:
+        return TextReaderReadSource.tap;
+      case _TextReaderReadSource.auto:
+        return TextReaderReadSource.auto;
+    }
+  }
+
+  _TextReaderSessionState _toTextReaderSessionState(TextReaderState state) {
+    switch (state) {
+      case TextReaderState.scanning:
+        return _TextReaderSessionState.scanning;
+      case TextReaderState.speaking:
+        return _TextReaderSessionState.speaking;
+      case TextReaderState.paused:
+        return _TextReaderSessionState.paused;
+      case TextReaderState.failed:
+        return _TextReaderSessionState.failed;
+      case TextReaderState.idle:
+        return _TextReaderSessionState.idle;
+    }
+  }
+
+  void _applyTextReaderState(
+    TextReaderState state, {
+    String? failureReason,
+    bool updateUi = true,
+  }) {
+    _textReaderSessionState = _toTextReaderSessionState(state);
+    if (failureReason != null) {
+      _lastTextReaderFailureReason = failureReason;
+    } else if (state != TextReaderState.failed) {
+      _lastTextReaderFailureReason = '';
+    }
+    if (updateUi && mounted) {
+      setState(() {});
+    }
+  }
+
   void _resetTextReaderAutoState({bool clearLastSignature = false}) {
     _pendingAutoTextReaderSignature = '';
     _pendingAutoTextReaderSeenCount = 0;
@@ -4029,19 +4369,17 @@ class _JanarymHomeState extends State<JanarymHome>
       _lastAutoTextReaderSpeakMs = 0;
       _lastAutoTextReaderExactSignature = '';
       _lastAutoTextReaderExactMs = 0;
-      _lastAutoTextReaderVisionFallbackSignature = '';
-      _lastAutoTextReaderVisionFallbackMs = 0;
+      _lastTextReaderVisionSignature = '';
+      _lastTextReaderVisionMs = 0;
     }
   }
 
   Future<void> _cancelActiveTextReaderSession() async {
     _textReaderSessionCancelRequested = true;
-    _resetTextReaderAutoState();
+    _textReaderController.stop();
     await _tts.stop();
     _isSpeaking = false;
-    if (mounted) {
-      setState(() {});
-    }
+    _applyTextReaderState(_textReaderController.state);
     appLog('[TextReader][control] stopped');
     _restoreWakeStateIfIdle();
   }
@@ -4049,13 +4387,11 @@ class _JanarymHomeState extends State<JanarymHome>
   Future<void> _pauseTextReaderContinuousReading() async {
     _textReaderAutoPaused = true;
     _textReaderSessionCancelRequested = true;
-    _resetTextReaderAutoState();
+    _textReaderController.pause();
     await _tts.stop();
     _isSpeaking = false;
     _syncTextReaderLoop();
-    if (mounted) {
-      setState(() {});
-    }
+    _applyTextReaderState(_textReaderController.state);
     appLog('[TextReader][control] paused');
     _restoreWakeStateIfIdle();
   }
@@ -4063,11 +4399,9 @@ class _JanarymHomeState extends State<JanarymHome>
   Future<void> _resumeTextReaderContinuousReading({bool restart = true}) async {
     _textReaderAutoPaused = false;
     _textReaderSessionCancelRequested = false;
-    _resetTextReaderAutoState(clearLastSignature: restart);
+    _textReaderController.resume(clearSpokenSignature: restart);
     _syncTextReaderLoop();
-    if (mounted) {
-      setState(() {});
-    }
+    _applyTextReaderState(_textReaderController.state);
     appLog('[TextReader][control] resumed restart=$restart');
     if (restart) {
       Future<void>.delayed(const Duration(milliseconds: 120), () {
@@ -4130,26 +4464,21 @@ class _JanarymHomeState extends State<JanarymHome>
     if (source == _TextReaderReadSource.auto && _textReaderAutoPaused) {
       return;
     }
-    if (_manualTextReadInProgress) {
+    if (_manualTextReadInProgress || _textReaderController.isBusy) {
       appLog('[TextReader][manual_session] skip busy source=${source.name}');
       return;
     }
-
-    // Reset loop state immediately to prevent "race condition" triggerings
-    _resetTextReaderAutoState();
 
     if (source != _TextReaderReadSource.auto) {
       _textReaderSessionCancelRequested = false;
     }
     _manualTextReadInProgress = true;
-    _textReaderSessionState = _TextReaderSessionState.preparing;
-    _lastTextReaderFailureReason = '';
-    if (mounted) {
-      setState(() {});
-    }
+    _textReaderController.markIdle();
+    _applyTextReaderState(TextReaderState.scanning);
     appLog('[TextReader][manual_session] start source=${source.name}');
-    appLog('[TextReader][manual_session] state=preparing');
-    _enterVoicePriorityWindow(reason: 'manual_text_read');
+    if (source != _TextReaderReadSource.auto) {
+      _enterVoicePriorityWindow(reason: 'manual_text_read');
+    }
 
     try {
       await _syncHeavyServices();
@@ -4158,13 +4487,19 @@ class _JanarymHomeState extends State<JanarymHome>
       }
       if (!_cameraGranted) {
         _lastTextReaderFailureReason = 'camera_denied';
-        appLog('[TextReader][manual_session] fail reason=camera_denied');
-        await _speak(
-          _voiceText(
-            ru: 'Для чтения текста нужна камера.',
-            kk: 'Мәтінді оқу үшін камера қажет.',
-          ),
+        _applyTextReaderState(
+          TextReaderState.failed,
+          failureReason: _lastTextReaderFailureReason,
         );
+        appLog('[TextReader][manual_session] fail reason=camera_denied');
+        if (source != _TextReaderReadSource.auto) {
+          await _speak(
+            _voiceText(
+              ru: 'Для чтения текста нужна камера.',
+              kk: 'Мәтінді оқу үшін камера қажет.',
+            ),
+          );
+        }
         return;
       }
       if (!_cameraStreaming) {
@@ -4172,304 +4507,66 @@ class _JanarymHomeState extends State<JanarymHome>
       }
       if (!_cameraStreaming) {
         _lastTextReaderFailureReason = 'camera_stream_unavailable';
+        _applyTextReaderState(
+          TextReaderState.failed,
+          failureReason: _lastTextReaderFailureReason,
+        );
         appLog(
           '[TextReader][manual_session] fail reason=camera_stream_unavailable',
         );
-        await _speak(_textReaderFailureMessage());
+        if (source != _TextReaderReadSource.auto) {
+          await _speak(_textReaderFailureMessage());
+        }
         return;
       }
 
-      _textReaderSessionState = _TextReaderSessionState.scanning;
-      if (mounted) {
-        setState(() {});
-      }
-      appLog('[TextReader][manual_session] state=scanning');
-      final candidates = await _collectManualTextReadCandidates();
+      final attempt = await _textReaderController.runManual(
+        source: _toTextReaderReadSource(source),
+      );
+      _applyTextReaderState(
+        attempt.state,
+        failureReason: attempt.failureReason,
+      );
+
       if (_textReaderSessionCancelRequested) {
         appLog('[TextReader][manual_session] cancel requested');
         return;
       }
-      if (candidates.isEmpty) {
-        if (source != _TextReaderReadSource.auto) {
-          final fallbackText = await _tryTextReaderVisionFallback();
-          if (fallbackText != null) {
-            appLog(
-              '[TextReader][manual_session] selected vision_fallback '
-              'reason=no_candidates',
-            );
-            _textReaderSessionState = _TextReaderSessionState.speaking;
-            if (mounted) {
-              setState(() {});
-            }
-            final answer = _buildDirectTextReadAnswer(fallbackText);
-            _lastAnswer = answer;
-            _rememberDialogTurn(rawText, answer);
-            await _ensureTtsLocaleForSpokenText(fallbackText, autoRead: false);
-            await _speak(answer, ensureLocale: false);
-            return;
-          }
-        }
-        _textReaderSessionState = _TextReaderSessionState.failed;
-        _lastTextReaderFailureReason = 'no_candidates';
-        appLog('[TextReader][manual_session] fail reason=no_candidates');
-        await _speak(_textReaderFailureMessage());
-        return;
-      }
-
-      OnDeviceTextReadResult? selected;
-      double selectedScore = double.negativeInfinity;
-      for (final candidate in candidates) {
-        final score = _scoreManualTextReadCandidate(candidate);
-        if (score > selectedScore) {
-          selected = candidate;
-          selectedScore = score;
-        }
-      }
-
-      final result = selected;
-      if (result == null) {
-        _textReaderSessionState = _TextReaderSessionState.failed;
-        _lastTextReaderFailureReason = 'selection_failed';
-        appLog('[TextReader][manual_session] fail reason=selection_failed');
-        await _speak(_textReaderFailureMessage());
-        return;
-      }
-
-      final resolvedText = _resolveManualSpeechText(result);
-      final normalized = _router.normalize(rawText);
-      final wantsStructuredOnly = _isTextReaderStructuredQuery(normalized);
-      final speakAsManual =
-          source != _TextReaderReadSource.auto ||
-          _assistantMode == AssistantMode.textReader;
-      final stableRepeats = _countStableManualCandidates(
-        candidates,
-        resolvedText,
-      );
-      final shouldUseVisionFallback = _shouldUseVisionTextReadFallback(
-        result,
-        resolvedText,
-        score: selectedScore,
-      );
-      final structuredOnlyAccepted =
-          selectedScore < _manualTextReadAcceptScore &&
-          result.hasStructuredData;
-      final weakAccepted =
-          !structuredOnlyAccepted &&
-          shouldAcceptWeakManualCandidate(
-            score: selectedScore,
-            hasStructuredData: result.hasStructuredData,
-            text: resolvedText,
-            stableRepeats: stableRepeats,
-          );
-      if (selectedScore < _manualTextReadAcceptScore &&
-          !structuredOnlyAccepted &&
-          !weakAccepted) {
-        if (speakAsManual && shouldUseVisionFallback) {
-          final fallbackText = await _tryTextReaderVisionFallback();
-          if (fallbackText != null) {
-            final transcriptSegments = _buildTextReaderSpeechSegments(
-              result,
-              overrideText: fallbackText,
-            );
-            final answer = _buildDirectTextReadAnswer(
-              fallbackText,
-              result: result,
-            );
-            appLog(
-              '[TextReader][manual_session] selected vision_fallback '
-              'score=${selectedScore.toStringAsFixed(1)}',
-            );
-            _textReaderSessionState = _TextReaderSessionState.speaking;
-            if (mounted) {
-              setState(() {});
-            }
-            await _storeOcrRead(result);
-            _publishTextReadEvent(
-              result,
-              source: source,
-              selectedScore: selectedScore,
-            );
-            if (!wantsStructuredOnly && transcriptSegments.isNotEmpty) {
-              if (source != _TextReaderReadSource.auto) {
-                _rememberDialogTurn(rawText, answer);
-              }
-              _lastAnswer = answer;
-              await _speakTextReaderSegments(
-                transcriptSegments,
-                autoRead: false,
-              );
-            } else {
-              if (source != _TextReaderReadSource.auto) {
-                _rememberDialogTurn(rawText, answer);
-              }
-              _lastAnswer = answer;
-              await _ensureTtsLocaleForSpokenText(
-                fallbackText,
-                autoRead: false,
-              );
-              await _speak(answer, ensureLocale: false);
-            }
-            return;
-          }
-        }
-        if (source == _TextReaderReadSource.auto) {
-          _lastTextReaderFailureReason = 'auto_low_score';
-          appLog(
-            '[TextReader][auto] skip low_score '
-            'score=${selectedScore.toStringAsFixed(1)}',
-          );
-          return;
-        }
-        final effectiveScript = _effectiveManualScript(result, resolvedText);
-        _textReaderSessionState = _TextReaderSessionState.failed;
-        _lastTextReaderFailureReason = 'low_score';
+      if (!attempt.hasResult) {
+        final failureReason = attempt.failureReason ?? 'no_text';
         appLog(
-          '[TextReader][manual_session] fail reason=low_score '
-          'score=${selectedScore.toStringAsFixed(1)} '
-          'script=${effectiveScript.name}',
+          '[TextReader][manual_session] '
+          '${attempt.skipped ? 'skip' : 'fail'} reason=$failureReason',
         );
-        await _speak(_textReaderFailureMessage());
+        if (!attempt.skipped && source != _TextReaderReadSource.auto) {
+          await _speak(_textReaderFailureMessage());
+        }
         return;
       }
 
-      final effectiveScript = _effectiveManualScript(result, resolvedText);
-      appLog(
-        '[TextReader][manual_session] selected '
-        'score=${selectedScore.toStringAsFixed(1)} '
-        'script=${effectiveScript.name} '
-        'stable_repeats=$stableRepeats '
-        'weak_accept=$weakAccepted',
-      );
-      appLog(
-        '[TextReader][manual_session] fallback_text_used='
-        '${result.blocks.isEmpty && result.manualFallbackText.trim().isNotEmpty}',
-      );
-
-      _textReaderSessionState = _TextReaderSessionState.speaking;
-      if (mounted) {
-        setState(() {});
-      }
-      appLog('[TextReader][manual_session] state=speaking');
-
-      if (speakAsManual && shouldUseVisionFallback) {
-        final fallbackText = await _tryTextReaderVisionFallback();
-        if (fallbackText != null) {
-          final transcriptSegments = _buildTextReaderSpeechSegments(
-            result,
-            overrideText: fallbackText,
-          );
-          final answer = _buildDirectTextReadAnswer(
-            fallbackText,
-            result: result,
-          );
-          appLog(
-            '[TextReader][manual_session] selected vision_fallback '
-            'score=${selectedScore.toStringAsFixed(1)}',
-          );
-          await _storeOcrRead(result);
-          _publishTextReadEvent(
-            result,
-            source: source,
-            selectedScore: selectedScore,
-          );
-          if (!wantsStructuredOnly && transcriptSegments.isNotEmpty) {
-            if (source != _TextReaderReadSource.auto) {
-              _rememberDialogTurn(rawText, answer);
-            }
-            _lastAnswer = answer;
-            await _speakTextReaderSegments(transcriptSegments, autoRead: false);
-          } else {
-            if (source != _TextReaderReadSource.auto) {
-              _rememberDialogTurn(rawText, answer);
-            }
-            _lastAnswer = answer;
-            await _ensureTtsLocaleForSpokenText(fallbackText, autoRead: false);
-            await _speak(answer, ensureLocale: false);
-          }
-          return;
-        }
-      }
-
-      await _storeOcrRead(result);
-      _publishTextReadEvent(
-        result,
+      await _handleTextReaderAttemptSuccess(
+        rawText: rawText,
         source: source,
-        selectedScore: selectedScore,
+        result: attempt.result!,
       );
-
-      final answer = structuredOnlyAccepted
-          ? _buildStructuredOnlyTextReaderAnswer(
-              result,
-              normalizedUserText: normalized,
-            )
-          : weakAccepted
-          ? _buildApproximateTextReaderAnswer(result)
-          : _buildTextReaderAnswer(
-              result,
-              normalizedUserText: normalized,
-              autoRead: false,
-            );
-      if (source == _TextReaderReadSource.auto && !speakAsManual) {
-        final autoSegments = _buildAutoTextReaderSpeechSegments(result);
-        final autoAnswer = _buildTextReaderAnswer(
-          result,
-          normalizedUserText: normalized,
-          autoRead: true,
-        );
-        if (autoSegments.isNotEmpty &&
-            result.isAutoSpeakSafe &&
-            _shouldSpeakAutoTextReaderTranscript(
-              autoSegments,
-              result: result,
-            )) {
-          _lastAnswer = autoAnswer;
-          await _speakTextReaderSegments(autoSegments, autoRead: true);
-        } else if (autoSegments.isEmpty &&
-            shouldAutoSpeakStructuredOnly(
-              hasStructuredData: result.hasStructuredData,
-              isAutoSpeakSafe: result.isAutoSpeakSafe,
-            ) &&
-            _shouldSpeakAutoTextReaderTranscript(<String>[
-              autoAnswer,
-            ], result: result)) {
-          _lastAnswer = autoAnswer;
-          await _ensureTtsLocaleForReadResult(result, autoRead: true);
-          await _speak(autoAnswer, ensureLocale: false);
-        } else {
-          final reason = !result.isAutoSpeakSafe
-              ? 'unsafe_auto_text'
-              : 'no_auto_text';
-          appLog('[TextReader][auto] skip $reason');
-        }
-      } else {
-        final transcriptSegments = _buildTextReaderSpeechSegments(result);
-        if (source != _TextReaderReadSource.auto) {
-          _rememberDialogTurn(rawText, answer);
-        }
-        _lastAnswer = answer;
-        if (!wantsStructuredOnly && transcriptSegments.isNotEmpty) {
-          await _speakTextReaderSegments(transcriptSegments, autoRead: false);
-        } else {
-          await _ensureTtsLocaleForReadResult(result, autoRead: false);
-          await _speak(answer, ensureLocale: false);
-        }
-      }
-      if (resolvedText.isEmpty && !result.hasStructuredData) {
-        _lastTextReaderFailureReason = 'empty_resolved_text';
-      }
     } finally {
       _manualTextReadInProgress = false;
-      _textReaderSessionState = _TextReaderSessionState.idle;
-      _exitVoicePriorityWindow(reason: 'manual_text_read');
-      if (mounted) {
-        setState(() {});
+      if (!_isSpeaking &&
+          !_textReaderAutoPaused &&
+          _textReaderController.state != TextReaderState.failed) {
+        _textReaderController.markIdle();
       }
+      if (source != _TextReaderReadSource.auto) {
+        _exitVoicePriorityWindow(reason: 'manual_text_read');
+      }
+      _applyTextReaderState(_textReaderController.state);
     }
   }
 
   Future<List<OnDeviceTextReadResult>>
   _collectManualTextReadCandidates() async {
     final results = <OnDeviceTextReadResult>[];
+    final aggressiveShortText = _assistantMode == AssistantMode.textReader;
     for (var i = 0; i < _manualTextReadAttempts; i += 1) {
       if (_textReaderSessionCancelRequested) {
         break;
@@ -4484,47 +4581,38 @@ class _JanarymHomeState extends State<JanarymHome>
       if (frame == null) {
         appLog('[TextReader][manual_session] attempt=$attempt no_frame');
       } else {
-        final result = await _textReaderService.readFrame(frame, force: true);
+        final result = await _textReaderService.readFrame(
+          frame,
+          force: true,
+          aggressiveShortText: aggressiveShortText,
+        );
         if (result == null || !result.hasRawText) {
           appLog('[TextReader][manual_session] attempt=$attempt no_result');
         } else {
           final text = _resolveManualSpeechText(result);
-          final score = scoreManualTextReadCandidate(
-              text: text, 
-              manualSpeechLinesCount: result.blocks.length,
-              dominantScript: result.dominantScript,
-              hasStructuredData: result.hasStructuredData,
-          );
           final effectiveScript = _effectiveManualScript(result, text);
           appLog(
             '[TextReader][manual_session] attempt=$attempt '
-            'score=${score.toStringAsFixed(1)} '
+            'score=${_scoreManualTextReadCandidate(result).toStringAsFixed(1)} '
             'script=${effectiveScript.name} '
             'raw="${_truncateForLog(result.rawText)}" '
             'text="${_truncateForLog(text)}"',
           );
           results.add(result);
           final stableRepeats = _countStableManualCandidates(results, text);
-          final structuredOnlyAccepted =
-              score < _manualTextReadAcceptScore && result.hasStructuredData;
-          final weakAccepted =
-              !structuredOnlyAccepted &&
-              shouldAcceptWeakManualCandidate(
-                score: score,
-                hasStructuredData: result.hasStructuredData,
-                text: text,
-                stableRepeats: stableRepeats,
-              );
-          if (score >= _manualTextReadAcceptScore ||
-              structuredOnlyAccepted ||
-              weakAccepted) {
+          final assessment = _assessTextReaderCandidate(
+            result,
+            resolvedTextOverride: text,
+            stableRepeats: stableRepeats,
+            allowVisionFallback: true,
+          );
+          if (assessment.disposition != TextReaderCandidateDisposition.reject) {
             appLog(
               '[TextReader][manual_session] early_accept '
               'attempt=$attempt '
-              'score=${score.toStringAsFixed(1)} '
+              'score=${assessment.score.toStringAsFixed(1)} '
               'stable_repeats=$stableRepeats '
-              'structured_only=$structuredOnlyAccepted '
-              'weak_accept=$weakAccepted',
+              'disposition=${assessment.disposition.name}',
             );
             break;
           }
@@ -4541,11 +4629,36 @@ class _JanarymHomeState extends State<JanarymHome>
 
   double _scoreManualTextReadCandidate(OnDeviceTextReadResult result) {
     final resolvedText = _resolveManualSpeechText(result);
-    return scoreManualTextReadCandidate(
-      text: resolvedText,
+    return _assessTextReaderCandidate(
+      result,
+      resolvedTextOverride: resolvedText,
+      allowVisionFallback: true,
+    ).score;
+  }
+
+  TextReaderCandidateAssessment _assessTextReaderCandidate(
+    OnDeviceTextReadResult result, {
+    int stableRepeats = 0,
+    bool allowVisionFallback = true,
+    String? resolvedTextOverride,
+  }) {
+    final resolvedText =
+        (resolvedTextOverride ?? _resolveManualSpeechText(result)).trim();
+    final effectiveScript = _effectiveManualScript(result, resolvedText);
+    final aggressiveShortText = _assistantMode == AssistantMode.textReader;
+    return assessTextReaderCandidate(
+      rawText: result.rawText,
+      resolvedText: resolvedText,
       manualSpeechLinesCount: result.blocks.length,
-      dominantScript: _effectiveManualScript(result, resolvedText),
+      rawDominantScript: result.rawDominantScript,
+      effectiveScript: effectiveScript,
       hasStructuredData: result.hasStructuredData,
+      stableRepeats: stableRepeats,
+      acceptScore: aggressiveShortText
+          ? _manualTextReadAggressiveAcceptScore
+          : _manualTextReadAcceptScore,
+      allowVisionFallback: allowVisionFallback,
+      aggressiveShortText: aggressiveShortText,
     );
   }
 
@@ -4557,11 +4670,11 @@ class _JanarymHomeState extends State<JanarymHome>
       if (result.price != null) return 'Цена ${result.price} тенге';
       if (result.calories != null) return '${result.calories} ккал';
     }
-    
+
     if (result.blocks.isNotEmpty) {
       return result.blocks.join('. ');
     }
-    
+
     return result.manualFallbackText;
   }
 
@@ -4586,11 +4699,11 @@ class _JanarymHomeState extends State<JanarymHome>
     final resolvedText =
         (resolvedTextOverride ?? _resolveManualSpeechText(result)).trim();
     if (resolvedText.isEmpty) {
-      return result.dominantScript;
+      return result.rawDominantScript;
     }
     final resolvedScript = TextReadingNormalizer.detectScript(resolvedText);
     if (resolvedScript == DetectedTextScript.unknown) {
-      return result.dominantScript;
+      return result.rawDominantScript;
     }
     return resolvedScript;
   }
@@ -4622,6 +4735,13 @@ class _JanarymHomeState extends State<JanarymHome>
       return _splitTextReaderSpeechSegments(override);
     }
 
+    if (!result.hasStructuredData &&
+        (result.looksPseudoRussianOcr ||
+            result.rawDominantScript == DetectedTextScript.mixed ||
+            result.rawDominantScript == DetectedTextScript.unknown)) {
+      return const <String>[];
+    }
+
     if (result.blocks.isNotEmpty) {
       return result.blocks
           .expand(_splitMixedLanguageSpeechSegments)
@@ -4635,6 +4755,12 @@ class _JanarymHomeState extends State<JanarymHome>
   List<String> _buildAutoTextReaderSpeechSegments(
     OnDeviceTextReadResult result,
   ) {
+    if (!result.hasStructuredData &&
+        (result.looksPseudoRussianOcr ||
+            result.rawDominantScript == DetectedTextScript.mixed ||
+            result.rawDominantScript == DetectedTextScript.unknown)) {
+      return const <String>[];
+    }
     if (result.blocks.isNotEmpty) {
       return result.blocks.take(1).toList();
     }
@@ -4797,13 +4923,11 @@ class _JanarymHomeState extends State<JanarymHome>
 
   bool _shouldTriggerAutoExactTextRead(OnDeviceTextReadResult result) {
     final resolvedText = _resolveManualSpeechText(result);
-    final score = _scoreManualTextReadCandidate(result);
     final rawText = result.rawText.trim();
     final candidateText = resolvedText.isNotEmpty ? resolvedText : rawText;
     final candidateSignature = buildManualCandidateSignature(candidateText);
     final inTextReaderMode = _assistantMode == AssistantMode.textReader;
-    // For specialized text reader mode, require 4 frames if short, else 3
-    final requiredSeenCount = inTextReaderMode ? (candidateText.length < 15 ? 4 : 3) : null;
+    final requiredSeenCount = inTextReaderMode ? 2 : null;
     if (candidateSignature.isEmpty) {
       _resetTextReaderAutoState();
       return false;
@@ -4813,7 +4937,11 @@ class _JanarymHomeState extends State<JanarymHome>
         rawText.length >= 48 ||
         resolvedText.length >= 24 ||
         result.blocks.length >= 2 ||
-        (inTextReaderMode && (rawText.length >= 24 || result.blocks.isNotEmpty));
+        (inTextReaderMode &&
+            (rawText.length >= 12 ||
+                resolvedText.length >= 8 ||
+                result.blocks.isNotEmpty ||
+                result.manualFallbackText.trim().isNotEmpty));
     if (!hasEnoughSignal) {
       return false;
     }
@@ -4830,36 +4958,39 @@ class _JanarymHomeState extends State<JanarymHome>
       return false;
     }
 
-    final structuredOnlyAccepted =
-        score < _manualTextReadAcceptScore && result.hasStructuredData;
-    final weakAccepted =
-        !structuredOnlyAccepted &&
-        shouldAcceptWeakManualCandidate(
-          score: score,
-          hasStructuredData: result.hasStructuredData,
-          text: resolvedText,
-          stableRepeats: _pendingAutoTextReaderSeenCount,
-        );
+    final assessment = _assessTextReaderCandidate(
+      result,
+      resolvedTextOverride: resolvedText,
+      stableRepeats: _pendingAutoTextReaderSeenCount,
+      allowVisionFallback: inTextReaderMode,
+    );
 
-    // Critical: Filter out repetitive OCR garbage or non-phonetic soup
-    if (!TextReadingNormalizer.isSpeechSafe(resolvedText) && !result.hasStructuredData) {
-      if (score >= _manualTextReadAcceptScore) {
-        appLog('[TextReader][auto] ignoring unsafe text candidate: "$resolvedText"');
+    if (!TextReadingNormalizer.isSpeechSafe(resolvedText) &&
+        !result.hasStructuredData &&
+        !assessment.requiresVisionFallback) {
+      if (assessment.score >= _manualTextReadAcceptScore) {
+        appLog(
+          '[TextReader][auto] ignoring unsafe text candidate: "$resolvedText"',
+        );
       }
       return false;
     }
-    final shouldUseVisionFallback = _shouldUseVisionTextReadFallback(
-      result,
-      resolvedText,
-      score: score,
-    );
-    final effectiveAcceptScore = inTextReaderMode ? 15.0 : _manualTextReadAcceptScore;
+
+    if (inTextReaderMode &&
+        assessment.acceptsDirectSpeech &&
+        !_isAutoTextReaderDirectSpeechStableEnough(
+          result,
+          resolvedText: resolvedText,
+          stableRepeats: _pendingAutoTextReaderSeenCount,
+          score: assessment.score,
+        )) {
+      return false;
+    }
+
     final shouldTrigger =
-        score >= effectiveAcceptScore ||
-        structuredOnlyAccepted ||
-        weakAccepted ||
-        shouldUseVisionFallback ||
-        (score >= 18 && rawText.length >= (inTextReaderMode ? 48 : 80));
+        assessment.acceptsDirectSpeech ||
+        assessment.structuredOnlyAccepted ||
+        assessment.requiresVisionFallback;
     if (!shouldTrigger) {
       return false;
     }
@@ -4867,6 +4998,62 @@ class _JanarymHomeState extends State<JanarymHome>
     _lastAutoTextReaderExactSignature = candidateSignature;
     _lastAutoTextReaderExactMs = now;
     return true;
+  }
+
+  bool _isAutoTextReaderDirectSpeechStableEnough(
+    OnDeviceTextReadResult result, {
+    required String resolvedText,
+    required int stableRepeats,
+    required double score,
+  }) {
+    if (result.hasStructuredData) return true;
+    final compactLength = RegExp(
+      r'[A-Za-zА-Яа-яЁё0-9]',
+      unicode: true,
+    ).allMatches(resolvedText).length;
+    final shortSingleBlock = compactLength < 12 && result.blocks.length <= 1;
+    if (!shortSingleBlock) return true;
+    return stableRepeats >= 3 && score >= 24.0;
+  }
+
+  Future<String?> _tryFastTextReaderVisionTranscript(
+    OnDeviceTextReadResult result, {
+    required bool autoRead,
+    required String reason,
+  }) async {
+    if (_assistantMode != AssistantMode.textReader) return null;
+    if (result.hasStructuredData) return null;
+    if (_llmRateLimitRemaining() != null) return null;
+    if (_gptStatus == GptStatus.loading || _textReaderVisionRequestInFlight) {
+      return null;
+    }
+    final candidateText = _resolveManualSpeechText(result).trim().isNotEmpty
+        ? _resolveManualSpeechText(result)
+        : result.rawText;
+    final signature = buildManualCandidateSignature(candidateText);
+    if (signature.isEmpty) return null;
+
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (_lastTextReaderVisionSignature == signature &&
+        now - _lastTextReaderVisionMs < _textReaderVisionCooldownMs) {
+      appLog(
+        '[TextReader][vision_fast] skip cooldown '
+        'reason=$reason auto=$autoRead signature=$signature',
+      );
+      return null;
+    }
+
+    _lastTextReaderVisionSignature = signature;
+    _lastTextReaderVisionMs = now;
+    appLog(
+      '[TextReader][vision_fast] start '
+      'reason=$reason auto=$autoRead signature=$signature',
+    );
+    return _tryTextReaderVisionFallback(
+      fastMode: true,
+      autoRead: autoRead,
+      reason: reason,
+    );
   }
 
   Future<void> _pauseWakeFallbackForAutoTextRead() async {
@@ -4884,40 +5071,6 @@ class _JanarymHomeState extends State<JanarymHome>
       appLog('[TextReader][auto] paused wake fallback');
       await Future<void>.delayed(const Duration(milliseconds: 120));
     }
-  }
-
-  bool _shouldTryAutoTextReaderVisionFallback(OnDeviceTextReadResult result) {
-    if (result.hasStructuredData || _gptStatus == GptStatus.loading) {
-      return false;
-    }
-    final rawText = result.rawText.trim();
-    if (rawText.isEmpty) return false;
-    final resolvedText = _resolveManualSpeechText(result);
-    final looksPseudoRussian =
-        TextReadingNormalizer.looksLikePseudoRussianOcr(rawText) ||
-        TextReadingNormalizer.looksLikePseudoRussianOcr(resolvedText);
-    if (!looksPseudoRussian) {
-      return false;
-    }
-    final candidateSignature = buildManualCandidateSignature(rawText);
-    if (candidateSignature.isEmpty ||
-        !_markAutoTextReaderCandidateSeen(
-          'vision:$candidateSignature',
-          requiredSeenCount: _assistantMode == AssistantMode.textReader
-              ? 1
-              : null,
-        )) {
-      return false;
-    }
-    final now = DateTime.now().millisecondsSinceEpoch;
-    if (_lastAutoTextReaderVisionFallbackSignature == candidateSignature &&
-        now - _lastAutoTextReaderVisionFallbackMs <
-            _textReaderAutoVisionFallbackCooldownMs) {
-      return false;
-    }
-    _lastAutoTextReaderVisionFallbackSignature = candidateSignature;
-    _lastAutoTextReaderVisionFallbackMs = now;
-    return true;
   }
 
   Future<void> _speakTextReaderSegments(
@@ -4938,7 +5091,7 @@ class _JanarymHomeState extends State<JanarymHome>
       }
       final text = segment.trim();
       if (text.isEmpty) continue;
-      
+
       // Filter out seen segments to avoid annoying loops
       if (autoRead && _isAlreadyReadFuzzy(text)) {
         continue;
@@ -4947,7 +5100,7 @@ class _JanarymHomeState extends State<JanarymHome>
       final useEnglish = TextReadingNormalizer.shouldUseEnglishTts(text);
 
       final speechText = TextReadingNormalizer.normalizeForTts(
-        text, 
+        text,
         useEnglishVoice: useEnglish,
       );
 
@@ -4984,50 +5137,64 @@ class _JanarymHomeState extends State<JanarymHome>
     return false;
   }
 
-  bool _shouldUseVisionTextReadFallback(
-    OnDeviceTextReadResult result,
-    String resolvedText, {
-    required double score,
-  }) {
-    if (result.hasStructuredData) return false;
-    if (resolvedText.trim().isEmpty) return false;
-    if (TextReadingNormalizer.shouldUseEnglishTts(resolvedText)) return false;
-    if (score >= _manualTextReadAcceptScore &&
-        !TextReadingNormalizer.looksLikePseudoRussianOcr(resolvedText) &&
-        !TextReadingNormalizer.looksLikePseudoRussianOcr(result.rawText)) {
-      return false;
+  Future<String?> _tryTextReaderVisionFallback({
+    bool fastMode = false,
+    bool autoRead = false,
+    String reason = 'fallback',
+    int? timeoutMs,
+    int? maxAttempts,
+  }) async {
+    if (_gptStatus == GptStatus.loading ||
+        _textReaderVisionRequestInFlight ||
+        _llmRateLimitRemaining() != null) {
+      return null;
     }
-    return TextReadingNormalizer.looksLikePseudoRussianOcr(resolvedText) ||
-        TextReadingNormalizer.looksLikePseudoRussianOcr(result.rawText);
-  }
-
-  Future<String?> _tryTextReaderVisionFallback() async {
-    if (_gptStatus == GptStatus.loading) return null;
+    _textReaderVisionRequestInFlight = true;
     final jpegBytes = await _captureLatestJpegFrame();
     if (jpegBytes == null || jpegBytes.isEmpty) {
+      _textReaderVisionRequestInFlight = false;
       appLog('[TextReader][vision_fallback] no_frame');
       return null;
     }
 
     final systemPrompt = _voiceText(
-      ru: 'Ты — ассистент для незрячих. Извлеки только печатный текст с изображения. Сохрани оригинальный язык. Верни ЧИСТЫЙ ТЕКСТ без своих комментариев. Если текста нет или он неразборчив, верни СТРОГО: NO_TEXT.',
-      kk: 'Сен — зағип жандарға көмекшісің. Суреттегі баспа мәтінді ғана тауып шығар. Түпнұсқа тілін сақта. Өз пікіріңсіз ТЕК МӘТІНДІ қайтар. Егер мәтін жоқ болса, СТРОГО: NO_TEXT деп жаз.',
+      ru: fastMode
+          ? 'Ты — быстрый OCR для незрячего пользователя. Верни только чёткий видимый печатный текст. Сохрани язык оригинала. Без пояснений. Если текста нет или он нечёткий, верни строго NO_TEXT.'
+          : 'Ты — ассистент для незрячих. Извлеки только печатный текст с изображения. Сохрани оригинальный язык. Верни ЧИСТЫЙ ТЕКСТ без своих комментариев. Если текста нет или он неразборчив, верни СТРОГО: NO_TEXT.',
+      kk: fastMode
+          ? 'Сен — зағип пайдаланушыға арналған жылдам OCR. Тек анық көрінетін баспа мәтінді қайтар. Түпнұсқа тілін сақта. Еш түсіндірмесіз. Егер мәтін жоқ немесе анық емес болса, қатаң түрде NO_TEXT деп қайтар.'
+          : 'Сен — зағип жандарға көмекшісің. Суреттегі баспа мәтінді ғана тауып шығар. Түпнұсқа тілін сақта. Өз пікіріңсіз ТЕК МӘТІНДІ қайтар. Егер мәтін жоқ болса, СТРОГО: NO_TEXT деп жаз.',
     );
     final userPrompt = _voiceText(
-      ru: 'Прочитай текст на картинке. Если его нет, ответь NO_TEXT.',
-      kk: 'Суреттегі мәтінді оқы. Егер мәтін жоқ болса, NO_TEXT деп жауап бер.',
+      ru: fastMode
+          ? 'Быстро верни только текст на изображении. Иначе NO_TEXT.'
+          : 'Прочитай текст на картинке. Если его нет, ответь NO_TEXT.',
+      kk: fastMode
+          ? 'Суреттен тек мәтінді жылдам қайтар. Әйтпесе NO_TEXT.'
+          : 'Суреттегі мәтінді оқы. Егер мәтін жоқ болса, NO_TEXT деп жауап бер.',
     );
 
     try {
-      appLog('[TextReader][vision_fallback] start');
+      appLog(
+        '[TextReader][vision_fallback] start '
+        'fast=$fastMode auto=$autoRead reason=$reason',
+      );
       final raw = await _openAi.askWithImage(
         userPrompt,
         jpegBytes,
         systemPrompt: _openAi.buildSystemPrompt(basePrompt: systemPrompt),
         history: const <OpenAiChatMessage>[],
         taskMode: 'text_reader_ocr',
-        perceptionSnapshot: const <String, Object?>{'ocr_only': true},
-        maxOutputTokens: 220,
+        perceptionSnapshot: <String, Object?>{
+          'ocr_only': true,
+          'fast_mode': fastMode,
+          'auto_read': autoRead,
+        },
+        maxOutputTokens: fastMode ? 120 : 220,
+        requestTimeout: Duration(
+          milliseconds: timeoutMs ?? _textReaderVisionTimeoutMs,
+        ),
+        maxAttempts: maxAttempts ?? (fastMode ? 1 : 3),
       );
       final text = _postprocessTextReaderVisionTranscript(raw);
       if (text.isEmpty) {
@@ -5039,11 +5206,14 @@ class _JanarymHomeState extends State<JanarymHome>
       );
       return text;
     } on LlmRateLimitException catch (e) {
+      _applyLlmRateLimit(e.retryAfter);
       appLog('[TextReader][vision_fallback] rate_limit: ${e.message}');
       return null;
     } catch (e) {
       appLog('[TextReader][vision_fallback] error: $e');
       return null;
+    } finally {
+      _textReaderVisionRequestInFlight = false;
     }
   }
 
@@ -5381,14 +5551,15 @@ class _JanarymHomeState extends State<JanarymHome>
     unawaited(_tts.stop());
     _assistantMode = target;
     if (target != AssistantMode.textReader) {
-      _resetTextReaderAutoState(clearLastSignature: true);
+      _textReaderController.stop();
       _textReaderAutoPaused = false;
       _textReaderSessionCancelRequested = false;
     } else {
-      _resetTextReaderAutoState(clearLastSignature: true);
+      _textReaderController.resume(clearSpokenSignature: true);
       _textReaderAutoPaused = false;
       _textReaderSessionCancelRequested = false;
     }
+    _applyTextReaderState(_textReaderController.state, updateUi: false);
     _modeOrchestrator.transitionTo(
       _toJanarymMode(target),
       subState: 'active',
@@ -5697,7 +5868,209 @@ class _JanarymHomeState extends State<JanarymHome>
       frame,
       minInterval: Duration(milliseconds: _textReaderFrameIntervalMs),
       force: force,
+      aggressiveShortText: _assistantMode == AssistantMode.textReader,
     );
+  }
+
+  String _textReaderKindForScan(TextReaderScanResult result) {
+    final structured = result.structuredData;
+    if (structured.price != null) return 'price';
+    if (structured.calories != null) return 'nutrition';
+    return 'document';
+  }
+
+  String _formatTextReaderPrice(double value) {
+    return value % 1 == 0 ? value.toStringAsFixed(0) : value.toStringAsFixed(2);
+  }
+
+  String _buildStructuredTextReaderSummary(TextReaderStructuredData data) {
+    final parts = <String>[];
+    if (data.price != null) {
+      parts.add(
+        _voiceText(
+          ru: 'Цена ${_formatTextReaderPrice(data.price!)}',
+          kk: 'Бағасы ${_formatTextReaderPrice(data.price!)}',
+        ),
+      );
+    }
+    if (data.calories != null) {
+      parts.add(
+        _voiceText(
+          ru: 'Калорийность ${data.calories} ккал',
+          kk: 'Калориясы ${data.calories} ккал',
+        ),
+      );
+    }
+    return parts.join('. ');
+  }
+
+  String _resolveTextReaderScanText(TextReaderScanResult result) {
+    final fullText = result.fullText.trim();
+    if (fullText.isNotEmpty) {
+      return fullText;
+    }
+    return _buildStructuredTextReaderSummary(result.structuredData).trim();
+  }
+
+  List<String> _buildTextReaderSpeechSegmentsFromScan(
+    TextReaderScanResult result,
+  ) {
+    final orderedLines = result.orderedLines
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList(growable: false);
+    if (orderedLines.isEmpty) {
+      return _splitTextReaderSpeechSegments(_resolveTextReaderScanText(result));
+    }
+    final segments = orderedLines
+        .expand(_splitMixedLanguageSpeechSegments)
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList(growable: false);
+    if (segments.isNotEmpty) {
+      return segments;
+    }
+    return _splitTextReaderSpeechSegments(_resolveTextReaderScanText(result));
+  }
+
+  String _buildTextReaderAnswerFromScan(
+    TextReaderScanResult result, {
+    required String normalizedUserText,
+  }) {
+    final structured = result.structuredData;
+    if (normalizedUserText.contains('цен') ||
+        normalizedUserText.contains('price')) {
+      if (structured.price != null) {
+        return _voiceText(
+          ru: 'Цена примерно ${_formatTextReaderPrice(structured.price!)}.',
+          kk: 'Бағасы шамамен ${_formatTextReaderPrice(structured.price!)}.',
+        );
+      }
+    }
+    if (normalizedUserText.contains('калор') ||
+        normalizedUserText.contains('kcal')) {
+      if (structured.calories != null) {
+        return _voiceText(
+          ru: 'Калорийность примерно ${structured.calories} ккал.',
+          kk: 'Калориясы шамамен ${structured.calories} ккал.',
+        );
+      }
+    }
+    final text = _truncateForSpeech(
+      _resolveTextReaderScanText(result),
+      maxChars: 320,
+    );
+    if (text.isNotEmpty) {
+      return text;
+    }
+    final structuredOnly = _buildStructuredTextReaderSummary(structured);
+    if (structuredOnly.isNotEmpty) {
+      return structuredOnly;
+    }
+    return _textReaderFailureMessage();
+  }
+
+  Future<void> _storeTextReaderScan(TextReaderScanResult result) async {
+    final db = await _personalizationDatabase.database;
+    final rawText = _resolveTextReaderScanText(result);
+    await db.insert('ocr_reads', <String, Object?>{
+      'read_kind': _textReaderKindForScan(result),
+      'raw_text': await _securePayloadCodec.encrypt(rawText),
+      'price': result.structuredData.price,
+      'calories': result.structuredData.calories,
+      'created_at': DateTime.now().millisecondsSinceEpoch,
+    });
+    await _personalizationDatabase.pruneOcrReads(maxEntries: 100);
+  }
+
+  void _publishTextReaderScanEvent(
+    TextReaderScanResult result, {
+    required _TextReaderReadSource source,
+  }) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _perceptionEventBus.publish(
+      PerceptionEvent(
+        id: 'text_read_$now',
+        type: PerceptionEventType.textRead,
+        timestampMs: now,
+        confidence: result.isStrong ? 0.95 : 0.78,
+        label: _textReaderKindForScan(result),
+        meta: <String, Object?>{
+          'raw_text': result.fullText,
+          'blocks': result.orderedLines,
+          'auto_speech_text': result.orderedLines.isNotEmpty
+              ? result.orderedLines.first
+              : '',
+          'scan_source': result.source.name,
+          'quality': result.quality.name,
+          'signature': result.signature,
+          'price': result.structuredData.price,
+          'calories': result.structuredData.calories,
+          'mode': _assistantModeContextKey(_assistantMode),
+          'manual_source': source.name,
+        },
+      ),
+    );
+  }
+
+  Future<void> _speakTextReaderAnswerText(
+    String answer, {
+    required bool autoRead,
+  }) async {
+    _textReaderController.markSpeaking();
+    _applyTextReaderState(_textReaderController.state);
+    try {
+      await _ensureTtsLocaleForSpokenText(answer, autoRead: autoRead);
+      await _speak(answer, ensureLocale: false);
+    } finally {
+      _textReaderController.markIdle();
+      _applyTextReaderState(_textReaderController.state);
+    }
+  }
+
+  Future<void> _handleTextReaderAttemptSuccess({
+    required String rawText,
+    required _TextReaderReadSource source,
+    required TextReaderScanResult result,
+  }) async {
+    final normalizedUserText = _router.normalize(rawText);
+    final autoRead = source == _TextReaderReadSource.auto;
+    final wantsStructuredOnly = _isTextReaderStructuredQuery(
+      normalizedUserText,
+    );
+    final answer = _buildTextReaderAnswerFromScan(
+      result,
+      normalizedUserText: normalizedUserText,
+    );
+    final segments = wantsStructuredOnly
+        ? const <String>[]
+        : _buildTextReaderSpeechSegmentsFromScan(result);
+
+    await _storeTextReaderScan(result);
+    _publishTextReaderScanEvent(result, source: source);
+    if (!autoRead) {
+      _rememberDialogTurn(rawText, answer);
+    }
+    _lastAnswer = answer;
+    appLog(
+      '[TextReader][result] source=${source.name} '
+      'scan=${result.source.name} quality=${result.quality.name} '
+      'signature=${result.signature} text="${_truncateForLog(_resolveTextReaderScanText(result))}"',
+    );
+
+    if (segments.isNotEmpty) {
+      _textReaderController.markSpeaking();
+      _applyTextReaderState(_textReaderController.state);
+      try {
+        await _speakTextReaderSegments(segments, autoRead: autoRead);
+      } finally {
+        _textReaderController.markIdle();
+        _applyTextReaderState(_textReaderController.state);
+      }
+      return;
+    }
+
+    await _speakTextReaderAnswerText(answer, autoRead: autoRead);
   }
 
   Future<void> _storeOcrRead(OnDeviceTextReadResult result) async {
@@ -5729,8 +6102,11 @@ class _JanarymHomeState extends State<JanarymHome>
           'raw_text': result.rawText,
           'blocks': result.blocks,
           'manual_fallback_text': result.manualFallbackText,
-          'auto_speech_text': result.blocks.isNotEmpty ? result.blocks.first : '',
-          'dominant_script': result.dominantScript.name,
+          'auto_speech_text': result.blocks.isNotEmpty
+              ? result.blocks.first
+              : '',
+          'dominant_script': result.rawDominantScript.name,
+          'looks_pseudo_russian_ocr': result.looksPseudoRussianOcr,
           'price': result.price,
           'calories': result.calories,
           'mode': _assistantModeContextKey(_assistantMode),
@@ -5874,7 +6250,12 @@ class _JanarymHomeState extends State<JanarymHome>
       _textReaderLoopTimer?.cancel();
       _textReaderLoopTimer = null;
       _textReaderLoopBusy = false;
-      _resetTextReaderAutoState();
+      if (!_isSpeaking &&
+          !_manualTextReadInProgress &&
+          !_textReaderAutoPaused) {
+        _textReaderController.markIdle();
+        _applyTextReaderState(_textReaderController.state);
+      }
       return;
     }
     if (_textReaderLoopTimer != null) return;
@@ -5906,139 +6287,25 @@ class _JanarymHomeState extends State<JanarymHome>
     }
     _textReaderLoopBusy = true;
     try {
-      final result = await _readTextFromCurrentFrame();
-      if (result == null || !result.hasRawText) {
-        _resetTextReaderAutoState();
-        if (_assistantMode == AssistantMode.textReader) {
-          // Log even if no result in text reader mode to help debug
-          appLog('[TextReader][auto] tick no_result');
-        }
-        return;
-      }
-
-      if (_assistantMode == AssistantMode.textReader) {
-        if (_shouldTriggerAutoExactTextRead(result)) {
-          // Use more permissive segments for specialized Text Reader mode
-          final textSegments = _buildTextReaderSpeechSegments(result);
-          final signature = _buildTextReaderSpeechSignature(
-            textSegments,
-            result: result,
-          );
-          if (textSegments.isNotEmpty &&
-              signature != _lastAutoTextReaderSignature) {
-            final now = DateTime.now().millisecondsSinceEpoch;
-            _lastAutoTextReaderSignature = signature;
-            _lastAutoTextReaderSpeakMs = now;
-
-            appLog(
-              '[TextReader][auto] fast_read triggered length=${result.rawText.length}',
-            );
-            await _speakTextReaderSegments(textSegments, autoRead: true);
-          } else if (textSegments.isEmpty) {
-            appLog('[TextReader][auto] trigger session (no fast segments)');
-            _resetTextReaderAutoState();
-            await _runManualTextReadSession(
-              _voiceText(ru: 'авточтение', kk: 'автоматты оқу'),
-              source: _TextReaderReadSource.auto,
-            );
-          }
-        }
-        return;
-      }
-
-      final autoSegments = _buildAutoTextReaderSpeechSegments(result);
-      final autoAnswer = _buildTextReaderAnswer(
-        result,
-        normalizedUserText: '',
-        autoRead: true,
+      final attempt = await _textReaderController.runAutoTick();
+      _applyTextReaderState(
+        attempt.state,
+        failureReason: attempt.failureReason,
+        updateUi: _assistantMode == AssistantMode.textReader,
       );
-      final canSpeakAutoSegments =
-          autoSegments.isNotEmpty && result.isAutoSpeakSafe;
-      if (canSpeakAutoSegments) {
-        final signature = _buildTextReaderSpeechSignature(
-          autoSegments,
-          result: result,
-        );
-        if (_markAutoTextReaderCandidateSeen(signature) &&
-            _shouldSpeakAutoTextReaderTranscript(
-              autoSegments,
-              result: result,
-            )) {
-          await _storeOcrRead(result);
-          _publishTextReadEvent(result, source: _TextReaderReadSource.auto);
-          _lastAnswer = autoAnswer;
+      if (!attempt.hasResult) {
+        if (_assistantMode == AssistantMode.textReader && !attempt.skipped) {
           appLog(
-            '[TextReader][auto] raw="${_truncateForLog(result.rawText)}" '
-            'auto="${result.blocks.isNotEmpty ? _truncateForLog(result.blocks.first) : ''}"',
+            '[TextReader][auto] no_result reason=${attempt.failureReason ?? 'none'}',
           );
-          await _speakTextReaderSegments(autoSegments, autoRead: true);
-          _resetTextReaderAutoState();
         }
         return;
       }
 
-      final canSpeakStructuredOnly = shouldAutoSpeakStructuredOnly(
-        hasStructuredData: result.hasStructuredData,
-        isAutoSpeakSafe: result.isAutoSpeakSafe,
-      );
-      if (canSpeakStructuredOnly) {
-        final signature = _buildTextReaderSpeechSignature(<String>[
-          autoAnswer,
-        ], result: result);
-        if (_markAutoTextReaderCandidateSeen(signature) &&
-            _shouldSpeakAutoTextReaderTranscript(<String>[
-              autoAnswer,
-            ], result: result)) {
-          await _storeOcrRead(result);
-          _publishTextReadEvent(result, source: _TextReaderReadSource.auto);
-          _lastAnswer = autoAnswer;
-          appLog(
-            '[TextReader][auto] structured="${_truncateForLog(autoAnswer)}"',
-          );
-          await _ensureTtsLocaleForReadResult(result, autoRead: true);
-          await _speak(autoAnswer, ensureLocale: false);
-          _resetTextReaderAutoState();
-        }
-        return;
-      }
-
-      if (_shouldTryAutoTextReaderVisionFallback(result)) {
-        final fallbackText = await _tryTextReaderVisionFallback();
-        if (fallbackText != null) {
-          final transcriptSegments = _splitTextReaderSpeechSegments(
-            fallbackText,
-          );
-          if (transcriptSegments.isNotEmpty &&
-              _shouldSpeakAutoTextReaderTranscript(
-                transcriptSegments,
-                result: result,
-              )) {
-            final answer = _buildDirectTextReadAnswer(
-              fallbackText,
-              result: result,
-            );
-            await _storeOcrRead(result);
-            _publishTextReadEvent(result, source: _TextReaderReadSource.auto);
-            _lastAnswer = answer;
-            appLog(
-              '[TextReader][auto] vision_fallback '
-              'text="${_truncateForLog(fallbackText)}"',
-            );
-            await _speakTextReaderSegments(transcriptSegments, autoRead: false);
-            _resetTextReaderAutoState();
-            return;
-          }
-        }
-      }
-
-      _resetTextReaderAutoState();
-      final reason = !result.isAutoSpeakSafe
-          ? 'unsafe_auto_text'
-          : 'no_auto_text';
-      appLog(
-        '[TextReader][auto] skip $reason '
-        'raw="${_truncateForLog(result.rawText)}" '
-        'auto="${result.blocks.isNotEmpty ? _truncateForLog(result.blocks.first) : ''}"',
+      await _handleTextReaderAttemptSuccess(
+        rawText: _voiceText(ru: 'авточтение', kk: 'автоматты оқу'),
+        source: _TextReaderReadSource.auto,
+        result: attempt.result!,
       );
     } finally {
       _textReaderLoopBusy = false;
@@ -7332,11 +7599,14 @@ class _JanarymHomeState extends State<JanarymHome>
   Future<void> _startRouteWithConfirmation(
     String rawDestination, {
     String routeSource = 'manual',
+    NavigationDestinationKind destinationKindHint =
+        NavigationDestinationKind.generic,
   }) async {
     if (!_micGranted) {
-      await _navigationController.startRoute(
+      await _navigationController.startRouteWithKind(
         rawDestination,
         source: routeSource,
+        destinationKind: destinationKindHint,
       );
       return;
     }
@@ -7347,12 +7617,24 @@ class _JanarymHomeState extends State<JanarymHome>
       return;
     }
 
+    if (destinationKindHint == NavigationDestinationKind.transitStop) {
+      final stopPrefix = _interactionLanguage == AppLanguage.kk ? 'аялдамасы ' : 'остановка ';
+      if (!destination.toLowerCase().contains('остановка') && 
+          !destination.toLowerCase().contains('аялдама')) {
+        destination = _interactionLanguage == AppLanguage.kk
+            ? '\$destination \$stopPrefix'
+            : '\$stopPrefix\$destination';
+      }
+    }
+
     var effectiveSource = routeSource;
     final confirmAddress =
         !_personalizationReady ||
         _personalizationController.snapshot.profile.confirmAddressBeforeRoute;
 
-    if (_personalizationReady && routeSource == 'manual') {
+    if (_personalizationReady &&
+        routeSource == 'manual' &&
+        destinationKindHint != NavigationDestinationKind.transitStop) {
       final similar = await _personalizationRepository.findBestSimilarRoute(
         destination,
       );
@@ -7377,9 +7659,10 @@ class _JanarymHomeState extends State<JanarymHome>
           destination = similar.resolvedAddress;
           effectiveSource = 'suggestion';
           if (!confirmAddress) {
-            await _navigationController.startRoute(
+            await _navigationController.startRouteWithKind(
               destination,
               source: effectiveSource,
+              destinationKind: destinationKindHint,
             );
             return;
           }
@@ -7393,9 +7676,10 @@ class _JanarymHomeState extends State<JanarymHome>
     }
 
     if (!confirmAddress) {
-      await _navigationController.startRoute(
+      await _navigationController.startRouteWithKind(
         destination,
         source: effectiveSource,
+        destinationKind: destinationKindHint,
       );
       return;
     }
@@ -7432,9 +7716,10 @@ class _JanarymHomeState extends State<JanarymHome>
 
         final normalized = _router.normalize(response);
         if (_isAffirmativeResponse(normalized)) {
-          await _navigationController.startRoute(
+          await _navigationController.startRouteWithKind(
             destination,
             source: effectiveSource,
+            destinationKind: destinationKindHint,
           );
           return;
         }
@@ -7560,10 +7845,11 @@ class _JanarymHomeState extends State<JanarymHome>
   Future<void> _stopAll() async {
     appLog('[Stop] pressed');
     _textReaderSessionCancelRequested = true;
+    _textReaderController.stop();
+    _applyTextReaderState(_textReaderController.state, updateUi: false);
     await _sttService.stop();
     await _tts.stop();
     _followUpActive = false;
-    await _playEndCue();
     await _vibrateEnd();
     if (_micGranted) {
       if (_useSttWakeEngine) {
@@ -7585,12 +7871,15 @@ class _JanarymHomeState extends State<JanarymHome>
 
   Future<void> _stopTtsOnly() async {
     _textReaderSessionCancelRequested = true;
+    if (_textReaderSessionState == _TextReaderSessionState.speaking) {
+      _textReaderController.markIdle();
+      _applyTextReaderState(_textReaderController.state, updateUi: false);
+    }
     await _tts.stop();
   }
 
   void _triggerFastModeFeedback() {
     _setCircleState(CircleState.end);
-    unawaited(_playEndCue());
     unawaited(_vibrateEnd());
     Future<void>.delayed(const Duration(milliseconds: 120), () {
       if (!mounted) return;
@@ -8283,7 +8572,6 @@ class _JanarymHomeState extends State<JanarymHome>
               if (mounted) {
                 setState(() => _modePickerOpen = false);
               }
-              await _playEndCue();
               await _vibrateEnd();
               switch (actionId) {
                 case 'go_home':
@@ -8702,10 +8990,8 @@ class _JanarymHomeState extends State<JanarymHome>
                     _modePickerAutoCloseTimer?.cancel();
                     setState(() => _modePickerOpen = nextOpen);
                     if (nextOpen) {
-                      await _playStartCue();
                       await _vibrateStart();
                     } else {
-                      await _playEndCue();
                       await _vibrateEnd();
                     }
                   },
@@ -8773,7 +9059,6 @@ class _JanarymHomeState extends State<JanarymHome>
   String _textReaderActionLabel() {
     if (_textReaderSessionState == _TextReaderSessionState.scanning ||
         _textReaderSessionState == _TextReaderSessionState.speaking ||
-        _textReaderSessionState == _TextReaderSessionState.preparing ||
         _manualTextReadInProgress) {
       return widget.appLanguage == AppLanguage.kk ? 'Тоқтату' : 'Стоп';
     }
@@ -8791,8 +9076,6 @@ class _JanarymHomeState extends State<JanarymHome>
             borderRadius: BorderRadius.circular(999),
             onTap: () async {
               if (_manualTextReadInProgress ||
-                  _textReaderSessionState ==
-                      _TextReaderSessionState.preparing ||
                   _textReaderSessionState == _TextReaderSessionState.scanning ||
                   _textReaderSessionState == _TextReaderSessionState.speaking) {
                 await _cancelActiveTextReaderSession();
@@ -9049,70 +9332,71 @@ class _JanarymHomeState extends State<JanarymHome>
       body: GestureDetector(
         behavior: HitTestBehavior.translucent,
         onTap: () async {
-          if (_isSpeaking || _textReaderSessionState == _TextReaderSessionState.speaking) {
+          if (_isSpeaking ||
+              _textReaderSessionState == _TextReaderSessionState.speaking) {
             await _stopTtsOnly();
             _textReaderSessionCancelRequested = true;
           }
         },
         child: Stack(
           children: [
-          // --- Camera feed ---
-          Positioned.fill(child: _buildCameraStage()),
+            // --- Camera feed ---
+            Positioned.fill(child: _buildCameraStage()),
 
-          // --- Top-to-bottom gradient overlay ---
-          Positioned.fill(
-            child: IgnorePointer(
-              child: Container(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    stops: const [0.0, 0.35, 0.65, 1.0],
-                    colors: [
-                      const Color(0xFF020617).withOpacity(0.75),
-                      Colors.transparent,
-                      Colors.transparent,
-                      const Color(0xFF020617).withOpacity(0.90),
-                    ],
+            // --- Top-to-bottom gradient overlay ---
+            Positioned.fill(
+              child: IgnorePointer(
+                child: Container(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      stops: const [0.0, 0.35, 0.65, 1.0],
+                      colors: [
+                        const Color(0xFF020617).withOpacity(0.75),
+                        Colors.transparent,
+                        Colors.transparent,
+                        const Color(0xFF020617).withOpacity(0.90),
+                      ],
+                    ),
                   ),
                 ),
               ),
             ),
-          ),
 
-          // --- Top status bar ---
-          Positioned(
-            top: topPadding + 12,
-            left: 16,
-            right: 16,
-            child: _buildTopStatusBar(statusColor),
-          ),
-
-          // --- Wake debug overlay (dev) ---
-          if (_wakeDebugOverlayEnabled)
+            // --- Top status bar ---
             Positioned(
+              top: topPadding + 12,
               left: 16,
-              bottom: bottomPadding + 130,
-              child: _buildWakeDebugOverlay(),
+              right: 16,
+              child: _buildTopStatusBar(statusColor),
             ),
 
-          // --- Text reader action button ---
-          if (_assistantMode == AssistantMode.textReader)
+            // --- Wake debug overlay (dev) ---
+            if (_wakeDebugOverlayEnabled)
+              Positioned(
+                left: 16,
+                bottom: bottomPadding + 130,
+                child: _buildWakeDebugOverlay(),
+              ),
+
+            // --- Text reader action button ---
+            if (_assistantMode == AssistantMode.textReader)
+              Positioned(
+                right: 20,
+                bottom: bottomPadding + 130,
+                child: _buildTextReaderActionButton(),
+              ),
+
+            // --- Main circle button (bottom center) ---
             Positioned(
-              right: 20,
-              bottom: bottomPadding + 130,
-              child: _buildTextReaderActionButton(),
+              bottom: bottomPadding + 24,
+              left: 0,
+              right: 0,
+              child: Center(child: _buildMainCircleButton(statusColor)),
             ),
-
-          // --- Main circle button (bottom center) ---
-          Positioned(
-            bottom: bottomPadding + 24,
-            left: 0,
-            right: 0,
-            child: Center(child: _buildMainCircleButton(statusColor)),
-          ),
-        ],
-      ),
+          ],
+        ),
       ),
     );
   }
@@ -9139,7 +9423,10 @@ class _JanarymHomeState extends State<JanarymHome>
           decoration: BoxDecoration(
             color: Colors.black.withOpacity(0.38),
             borderRadius: BorderRadius.circular(20),
-            border: Border.all(color: accentColor.withOpacity(0.45), width: 1.2),
+            border: Border.all(
+              color: accentColor.withOpacity(0.45),
+              width: 1.2,
+            ),
             boxShadow: [
               BoxShadow(
                 color: accentColor.withOpacity(0.12),
@@ -9243,11 +9530,15 @@ class _JanarymHomeState extends State<JanarymHome>
       case CircleState.wake:
         return widget.appLanguage == AppLanguage.kk ? 'Тыңдауда' : 'Слушаю...';
       case CircleState.listening:
-        return widget.appLanguage == AppLanguage.kk ? 'Сөйлеңіз' : 'Говорите...';
+        return widget.appLanguage == AppLanguage.kk
+            ? 'Сөйлеңіз'
+            : 'Говорите...';
       case CircleState.thinking:
         return widget.appLanguage == AppLanguage.kk ? 'Ойлануда' : 'Думаю...';
       case CircleState.speaking:
-        return widget.appLanguage == AppLanguage.kk ? 'Жауап беруде' : 'Отвечаю...';
+        return widget.appLanguage == AppLanguage.kk
+            ? 'Жауап беруде'
+            : 'Отвечаю...';
       case CircleState.end:
         return widget.appLanguage == AppLanguage.kk ? 'Дайын' : 'Готово';
       default:
@@ -9261,7 +9552,8 @@ class _JanarymHomeState extends State<JanarymHome>
       animation: _modeFabPulse,
       builder: (context, _) {
         final pulseScale = 1.0 + (_modeFabPulse.value - 1.0) * 0.6;
-        final isActive = _circleState == CircleState.listening ||
+        final isActive =
+            _circleState == CircleState.listening ||
             _circleState == CircleState.thinking ||
             _circleState == CircleState.speaking;
 
@@ -9391,7 +9683,6 @@ class _JanarymHomeState extends State<JanarymHome>
           },
           onActionSelected: (actionId) async {
             Navigator.of(sheetCtx).pop();
-            await _playEndCue();
             switch (actionId) {
               case 'go_home':
                 await _handleGoHomeShortcut(
@@ -9419,8 +9710,8 @@ class _JanarymHomeState extends State<JanarymHome>
         ? 'Жеке баптау: $step/$total'
         : 'Персонализация: $step/$total';
     final subtitle = widget.appLanguage == AppLanguage.kk
-        ? 'Жауап беріңіз немесе "кейін" деңіз.'
-        : 'Ответьте голосом или скажите "позже".';
+        ? 'Жауап беріңіз немесе "кейін" деңіз. Бір сағаттан кейін еске саламын.'
+        : 'Ответьте голосом или скажите "позже". Я напомню через час.';
 
     return Container(
       width: double.infinity,
@@ -9453,6 +9744,13 @@ class _JanarymHomeState extends State<JanarymHome>
             question.isEmpty ? subtitle : question,
             style: const TextStyle(color: Colors.white, fontSize: 13),
           ),
+          if (question.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              subtitle,
+              style: const TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+          ],
           const SizedBox(height: 10),
           Row(
             children: [
@@ -9472,10 +9770,12 @@ class _JanarymHomeState extends State<JanarymHome>
               const SizedBox(width: 8),
               OutlinedButton(
                 onPressed: () {
-                  _personalizationController.pauseOnboarding();
-                  setState(() {
-                    _showOnboardingOverlay = false;
-                  });
+                  unawaited(
+                    _deferOnboarding(
+                      defaultOnboardingReminderRequest(),
+                      speakAck: false,
+                    ),
+                  );
                 },
                 child: Text(
                   widget.appLanguage == AppLanguage.kk ? 'Кейін' : 'Позже',
@@ -10160,19 +10460,27 @@ class _ModePickerSheet extends StatelessWidget {
               ...menuItems.map((item) {
                 final isSelected = item.isMode && item.mode == currentMode;
                 final subtitle = (item.isMode && item.mode != null)
-                    ? modeDescriptorFor(item.mode!).ui.shortLabel(isKazakh: isKazakh)
+                    ? modeDescriptorFor(
+                        item.mode!,
+                      ).ui.shortLabel(isKazakh: isKazakh)
                     : null;
 
                 return ListTile(
                   leading: Icon(
                     item.icon,
-                    color: isSelected ? Theme.of(context).colorScheme.primary : null,
+                    color: isSelected
+                        ? Theme.of(context).colorScheme.primary
+                        : null,
                   ),
                   title: Text(
                     item.label,
                     style: TextStyle(
-                      fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                      color: isSelected ? Theme.of(context).colorScheme.primary : null,
+                      fontWeight: isSelected
+                          ? FontWeight.bold
+                          : FontWeight.normal,
+                      color: isSelected
+                          ? Theme.of(context).colorScheme.primary
+                          : null,
                     ),
                   ),
                   subtitle: subtitle != null ? Text(subtitle) : null,

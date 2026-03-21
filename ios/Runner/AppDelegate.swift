@@ -19,8 +19,14 @@ import YandexMapsMobile
   private func readYandexApiKey() -> String? {
     let paths = [
       Bundle.main.path(forResource: ".env", ofType: nil, inDirectory: "flutter_assets"),
+      Bundle.main.path(forResource: ".env.example", ofType: nil, inDirectory: "flutter_assets"),
       Bundle.main.path(
         forResource: ".env",
+        ofType: nil,
+        inDirectory: "Frameworks/App.framework/flutter_assets"
+      ),
+      Bundle.main.path(
+        forResource: ".env.example",
         ofType: nil,
         inDirectory: "Frameworks/App.framework/flutter_assets"
       )
@@ -32,13 +38,26 @@ import YandexMapsMobile
 
       for rawLine in content.components(separatedBy: .newlines) {
         let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-        if line.hasPrefix("YANDEX_MAPKIT_API_KEY=") {
-          return String(line.dropFirst("YANDEX_MAPKIT_API_KEY=".count))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let value = parseEnvValue(line, key: "YANDEX_MAPKIT_API_KEY") {
+          return value
         }
       }
     }
 
     return nil
+  }
+
+  private func parseEnvValue(_ line: String, key: String) -> String? {
+    let prefix = "\(key)="
+    guard line.hasPrefix(prefix) else { return nil }
+    let rawValue = String(line.dropFirst(prefix.count))
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let uncommented = rawValue.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
+      .first
+      .map(String.init) ?? rawValue
+    return uncommented
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+      .trimmingCharacters(in: .whitespacesAndNewlines)
   }
 }

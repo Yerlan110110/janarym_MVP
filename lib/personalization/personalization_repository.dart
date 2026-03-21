@@ -244,6 +244,7 @@ class PersonalizationRepository {
       warningIntensity: ((row['warning_intensity'] as int?) ?? 2).clamp(1, 3),
       onboardingCompleted: ((row['onboarding_completed'] as int?) ?? 0) == 1,
       onboardingStep: ((row['onboarding_step'] as int?) ?? 0).clamp(0, 10),
+      onboardingDeferredUntilEpochMs: row['onboarding_deferred_until'] as int?,
       createdAtEpochMs: (row['created_at'] as int?) ?? 0,
       updatedAtEpochMs: (row['updated_at'] as int?) ?? 0,
     );
@@ -258,6 +259,7 @@ class PersonalizationRepository {
       'warning_intensity': profile.warningIntensity.clamp(1, 3),
       'onboarding_completed': profile.onboardingCompleted ? 1 : 0,
       'onboarding_step': profile.onboardingStep.clamp(0, 10),
+      'onboarding_deferred_until': profile.onboardingDeferredUntilEpochMs,
       'created_at': profile.createdAtEpochMs,
       'updated_at': profile.updatedAtEpochMs,
     };

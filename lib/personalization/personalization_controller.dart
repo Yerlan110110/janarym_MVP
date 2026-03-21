@@ -18,6 +18,182 @@ class OnboardingQuestion {
   final String kk;
 }
 
+class OnboardingReminderRequest {
+  const OnboardingReminderRequest({
+    required this.delay,
+    required this.labelRu,
+    required this.labelKk,
+  });
+
+  final Duration delay;
+  final String labelRu;
+  final String labelKk;
+}
+
+OnboardingReminderRequest defaultOnboardingReminderRequest() {
+  return const OnboardingReminderRequest(
+    delay: Duration(hours: 1),
+    labelRu: 'через час',
+    labelKk: 'бір сағаттан кейін',
+  );
+}
+
+OnboardingReminderRequest tomorrowOnboardingReminderRequest() {
+  return const OnboardingReminderRequest(
+    delay: Duration(days: 1),
+    labelRu: 'завтра',
+    labelKk: 'ертең',
+  );
+}
+
+OnboardingReminderRequest? parseOnboardingReminderRequest(String rawText) {
+  final normalized = normalizeText(rawText);
+  if (normalized.isEmpty) return null;
+
+  const laterTokens = <String>[
+    'позже',
+    'потом',
+    'попозже',
+    'не сейчас',
+    'чуть позже',
+    'сделаю позже',
+    'сделаем позже',
+    'сделаю потом',
+    'сделаем потом',
+    'давай позже',
+    'давай потом',
+    'кейин',
+    'кейін',
+  ];
+  const tomorrowTokens = <String>['завтра', 'ертең', 'ертен'];
+  const oneHourTokens = <String>[
+    'через час',
+    'через 1 час',
+    'через один час',
+    'через 1 часа',
+    'бір сағаттан кейін',
+    'бир сагаттан кейин',
+    '1 сағаттан кейін',
+    '1 сагаттан кейин',
+  ];
+  const oneDayTokens = <String>[
+    'через день',
+    'через 1 день',
+    'через один день',
+    'через сутки',
+    'бір күннен кейін',
+    'бир куннен кейин',
+    '1 күннен кейін',
+    '1 куннен кейин',
+  ];
+
+  if (_matchesReminderToken(normalized, tomorrowTokens)) {
+    return tomorrowOnboardingReminderRequest();
+  }
+  if (_matchesReminderToken(normalized, oneHourTokens)) {
+    return _hoursReminderRequest(1);
+  }
+  if (_matchesReminderToken(normalized, oneDayTokens)) {
+    return _daysReminderRequest(1);
+  }
+
+  final hourMatch = RegExp(
+    r'^(?:напом(?:ни|ните)\s+)?через\s+(\d{1,2})\s+(час|часа|часов)$',
+  ).firstMatch(normalized);
+  if (hourMatch != null) {
+    final hours = int.tryParse(hourMatch.group(1) ?? '') ?? 1;
+    return _hoursReminderRequest(hours.clamp(1, 72));
+  }
+
+  final hourMatchKk = RegExp(
+    r'^(\d{1,2})\s+(сагат|сағат)\w*\s+(кейин|кейін)$',
+  ).firstMatch(normalized);
+  if (hourMatchKk != null) {
+    final hours = int.tryParse(hourMatchKk.group(1) ?? '') ?? 1;
+    return _hoursReminderRequest(hours.clamp(1, 72));
+  }
+
+  final dayMatch = RegExp(
+    r'^(?:напом(?:ни|ните)\s+)?через\s+(\d{1,2})\s+(день|дня|дней)$',
+  ).firstMatch(normalized);
+  if (dayMatch != null) {
+    final days = int.tryParse(dayMatch.group(1) ?? '') ?? 1;
+    return _daysReminderRequest(days.clamp(1, 30));
+  }
+
+  final dayMatchKk = RegExp(
+    r'^(\d{1,2})\s+(кун|күн)\w*\s+(кейин|кейін)$',
+  ).firstMatch(normalized);
+  if (dayMatchKk != null) {
+    final days = int.tryParse(dayMatchKk.group(1) ?? '') ?? 1;
+    return _daysReminderRequest(days.clamp(1, 30));
+  }
+
+  if (_matchesReminderToken(normalized, laterTokens)) {
+    return defaultOnboardingReminderRequest();
+  }
+
+  return null;
+}
+
+bool _matchesReminderToken(String normalized, List<String> tokens) {
+  if (tokens.any((token) => normalized == token)) {
+    return true;
+  }
+  if (!_containsReminderVerb(normalized)) {
+    return false;
+  }
+  return tokens.any(normalized.contains);
+}
+
+bool _containsReminderVerb(String normalized) {
+  return normalized.contains('напомн') || normalized.contains('еске сал');
+}
+
+OnboardingReminderRequest _hoursReminderRequest(int hours) {
+  final labelRu = hours == 1
+      ? 'через час'
+      : 'через $hours ${_russianHoursWord(hours)}';
+  final labelKk = hours == 1 ? 'бір сағаттан кейін' : '$hours сағаттан кейін';
+  return OnboardingReminderRequest(
+    delay: Duration(hours: hours),
+    labelRu: labelRu,
+    labelKk: labelKk,
+  );
+}
+
+OnboardingReminderRequest _daysReminderRequest(int days) {
+  final labelRu = days == 1
+      ? 'через день'
+      : 'через $days ${_russianDaysWord(days)}';
+  final labelKk = days == 1 ? 'бір күннен кейін' : '$days күннен кейін';
+  return OnboardingReminderRequest(
+    delay: Duration(days: days),
+    labelRu: labelRu,
+    labelKk: labelKk,
+  );
+}
+
+String _russianHoursWord(int hours) {
+  final mod10 = hours % 10;
+  final mod100 = hours % 100;
+  if (mod10 == 1 && mod100 != 11) return 'час';
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) {
+    return 'часа';
+  }
+  return 'часов';
+}
+
+String _russianDaysWord(int days) {
+  final mod10 = days % 10;
+  final mod100 = days % 100;
+  if (mod10 == 1 && mod100 != 11) return 'день';
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) {
+    return 'дня';
+  }
+  return 'дней';
+}
+
 class PersonalizationController extends ChangeNotifier {
   PersonalizationController({required PersonalizationRepository repository})
     : _repository = repository;
@@ -36,6 +212,12 @@ class PersonalizationController extends ChangeNotifier {
   bool get onboardingActive => _onboardingActive;
   bool get onboardingRequired => !_snapshot.onboardingCompleted;
   bool get onboardingPaused => _onboardingPaused;
+  bool get onboardingDeferred {
+    final until = _snapshot.profile.onboardingDeferredUntilEpochMs;
+    if (until == null) return false;
+    return until > DateTime.now().millisecondsSinceEpoch;
+  }
+
   PersonalizationSnapshot get snapshot => _snapshot;
   int get onboardingStep =>
       _snapshot.profile.onboardingStep.clamp(0, _questions.length);
@@ -75,7 +257,29 @@ class PersonalizationController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> startOrResumeOnboarding() async {
+  Future<void> startOrResumeOnboarding({bool force = false}) async {
+    if (!onboardingRequired) {
+      _onboardingPaused = false;
+      _onboardingActive = false;
+      notifyListeners();
+      return;
+    }
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final until = _snapshot.profile.onboardingDeferredUntilEpochMs;
+    if (!force && until != null && until > now) {
+      _onboardingPaused = true;
+      _onboardingActive = false;
+      notifyListeners();
+      return;
+    }
+    if (until != null) {
+      final cleared = _snapshot.profile.copyWith(
+        onboardingDeferredUntilEpochMs: null,
+        updatedAtEpochMs: now,
+      );
+      await _repository.upsertProfile(cleared);
+      await _reloadSnapshot();
+    }
     _onboardingPaused = false;
     _onboardingActive = onboardingRequired;
     notifyListeners();
@@ -92,6 +296,7 @@ class PersonalizationController extends ChangeNotifier {
       warningIntensity: 2,
       onboardingCompleted: false,
       onboardingStep: 0,
+      onboardingDeferredUntilEpochMs: null,
       confirmAddressBeforeRoute: true,
       preferSaferRoute: true,
       createdAtEpochMs: current.createdAtEpochMs == 0
@@ -111,6 +316,20 @@ class PersonalizationController extends ChangeNotifier {
   }
 
   void pauseOnboarding() {
+    _onboardingPaused = true;
+    _onboardingActive = false;
+    notifyListeners();
+  }
+
+  Future<void> deferOnboarding(Duration delay) async {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final until = now + delay.inMilliseconds;
+    final updated = _snapshot.profile.copyWith(
+      onboardingDeferredUntilEpochMs: until,
+      updatedAtEpochMs: now,
+    );
+    await _repository.upsertProfile(updated);
+    await _reloadSnapshot();
     _onboardingPaused = true;
     _onboardingActive = false;
     notifyListeners();
@@ -144,6 +363,7 @@ class PersonalizationController extends ChangeNotifier {
     profile = profile.copyWith(
       onboardingStep: nextStep,
       onboardingCompleted: nextStep >= _questions.length,
+      onboardingDeferredUntilEpochMs: null,
       updatedAtEpochMs: now,
     );
     await _repository.upsertProfile(profile);

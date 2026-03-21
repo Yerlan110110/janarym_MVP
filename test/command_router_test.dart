@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:janarym_app2/logic/command_router.dart';
+import 'package:janarym_app2/navigation/models/navigation_mode_state.dart';
 
 void main() {
   group('CommandRouter', () {
@@ -19,6 +20,72 @@ void main() {
       final decision = router.route('маршрут до абая 10 алматы');
       expect(decision.modeIntent, AssistantModeIntent.navStart);
       expect(decision.destinationQuery, 'абая 10 алматы');
+      expect(decision.destinationKindHint, NavigationDestinationKind.generic);
+    });
+
+    test('parses route to stop as transit stop destination', () {
+      final decision = router.route('маршрут до остановки университет');
+      expect(decision.modeIntent, AssistantModeIntent.navStart);
+      expect(decision.destinationQuery, 'университет');
+      expect(
+        decision.destinationKindHint,
+        NavigationDestinationKind.transitStop,
+      );
+    });
+
+    test('parses stop routes query', () {
+      final decision = router.route('какие маршруты на остановке университет');
+      expect(decision.modeIntent, AssistantModeIntent.navStopRoutes);
+      expect(decision.destinationQuery, 'университет');
+      expect(
+        decision.destinationKindHint,
+        NavigationDestinationKind.transitStop,
+      );
+    });
+
+    test('parses stop schedule query', () {
+      final decision = router.route(
+        'когда автобус 10 на остановке университет',
+      );
+      expect(decision.modeIntent, AssistantModeIntent.navStopSchedule);
+      expect(decision.destinationQuery, 'университет');
+      expect(decision.transitRouteName, '10');
+      expect(
+        decision.destinationKindHint,
+        NavigationDestinationKind.transitStop,
+      );
+    });
+
+    test('parses reordered stop schedule query with route number word', () {
+      final decision = router.route(
+        'когда придет автобус номер 10 на остановку университет',
+      );
+      expect(decision.modeIntent, AssistantModeIntent.navStopSchedule);
+      expect(decision.destinationQuery, 'университет');
+      expect(decision.transitRouteName, '10');
+    });
+
+    test('parses stop-first stop schedule query', () {
+      final decision = router.route(
+        'на остановке университет когда придет автобус 10',
+      );
+      expect(decision.modeIntent, AssistantModeIntent.navStopSchedule);
+      expect(decision.destinationQuery, 'университет');
+      expect(decision.transitRouteName, '10');
+    });
+
+    test('parses through-how-long stop schedule query', () {
+      final decision = router.route(
+        'через сколько придет автобус 10 на остановку университет',
+      );
+      expect(decision.modeIntent, AssistantModeIntent.navStopSchedule);
+      expect(decision.destinationQuery, 'университет');
+      expect(decision.transitRouteName, '10');
+    });
+
+    test('does not confuse route to stop with route to saved label', () {
+      final decision = router.route('маршрут до остановки университет');
+      expect(decision.modeIntent, isNot(AssistantModeIntent.routeToPlaceLabel));
     });
 
     test('parses nav status and next-step commands', () {
@@ -99,6 +166,22 @@ void main() {
         router.route('ешқайсысы').modeIntent,
         AssistantModeIntent.navRejectChoice,
       );
+      expect(
+        router.route('аялдамаға дейін маршрут университет').modeIntent,
+        AssistantModeIntent.navStart,
+      );
+      expect(
+        router.route('аялдамаға дейін маршрут университет').destinationKindHint,
+        NavigationDestinationKind.transitStop,
+      );
+      expect(
+        router.route('аялдама университет қандай маршруттар').modeIntent,
+        AssistantModeIntent.navStopRoutes,
+      );
+      expect(
+        router.route('аялдама университет автобус 10 қашан').modeIntent,
+        AssistantModeIntent.navStopSchedule,
+      );
     });
 
     test('parses kazakh describe and choice commands', () {
@@ -138,6 +221,28 @@ void main() {
     test('parses onboarding intent', () {
       final intent = router.route('давай пройти персонализацию');
       expect(intent.modeIntent, AssistantModeIntent.startOnboarding);
+    });
+
+    test('strips aggressive wake variants before routing', () {
+      expect(
+        router.stripWakeWords('женарим включи режим маршрута'),
+        'включи режим маршрута',
+      );
+      expect(
+        router.route('джанар начни опрос').modeIntent,
+        AssistantModeIntent.startOnboarding,
+      );
+    });
+
+    test('parses explicit onboarding start phrases', () {
+      expect(
+        router.route('начни опрос').modeIntent,
+        AssistantModeIntent.startOnboarding,
+      );
+      expect(
+        router.route('давай начнем опрос').modeIntent,
+        AssistantModeIntent.startOnboarding,
+      );
     });
 
     test('parses restart onboarding intent', () {
