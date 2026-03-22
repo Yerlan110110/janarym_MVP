@@ -22,7 +22,10 @@ void main() {
             supportedLocales: AppLocalizations.supportedLocales,
             home: Builder(
               builder: (context) {
-                return Text(AppLocalizations.of(context).modeNavigation);
+                final l10n = AppLocalizations.of(context);
+                return Column(
+                  children: [Text(l10n.modeNavigation), Text(l10n.modeBus)],
+                );
               },
             ),
           );
@@ -31,10 +34,12 @@ void main() {
     );
 
     expect(find.text('Режим маршрута'), findsOneWidget);
+    expect(find.text('Режим автобуса'), findsOneWidget);
 
     await controller.setLanguage(AppLanguage.kk);
     await tester.pumpAndSettle();
 
     expect(find.text('Маршрут режимі'), findsOneWidget);
+    expect(find.text('Автобус режимі'), findsOneWidget);
   });
 }

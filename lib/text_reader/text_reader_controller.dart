@@ -58,6 +58,7 @@ class TextReaderController {
   String _lastFailureReason = '';
   bool _paused = false;
   bool _busy = false;
+  int _runGeneration = 0;
   String _pendingSignature = '';
   int _pendingStableCount = 0;
   String _lastSpokenSignature = '';
@@ -71,6 +72,7 @@ class TextReaderController {
   String get lastSpokenSignature => _lastSpokenSignature;
 
   void pause() {
+    _runGeneration += 1;
     _paused = true;
     _state = TextReaderState.paused;
     _pendingSignature = '';
@@ -78,6 +80,7 @@ class TextReaderController {
   }
 
   void resume({bool clearSpokenSignature = true}) {
+    _runGeneration += 1;
     _paused = false;
     _state = TextReaderState.idle;
     _pendingSignature = '';
@@ -88,7 +91,7 @@ class TextReaderController {
   }
 
   void stop() {
-    _busy = false;
+    _runGeneration += 1;
     _paused = false;
     _state = TextReaderState.idle;
     _pendingSignature = '';
@@ -118,6 +121,7 @@ class TextReaderController {
       );
     }
     _busy = true;
+    final runGeneration = _runGeneration;
     _state = TextReaderState.scanning;
     _lastFailureReason = '';
     try {
@@ -128,6 +132,13 @@ class TextReaderController {
           force: true,
           timeout: _burstFrameTimeout,
         );
+        if (_isRunCanceled(runGeneration)) {
+          return TextReaderAttemptResult(
+            state: _state,
+            failureReason: _lastFailureReason,
+            skipped: true,
+          );
+        }
         if (result != null && result.hasRawText) {
           burst.add(result);
         }
@@ -145,6 +156,13 @@ class TextReaderController {
         timeoutMs: _manualGptTimeoutMs,
         maxAttempts: 1,
       );
+      if (_isRunCanceled(runGeneration)) {
+        return TextReaderAttemptResult(
+          state: _state,
+          failureReason: _lastFailureReason,
+          skipped: true,
+        );
+      }
       final visionResult = fallback == null
           ? null
           : _engine.fromVisionText(fallback);
@@ -174,10 +192,14 @@ class TextReaderController {
     }
 
     _busy = true;
+    final runGeneration = _runGeneration;
     _state = TextReaderState.scanning;
     _lastFailureReason = '';
     try {
       final raw = await _readOnDevice(force: false, timeout: _autoFrameTimeout);
+      if (_isRunCanceled(runGeneration)) {
+        return TextReaderAttemptResult(state: _state, skipped: true);
+      }
       final local = raw == null ? null : _engine.fromOnDevice(raw);
       if (local != null && local.signature.isNotEmpty) {
         _pendingStableCount = _engine.stableCountForSignature(
@@ -225,6 +247,9 @@ class TextReaderController {
         timeoutMs: _autoGptTimeoutMs,
         maxAttempts: 1,
       );
+      if (_isRunCanceled(runGeneration)) {
+        return TextReaderAttemptResult(state: _state, skipped: true);
+      }
       if (fallback == null) {
         _state = TextReaderState.idle;
         return TextReaderAttemptResult(state: _state, skipped: true);
@@ -266,6 +291,8 @@ class TextReaderController {
     }
     return true;
   }
+
+  bool _isRunCanceled(int runGeneration) => runGeneration != _runGeneration;
 
   Future<bool> _isStaleVisionResponse(String requestSignature) async {
     if (requestSignature.trim().isEmpty) return false;

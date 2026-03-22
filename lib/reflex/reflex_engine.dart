@@ -108,6 +108,40 @@ class ReflexEngine {
 
   final Map<int, _ReflexTrack> _tracks = <int, _ReflexTrack>{};
 
+  @visibleForTesting
+  static bool shouldEmitVoiceAlert({
+    required ReflexDetection detection,
+    required int consecutiveHighFrames,
+    required ReflexSafetyLevel safetyLevel,
+  }) {
+    final minFrames = safetyLevel == ReflexSafetyLevel.max ? 2 : 3;
+    if (consecutiveHighFrames < minFrames) return false;
+
+    final confidenceThresholds = <String, double>{
+      'car': 0.62,
+      'bike': 0.56,
+      'hot_surface': 0.52,
+      'sharp_object': 0.50,
+      'stairs_edge': 0.58,
+    };
+    if (detection.confidence <
+        (confidenceThresholds[detection.hazardLabel] ?? 0.60)) {
+      return false;
+    }
+
+    final distanceThresholds = <String, double>{
+      'car': 2.6,
+      'bike': 2.1,
+      'hot_surface': 1.3,
+      'sharp_object': 0.8,
+      'stairs_edge': 1.4,
+    };
+    final distanceBoost = safetyLevel == ReflexSafetyLevel.max ? 1.15 : 1.0;
+    final maxDistance =
+        (distanceThresholds[detection.hazardLabel] ?? 1.8) * distanceBoost;
+    return detection.distanceM <= maxDistance;
+  }
+
   Timer? _timer;
   bool _initialized = false;
   bool _running = false;
@@ -285,6 +319,11 @@ class ReflexEngine {
         growthRate: growthRate,
         direction: direction,
       );
+      final consecutiveHighFrames = severity == ReflexSeverity.high
+          ? (track.severity == ReflexSeverity.high
+                ? track.consecutiveHighFrames + 1
+                : 1)
+          : 0;
 
       track
         ..bbox = smoothedBox
@@ -297,7 +336,8 @@ class ReflexEngine {
         ..growthRate = growthRate
         ..severity = severity
         ..direction = direction
-        ..recommendedAction = recommendedAction;
+        ..recommendedAction = recommendedAction
+        ..consecutiveHighFrames = consecutiveHighFrames;
 
       result.add(
         ReflexDetection(
@@ -359,6 +399,13 @@ class ReflexEngine {
       if (detection.severity != ReflexSeverity.high) continue;
       final track = _tracks[detection.trackId];
       if (track == null) continue;
+      if (!shouldEmitVoiceAlert(
+        detection: detection,
+        consecutiveHighFrames: track.consecutiveHighFrames,
+        safetyLevel: _safetyLevel,
+      )) {
+        continue;
+      }
       if (now - track.lastAlertAtMs < _alertCooldownMs) continue;
       topAlert = detection;
       track.lastAlertAtMs = now;
@@ -614,4 +661,5 @@ class _ReflexTrack {
   ReflexSeverity severity = ReflexSeverity.safe;
   String direction = 'center';
   String recommendedAction = 'step_back';
+  int consecutiveHighFrames = 0;
 }

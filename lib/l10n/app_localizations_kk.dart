@@ -95,6 +95,9 @@ class AppLocalizationsKk extends AppLocalizations {
   String get modeNavigation => 'Маршрут режимі';
 
   @override
+  String get modeBus => 'Автобус режимі';
+
+  @override
   String get modeGeneral => 'Қалыпты режим';
 
   @override
@@ -181,6 +184,9 @@ class AppLocalizationsKk extends AppLocalizations {
   String get enableRouteModeFirst => 'Алдымен маршрут режимін қосыңыз.';
 
   @override
+  String get enableBusModeFirst => 'Алдымен автобус режимін қосыңыз.';
+
+  @override
   String get routeModeDescribeBlocked =>
       'Қазір маршрут режимі қосулы. Сипаттау командалары үшін режимнен шығыңыз.';
 
@@ -209,6 +215,12 @@ class AppLocalizationsKk extends AppLocalizations {
 
   @override
   String get routeModeNotEnabled => 'Маршрут режимі қосылмаған.';
+
+  @override
+  String get busModeAlreadyEnabled => 'Автобус режимі әлдеқашан қосулы.';
+
+  @override
+  String get busModeNotEnabled => 'Автобус режимі қосылмаған.';
 
   @override
   String get noCameraAccess => 'Камераға рұқсат жоқ.';
@@ -255,6 +267,12 @@ class AppLocalizationsKk extends AppLocalizations {
 
   @override
   String get navModeDisabled => 'Маршрут режимі өшірілді.';
+
+  @override
+  String get busModeEnabled => 'Автобус режимі қосылды.';
+
+  @override
+  String get busModeDisabled => 'Автобус режимі өшірілді.';
 
   @override
   String get navEnableFirst => 'Алдымен маршрут режимін қосыңыз.';

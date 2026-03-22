@@ -39,9 +39,10 @@ class _FakeLocationProvider implements NavigationLocationProvider {
 }
 
 class _FakeRouteService implements NavigationRouteService {
-  _FakeRouteService(this.destination);
+  _FakeRouteService(this.destination, {this.buildError});
 
   final DestinationCandidate destination;
+  final String? buildError;
   NavigationDestinationKind lastSearchKind = NavigationDestinationKind.generic;
 
   @override
@@ -52,6 +53,9 @@ class _FakeRouteService implements NavigationRouteService {
     required NavPoint origin,
     required NavPoint destination,
   }) async {
+    if (buildError != null) {
+      throw Exception(buildError);
+    }
     return RouteBuildResult(
       polyline: [origin, destination],
       steps: const [
@@ -309,25 +313,27 @@ void main() {
       await kkController.dispose();
     });
 
-    test('speaks compact route list for stop', () async {
-      await controller.enterMode();
-      await controller.speakStopRoutes('университет');
-
-      expect(spoken.last, contains('Университет'));
-      expect(spoken.last, contains('автобус 10'));
-      expect(spoken.last, contains('автобус 12'));
-    });
-
-    test('speaks exact schedule for route at stop', () async {
-      await controller.enterMode();
-      await controller.speakScheduledArrivals(
-        stopQuery: 'университет',
-        routeName: '10',
+    test('surfaces astana-only route rejection', () async {
+      await controller.dispose();
+      controller = NavigationModeController(
+        speak: (text) async => spoken.add(text),
+        routeService: _FakeRouteService(
+          const DestinationCandidate(
+            title: 'Арбат 1',
+            subtitle: 'Алматы',
+            point: NavPoint(latitude: 43.2389, longitude: 76.8897),
+          ),
+          buildError: 'Сейчас поддерживаются только маршруты по Астане.',
+        ),
+        transitService: transitService,
+        locationProvider: locationProvider,
+        launchUrlFn: (uri, {mode = LaunchMode.platformDefault}) async => false,
       );
 
-      expect(transitService.lastScheduleRouteName, '10');
-      expect(spoken.last, contains('маршрут 10'));
-      expect(spoken.last, contains('17:36'));
+      await controller.enterMode();
+      await controller.startRoute('арбат 1 алматы');
+
+      expect(spoken.last, contains('только маршруты по Астане'));
     });
   });
 }

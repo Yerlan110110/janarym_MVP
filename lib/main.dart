@@ -13,9 +13,13 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:vibration/vibration.dart';
 import 'package:yandex_mapkit/yandex_mapkit.dart' hide BoundingBox;
 
+import 'anti_fraud/currency_check_analyzer.dart';
+import 'anti_fraud/currency_check_audit_service.dart';
+import 'bus/bus_mode_controller.dart';
 import 'l10n/app_locale_controller.dart';
 import 'l10n/app_localizations.dart';
 import 'logic/command_router.dart';
+import 'bus/models/bus_mode_state.dart';
 import 'navigation/navigation_mode_controller.dart';
 import 'navigation/models/navigation_mode_state.dart';
 import 'openai_client.dart';
@@ -197,6 +201,7 @@ enum CircleState { idle, wake, listening, thinking, speaking, end }
 enum AssistantMode {
   general,
   navigation,
+  bus,
   safety,
   shopping,
   cooking,
@@ -204,7 +209,6 @@ enum AssistantMode {
   antiFraud,
   textReader,
   memory,
-  find,
 }
 
 enum _OnboardingTurnResult { advanced, retry, paused, completed }
@@ -224,6 +228,21 @@ class _LabelCorrectionDraft {
   bool get hasAny =>
       (labelName != null && labelName!.trim().isNotEmpty) ||
       (addressText != null && addressText!.trim().isNotEmpty);
+}
+
+class _MemorySaveRequest {
+  const _MemorySaveRequest({
+    required this.key,
+    required this.value,
+    required this.kind,
+  });
+
+  final String key;
+  final String value;
+  final String kind;
+
+  String get kindLabelRu => kind == 'code' ? 'код' : 'заметку';
+  String get kindLabelKk => kind == 'code' ? 'код ретінде' : 'жазба ретінде';
 }
 
 class _DialogStyleDirectiveResult {
@@ -289,6 +308,7 @@ class _JanarymHomeState extends State<JanarymHome>
   late AppLocalizations _l10n;
   late AppLanguage _interactionLanguage;
   late final NavigationModeController _navigationController;
+  late final BusModeController _busModeController;
   late final CommandSttService _sttService;
   late final WakeWordService _wakeService;
   late final WakeEngineMode _wakeEngineMode;
@@ -302,6 +322,7 @@ class _JanarymHomeState extends State<JanarymHome>
   late final TextReaderController _textReaderController;
   late final OpenMeteoService _openMeteoService;
   late final SceneMemoryService _sceneMemoryService;
+  late final CurrencyCheckAuditService _currencyCheckAuditService;
   late final ShoppingModeService _shoppingModeService;
   YandexMapController? _yandexMapController;
 
@@ -650,6 +671,10 @@ class _JanarymHomeState extends State<JanarymHome>
       database: _personalizationDatabase,
       codec: _securePayloadCodec,
     );
+    _currencyCheckAuditService = CurrencyCheckAuditService(
+      database: _personalizationDatabase,
+      codec: _securePayloadCodec,
+    );
     _shoppingModeService = ShoppingModeService(
       database: _personalizationDatabase,
       codec: _securePayloadCodec,
@@ -682,6 +707,11 @@ class _JanarymHomeState extends State<JanarymHome>
       instructionAdapter: _adaptNavigationInstruction,
       onRouteBuilt: _handleRouteBuilt,
     );
+    _busModeController = BusModeController(
+      speak: _speak,
+      log: appLog,
+      language: _interactionLanguage,
+    );
     _wakeEngineMode = readWakeEngineModeFromEnv();
     _sttService = CommandSttService(language: _interactionLanguage);
     _wakeService = WakeWordService(onWakeWordDetected: _handleWakeDetected);
@@ -692,6 +722,7 @@ class _JanarymHomeState extends State<JanarymHome>
     _micMessage = _l10n.checkingMic;
     _cameraMessage = _l10n.checkingCamera;
     _navigationController.state.addListener(_handleNavigationStateChange);
+    _busModeController.state.addListener(_handleBusStateChange);
     _sttService.state.addListener(_handleSttStateChange);
     _wakeService.state.addListener(_handleWakeStateChange);
     _sttWakeSubscription = _sttWakeService.events.listen(
@@ -730,6 +761,7 @@ class _JanarymHomeState extends State<JanarymHome>
     WidgetsBinding.instance.removeObserver(this);
     _stopWakeFallbackLoop();
     _navigationController.state.removeListener(_handleNavigationStateChange);
+    _busModeController.state.removeListener(_handleBusStateChange);
     _sttService.state.removeListener(_handleSttStateChange);
     _wakeService.state.removeListener(_handleWakeStateChange);
     _sttWakeSubscription?.cancel();
@@ -737,6 +769,7 @@ class _JanarymHomeState extends State<JanarymHome>
     _modeOrchestrator.removeListener(_handleModeOrchestratorChange);
     _personalizationController.removeListener(_handlePersonalizationChange);
     unawaited(_navigationController.dispose());
+    unawaited(_busModeController.dispose());
     unawaited(_personalizationRepository.close());
     _personalizationController.dispose();
     _sttService.dispose();
@@ -1220,6 +1253,7 @@ class _JanarymHomeState extends State<JanarymHome>
       _openAi.setLanguage(language);
       _sttService.setLanguage(language);
       _navigationController.setLanguage(language);
+      _busModeController.setLanguage(language);
       return;
     }
     _interactionLanguage = language;
@@ -1227,6 +1261,7 @@ class _JanarymHomeState extends State<JanarymHome>
     _openAi.setLanguage(language);
     _sttService.setLanguage(language);
     _navigationController.setLanguage(language);
+    _busModeController.setLanguage(language);
     appLog('[OpenAI] interaction_language=${language.name}');
     appLog('[VoiceLang] pinned=${language.name} reason=$reason');
     if (mounted) {
@@ -2184,6 +2219,11 @@ class _JanarymHomeState extends State<JanarymHome>
       _lastLoggedFinal = current.finalWords;
       appLog('[STT] final: ${current.finalWords}');
     }
+    if (current.isProcessing &&
+        _circleState == CircleState.listening &&
+        (_commandInFlight || _followUpActive || _wakeHandling)) {
+      _setCircleState(CircleState.thinking);
+    }
     if (mounted) {
       setState(() {});
     }
@@ -2339,13 +2379,17 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   Future<void> _syncReflexLoop() async {
+    final perception = _currentModeDescriptor().perception;
+    final hazardMonitoringEnabled =
+        perception.showHazardOverlay || perception.allowHazardVoice;
     final lifecycle = WidgetsBinding.instance.lifecycleState;
     final shouldRun =
         lifecycle == AppLifecycleState.resumed &&
         _featureFlags.reflexEnabled &&
         _featureFlags.safetyEnabled &&
         _cameraGranted &&
-        _cameraStreaming;
+        _cameraStreaming &&
+        hazardMonitoringEnabled;
     if (shouldRun) {
       await _reflexEngine.setSafetyLevel(_currentReflexSafetyLevel());
       await _reflexEngine.start();
@@ -2356,23 +2400,31 @@ class _JanarymHomeState extends State<JanarymHome>
 
   void _handleReflexOverlayChanged(List<ReflexDetection> detections) {
     if (!mounted) return;
-    final entries = detections
-        .map(
-          (detection) => BBoxOverlayEntry(
-            bbox: detection.bbox,
-            label: _reflexDisplayLabel(detection.hazardLabel),
-            confidence: detection.confidence,
-            severity: switch (detection.severity) {
-              ReflexSeverity.high => BBoxSeverity.danger,
-              ReflexSeverity.medium => BBoxSeverity.medium,
-              ReflexSeverity.safe => BBoxSeverity.safe,
-            },
-            distanceM: detection.distanceM,
-          ),
+    final perception = _currentModeDescriptor().perception;
+    final filteredDetections = detections
+        .where(
+          (detection) => perception.matchesHazardLabel(detection.hazardLabel),
         )
         .toList(growable: false);
+    final entries = perception.showHazardOverlay
+        ? filteredDetections
+              .map(
+                (detection) => BBoxOverlayEntry(
+                  bbox: detection.bbox,
+                  label: _reflexDisplayLabel(detection.hazardLabel),
+                  confidence: detection.confidence,
+                  severity: switch (detection.severity) {
+                    ReflexSeverity.high => BBoxSeverity.danger,
+                    ReflexSeverity.medium => BBoxSeverity.medium,
+                    ReflexSeverity.safe => BBoxSeverity.safe,
+                  },
+                  distanceM: detection.distanceM,
+                ),
+              )
+              .toList(growable: false)
+        : const <BBoxOverlayEntry>[];
     ReflexDetection? latestHazard;
-    for (final detection in detections) {
+    for (final detection in filteredDetections) {
       if (detection.severity != ReflexSeverity.safe) {
         latestHazard = detection;
         break;
@@ -2381,13 +2433,18 @@ class _JanarymHomeState extends State<JanarymHome>
     setState(() {
       _latestReflexDetections = detections;
       _reflexBBoxes = entries;
-      _latestHazardHint = latestHazard == null
+      _latestHazardHint =
+          latestHazard == null ||
+              (!perception.showHazardOverlay && !perception.allowHazardVoice)
           ? ''
           : _reflexDisplayLabel(latestHazard.hazardLabel);
     });
   }
 
   Future<void> _handleReflexAlert(ReflexAlert alert) async {
+    final perception = _currentModeDescriptor().perception;
+    if (!perception.allowHazardVoice) return;
+    if (!perception.matchesHazardLabel(alert.hazardLabel)) return;
     if (_voicePriorityWindowActive ||
         _wakeHandling ||
         _commandInFlight ||
@@ -2569,6 +2626,21 @@ class _JanarymHomeState extends State<JanarymHome>
     }
   }
 
+  void _handleBusStateChange() {
+    final busState = _busModeController.state.value;
+    if (_assistantMode == AssistantMode.bus && !busState.modeEnabled) {
+      _assistantMode = AssistantMode.general;
+      _modeOrchestrator.transitionTo(
+        _toJanarymMode(_assistantMode),
+        subState: 'active',
+        autoTriggeredBy: 'bus_mode_disabled',
+      );
+    }
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
   void _syncNavigationCamera(NavigationModeState navState) {
     if (!_embeddedMapEnabled) return;
     final controller = _yandexMapController;
@@ -2745,9 +2817,44 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   bool _shouldProcessSpeechInterruption(String text) {
+    final decision = _router.route(text);
+    if (_assistantMode == AssistantMode.bus) {
+      final busState = _busModeController.state.value;
+      if (decision.candidateChoiceIndex != null &&
+          busState.status == BusModeStatus.awaitingChoice) {
+        return true;
+      }
+      switch (decision.modeIntent) {
+        case AssistantModeIntent.busStopRoutes:
+        case AssistantModeIntent.busStopSchedule:
+        case AssistantModeIntent.enterBusMode:
+        case AssistantModeIntent.exitBusMode:
+        case AssistantModeIntent.readText:
+        case AssistantModeIntent.switchVoiceLanguage:
+          return true;
+        case AssistantModeIntent.unknown:
+        case AssistantModeIntent.repeat:
+        case AssistantModeIntent.visionDescribe:
+        case AssistantModeIntent.enterNavMode:
+        case AssistantModeIntent.exitNavMode:
+        case AssistantModeIntent.navStart:
+        case AssistantModeIntent.routeToPlaceLabel:
+        case AssistantModeIntent.setPlaceLabel:
+        case AssistantModeIntent.startOnboarding:
+        case AssistantModeIntent.restartOnboarding:
+        case AssistantModeIntent.updateUserFear:
+        case AssistantModeIntent.confirmYes:
+        case AssistantModeIntent.confirmNo:
+        case AssistantModeIntent.navStop:
+        case AssistantModeIntent.navStatus:
+        case AssistantModeIntent.navNextStep:
+        case AssistantModeIntent.navRejectChoice:
+          return false;
+      }
+    }
+
     if (_assistantMode != AssistantMode.navigation) return false;
     final navState = _navigationController.state.value;
-    final decision = _router.route(text);
 
     if (decision.candidateChoiceIndex != null &&
         navState.navStatus == NavigationStatus.awaitingChoice) {
@@ -2756,8 +2863,6 @@ class _JanarymHomeState extends State<JanarymHome>
 
     switch (decision.modeIntent) {
       case AssistantModeIntent.navStart:
-      case AssistantModeIntent.navStopRoutes:
-      case AssistantModeIntent.navStopSchedule:
       case AssistantModeIntent.routeToPlaceLabel:
       case AssistantModeIntent.navStop:
       case AssistantModeIntent.navStatus:
@@ -2771,6 +2876,10 @@ class _JanarymHomeState extends State<JanarymHome>
       case AssistantModeIntent.startOnboarding:
       case AssistantModeIntent.restartOnboarding:
       case AssistantModeIntent.updateUserFear:
+      case AssistantModeIntent.busStopRoutes:
+      case AssistantModeIntent.busStopSchedule:
+      case AssistantModeIntent.enterBusMode:
+      case AssistantModeIntent.exitBusMode:
       case AssistantModeIntent.readText:
       case AssistantModeIntent.switchVoiceLanguage:
         return true;
@@ -2805,8 +2914,10 @@ class _JanarymHomeState extends State<JanarymHome>
     if (CommandRouter.navRejectChoiceTriggers.any(normalized.contains)) {
       return false;
     }
-    if (CommandRouter.repeatTriggers.any(normalized.contains)) return false;
-    if (CommandRouter.describeTriggers.any(normalized.contains)) return false;
+    if (CommandRouter.transitScheduleTriggers.any(normalized.contains) ||
+        CommandRouter.transitStopRoutesTriggers.any(normalized.contains)) {
+      return false;
+    }
     return true;
   }
 
@@ -2830,8 +2941,6 @@ class _JanarymHomeState extends State<JanarymHome>
       }
       switch (decision.modeIntent) {
         case AssistantModeIntent.navStart:
-        case AssistantModeIntent.navStopRoutes:
-        case AssistantModeIntent.navStopSchedule:
         case AssistantModeIntent.routeToPlaceLabel:
         case AssistantModeIntent.navStop:
         case AssistantModeIntent.navStatus:
@@ -2845,6 +2954,10 @@ class _JanarymHomeState extends State<JanarymHome>
         case AssistantModeIntent.startOnboarding:
         case AssistantModeIntent.restartOnboarding:
         case AssistantModeIntent.updateUserFear:
+        case AssistantModeIntent.busStopRoutes:
+        case AssistantModeIntent.busStopSchedule:
+        case AssistantModeIntent.enterBusMode:
+        case AssistantModeIntent.exitBusMode:
         case AssistantModeIntent.readText:
         case AssistantModeIntent.switchVoiceLanguage:
           return true;
@@ -2855,6 +2968,43 @@ class _JanarymHomeState extends State<JanarymHome>
           break;
         case AssistantModeIntent.visionDescribe:
         case AssistantModeIntent.repeat:
+          break;
+      }
+    }
+
+    if (_assistantMode == AssistantMode.bus) {
+      final busState = _busModeController.state.value;
+      final decision = _router.route(normalized);
+      if (decision.candidateChoiceIndex != null &&
+          busState.status == BusModeStatus.awaitingChoice) {
+        return true;
+      }
+      switch (decision.modeIntent) {
+        case AssistantModeIntent.busStopRoutes:
+        case AssistantModeIntent.busStopSchedule:
+        case AssistantModeIntent.enterBusMode:
+        case AssistantModeIntent.exitBusMode:
+        case AssistantModeIntent.readText:
+        case AssistantModeIntent.switchVoiceLanguage:
+          return true;
+        case AssistantModeIntent.unknown:
+          break;
+        case AssistantModeIntent.repeat:
+        case AssistantModeIntent.visionDescribe:
+        case AssistantModeIntent.enterNavMode:
+        case AssistantModeIntent.exitNavMode:
+        case AssistantModeIntent.navStart:
+        case AssistantModeIntent.routeToPlaceLabel:
+        case AssistantModeIntent.setPlaceLabel:
+        case AssistantModeIntent.startOnboarding:
+        case AssistantModeIntent.restartOnboarding:
+        case AssistantModeIntent.updateUserFear:
+        case AssistantModeIntent.confirmYes:
+        case AssistantModeIntent.confirmNo:
+        case AssistantModeIntent.navStop:
+        case AssistantModeIntent.navStatus:
+        case AssistantModeIntent.navNextStep:
+        case AssistantModeIntent.navRejectChoice:
           break;
       }
     }
@@ -3145,6 +3295,9 @@ class _JanarymHomeState extends State<JanarymHome>
       final changed = await _switchAssistantMode(
         requestedMode,
         reason: 'voice_mode_switch',
+        announceTargetEntry:
+            requestedMode == AssistantMode.navigation ||
+            requestedMode == AssistantMode.bus,
       );
       if (changed) {
         _triggerFastModeFeedback();
@@ -3217,7 +3370,15 @@ class _JanarymHomeState extends State<JanarymHome>
       await _exitNavigationMode();
       return;
     }
-    if (await _handleGlobalNavigationIntent(userText, decision)) {
+    if (decision.modeIntent == AssistantModeIntent.enterBusMode) {
+      await _enterBusMode();
+      return;
+    }
+    if (decision.modeIntent == AssistantModeIntent.exitBusMode) {
+      await _exitBusMode();
+      return;
+    }
+    if (await _handleGlobalTransitIntent(userText, decision)) {
       return;
     }
 
@@ -3227,6 +3388,10 @@ class _JanarymHomeState extends State<JanarymHome>
     }
     if (_assistantMode == AssistantMode.navigation) {
       await _handleNavigationModeCommand(userText, decision);
+      return;
+    }
+    if (_assistantMode == AssistantMode.bus) {
+      await _handleBusModeCommand(userText, decision);
       return;
     }
     await _handleTaskModeCommand(userText, decision);
@@ -3264,20 +3429,15 @@ class _JanarymHomeState extends State<JanarymHome>
     if (hasAny(['запомни', 'память', 'помни это', 'есте сақта'])) {
       return AssistantMode.memory;
     }
-    if (hasAny(['найди', 'отыщи', 'find'])) {
-      return AssistantMode.find;
-    }
     return null;
   }
 
-  Future<bool> _handleGlobalNavigationIntent(
+  Future<bool> _handleGlobalTransitIntent(
     String rawText,
     CommandDecision decision,
   ) async {
     switch (decision.modeIntent) {
       case AssistantModeIntent.navStart:
-      case AssistantModeIntent.navStopRoutes:
-      case AssistantModeIntent.navStopSchedule:
       case AssistantModeIntent.routeToPlaceLabel:
       case AssistantModeIntent.navStop:
       case AssistantModeIntent.navStatus:
@@ -3286,15 +3446,27 @@ class _JanarymHomeState extends State<JanarymHome>
       case AssistantModeIntent.confirmYes:
       case AssistantModeIntent.confirmNo:
         if (_assistantMode != AssistantMode.navigation) {
-          await _enterNavigationMode();
+          await _enterNavigationMode(speakAck: false);
           if (_assistantMode != AssistantMode.navigation) {
             return true;
           }
         }
         await _handleNavigationModeCommand(rawText, decision);
         return true;
+      case AssistantModeIntent.busStopRoutes:
+      case AssistantModeIntent.busStopSchedule:
+        if (_assistantMode != AssistantMode.bus) {
+          await _enterBusMode(speakAck: false);
+          if (_assistantMode != AssistantMode.bus) {
+            return true;
+          }
+        }
+        await _handleBusModeCommand(rawText, decision);
+        return true;
       case AssistantModeIntent.enterNavMode:
       case AssistantModeIntent.exitNavMode:
+      case AssistantModeIntent.enterBusMode:
+      case AssistantModeIntent.exitBusMode:
       case AssistantModeIntent.setPlaceLabel:
       case AssistantModeIntent.startOnboarding:
       case AssistantModeIntent.restartOnboarding:
@@ -3377,6 +3549,9 @@ class _JanarymHomeState extends State<JanarymHome>
     final changed = await _switchAssistantMode(
       AssistantMode.general,
       reason: 'voice_exit_mode',
+      announceSourceExit:
+          _assistantMode == AssistantMode.navigation ||
+          _assistantMode == AssistantMode.bus,
     );
     if (changed) {
       _triggerFastModeFeedback();
@@ -3911,14 +4086,26 @@ class _JanarymHomeState extends State<JanarymHome>
   ) async {
     switch (decision.modeIntent) {
       case AssistantModeIntent.navStart:
-      case AssistantModeIntent.navStopRoutes:
-      case AssistantModeIntent.navStopSchedule:
       case AssistantModeIntent.routeToPlaceLabel:
       case AssistantModeIntent.navStop:
       case AssistantModeIntent.navStatus:
       case AssistantModeIntent.navNextStep:
       case AssistantModeIntent.navRejectChoice:
-        await _speak(_voiceL10n.enableRouteModeFirst);
+        await _enterNavigationMode(speakAck: false);
+        if (_assistantMode == AssistantMode.navigation) {
+          await _handleNavigationModeCommand(rawText, decision);
+        } else {
+          await _speak(_voiceL10n.enableRouteModeFirst);
+        }
+        return;
+      case AssistantModeIntent.busStopRoutes:
+      case AssistantModeIntent.busStopSchedule:
+        await _enterBusMode(speakAck: false);
+        if (_assistantMode == AssistantMode.bus) {
+          await _handleBusModeCommand(rawText, decision);
+        } else {
+          await _speak(_l10n.enableBusModeFirst);
+        }
         return;
       case AssistantModeIntent.repeat:
         await _repeatLastAnswer();
@@ -3961,6 +4148,14 @@ class _JanarymHomeState extends State<JanarymHome>
           await _speak(_routeModeHelpAnswer(_wantsDetailedByText(userText)));
           return;
         }
+        if (_isBusModeHelpQuestion(userText)) {
+          await _speak(_busModeHelpAnswer(_wantsDetailedByText(userText)));
+          return;
+        }
+        if (_looksLikeObjectLocatorRequest(userText)) {
+          await _handleObjectLocatorCommand(userText);
+          return;
+        }
         if (_looksLikeVisualFreeRequest(userText)) {
           await _describeWithVision(
             userText,
@@ -3976,6 +4171,8 @@ class _JanarymHomeState extends State<JanarymHome>
         return;
       case AssistantModeIntent.enterNavMode:
       case AssistantModeIntent.exitNavMode:
+      case AssistantModeIntent.enterBusMode:
+      case AssistantModeIntent.exitBusMode:
       case AssistantModeIntent.setPlaceLabel:
       case AssistantModeIntent.startOnboarding:
       case AssistantModeIntent.restartOnboarding:
@@ -3999,8 +4196,6 @@ class _JanarymHomeState extends State<JanarymHome>
 
     switch (decision.modeIntent) {
       case AssistantModeIntent.navStart:
-      case AssistantModeIntent.navStopRoutes:
-      case AssistantModeIntent.navStopSchedule:
       case AssistantModeIntent.routeToPlaceLabel:
         var destination = decision.destinationQuery?.trim() ?? '';
         if (destination.isEmpty) {
@@ -4008,6 +4203,7 @@ class _JanarymHomeState extends State<JanarymHome>
         }
         if (destination.isEmpty) {
           await _speak(_voiceL10n.sayAddressAfterRoutePhrase);
+          _maybeTriggerNavigationFollowUp();
           return;
         }
         if (decision.destinationKindHint !=
@@ -4021,6 +4217,7 @@ class _JanarymHomeState extends State<JanarymHome>
               byLabel.addressText,
               routeSource: 'label',
             );
+            _maybeTriggerNavigationFollowUp();
             return;
           }
         }
@@ -4029,17 +4226,7 @@ class _JanarymHomeState extends State<JanarymHome>
           routeSource: 'manual',
           destinationKindHint: decision.destinationKindHint,
         );
-        return;
-      case AssistantModeIntent.navStopRoutes:
-        await _navigationController.speakStopRoutes(
-          decision.destinationQuery?.trim() ?? '',
-        );
-        return;
-      case AssistantModeIntent.navStopSchedule:
-        await _navigationController.speakScheduledArrivals(
-          stopQuery: decision.destinationQuery?.trim() ?? '',
-          routeName: decision.transitRouteName?.trim() ?? '',
-        );
+        _maybeTriggerNavigationFollowUp();
         return;
       case AssistantModeIntent.navStop:
         await _navigationController.stopRoute();
@@ -4079,6 +4266,10 @@ class _JanarymHomeState extends State<JanarymHome>
           await _speak(_routeModeHelpAnswer(true));
           return;
         }
+        if (_isBusModeHelpQuestion(freeText)) {
+          await _speak(_busModeHelpAnswer(_wantsDetailedByText(freeText)));
+          return;
+        }
         if (_looksLikeFreeDestination(freeText)) {
           await _startRouteWithConfirmation(freeText);
           return;
@@ -4094,6 +4285,10 @@ class _JanarymHomeState extends State<JanarymHome>
       case AssistantModeIntent.confirmNo:
         await _speak(_voiceL10n.navAnswerYesOrNoOrAddress);
         return;
+      case AssistantModeIntent.busStopRoutes:
+      case AssistantModeIntent.busStopSchedule:
+      case AssistantModeIntent.enterBusMode:
+      case AssistantModeIntent.exitBusMode:
       case AssistantModeIntent.enterNavMode:
       case AssistantModeIntent.exitNavMode:
       case AssistantModeIntent.setPlaceLabel:
@@ -4104,20 +4299,40 @@ class _JanarymHomeState extends State<JanarymHome>
     }
   }
 
-  Future<void> _handleTaskModeCommand(
+  void _maybeTriggerNavigationFollowUp() {
+    final navStatus = _navigationController.state.value.navStatus;
+    if (navStatus == NavigationStatus.awaitingChoice) {
+      unawaited(_startFollowUpWindow());
+    }
+  }
+
+  Future<void> _handleBusModeCommand(
     String rawText,
     CommandDecision decision,
   ) async {
+    final busState = _busModeController.state.value;
+    if (decision.candidateChoiceIndex != null &&
+        busState.status == BusModeStatus.awaitingChoice) {
+      await _busModeController.selectCandidate(decision.candidateChoiceIndex!);
+      return;
+    }
+
     switch (decision.modeIntent) {
-      case AssistantModeIntent.navStart:
-      case AssistantModeIntent.navStopRoutes:
-      case AssistantModeIntent.navStopSchedule:
-      case AssistantModeIntent.routeToPlaceLabel:
-      case AssistantModeIntent.navStop:
-      case AssistantModeIntent.navStatus:
-      case AssistantModeIntent.navNextStep:
+      case AssistantModeIntent.busStopRoutes:
+        await _busModeController.speakStopRoutes(
+          decision.destinationQuery?.trim() ?? '',
+        );
+        _maybeTriggerBusFollowUp();
+        return;
+      case AssistantModeIntent.busStopSchedule:
+        await _busModeController.speakScheduledArrivals(
+          stopQuery: decision.destinationQuery?.trim() ?? '',
+          routeName: decision.transitRouteName?.trim() ?? '',
+        );
+        _maybeTriggerBusFollowUp();
+        return;
       case AssistantModeIntent.navRejectChoice:
-        await _speak(_voiceL10n.enableRouteModeFirst);
+        await _busModeController.rejectCandidateSelection();
         return;
       case AssistantModeIntent.repeat:
         await _repeatLastAnswer();
@@ -4150,6 +4365,102 @@ class _JanarymHomeState extends State<JanarymHome>
           await _speak(_capabilitiesAnswer());
           return;
         }
+        if (_isBusModeHelpQuestion(userText)) {
+          await _speak(_busModeHelpAnswer(_wantsDetailedByText(userText)));
+          return;
+        }
+        await _askGpt(userText, systemPrompt: _buildBlindPrompt());
+        return;
+      case AssistantModeIntent.confirmYes:
+      case AssistantModeIntent.confirmNo:
+        await _speak(_voiceL10n.didntHearCommandRepeat);
+        return;
+      case AssistantModeIntent.enterNavMode:
+      case AssistantModeIntent.exitNavMode:
+      case AssistantModeIntent.navStart:
+      case AssistantModeIntent.routeToPlaceLabel:
+      case AssistantModeIntent.navStop:
+      case AssistantModeIntent.navStatus:
+      case AssistantModeIntent.navNextStep:
+      case AssistantModeIntent.enterBusMode:
+      case AssistantModeIntent.exitBusMode:
+      case AssistantModeIntent.setPlaceLabel:
+      case AssistantModeIntent.startOnboarding:
+      case AssistantModeIntent.restartOnboarding:
+      case AssistantModeIntent.updateUserFear:
+        return;
+    }
+  }
+
+  void _maybeTriggerBusFollowUp() {
+    final busStatus = _busModeController.state.value.status;
+    if (busStatus == BusModeStatus.awaitingChoice) {
+      unawaited(_startFollowUpWindow());
+    }
+  }
+
+  Future<void> _handleTaskModeCommand(
+    String rawText,
+    CommandDecision decision,
+  ) async {
+    switch (decision.modeIntent) {
+      case AssistantModeIntent.navStart:
+      case AssistantModeIntent.routeToPlaceLabel:
+      case AssistantModeIntent.navStop:
+      case AssistantModeIntent.navStatus:
+      case AssistantModeIntent.navNextStep:
+      case AssistantModeIntent.navRejectChoice:
+        await _enterNavigationMode(speakAck: false);
+        if (_assistantMode == AssistantMode.navigation) {
+          await _handleNavigationModeCommand(rawText, decision);
+        } else {
+          await _speak(_voiceL10n.enableRouteModeFirst);
+        }
+        return;
+      case AssistantModeIntent.busStopRoutes:
+      case AssistantModeIntent.busStopSchedule:
+        await _enterBusMode(speakAck: false);
+        if (_assistantMode == AssistantMode.bus) {
+          await _handleBusModeCommand(rawText, decision);
+        } else {
+          await _speak(_l10n.enableBusModeFirst);
+        }
+        return;
+      case AssistantModeIntent.repeat:
+        await _repeatLastAnswer();
+        return;
+      case AssistantModeIntent.readText:
+        await _handleReadTextIntent(rawText);
+        return;
+      case AssistantModeIntent.switchVoiceLanguage:
+        await _speak(_voiceLanguageSwitchAck());
+        return;
+      case AssistantModeIntent.visionDescribe:
+        final userText = decision.cleanedText.isEmpty
+            ? rawText
+            : decision.cleanedText;
+        await _describeWithVision(userText, systemPrompt: _buildVisionPrompt());
+        return;
+      case AssistantModeIntent.unknown:
+        final userText = decision.cleanedText.isEmpty
+            ? rawText.trim()
+            : decision.cleanedText.trim();
+        if (userText.isEmpty) {
+          await _speak(_voiceL10n.didntHearCommandRepeat);
+          return;
+        }
+        if (_isIdentityQuestion(userText)) {
+          await _speak(_identityAnswer());
+          return;
+        }
+        if (_isCapabilitiesQuestion(userText)) {
+          await _speak(_capabilitiesAnswer());
+          return;
+        }
+        if (_isBusModeHelpQuestion(userText)) {
+          await _speak(_busModeHelpAnswer(_wantsDetailedByText(userText)));
+          return;
+        }
         await _handleModeSpecificUnknown(userText);
         return;
       case AssistantModeIntent.confirmYes:
@@ -4158,6 +4469,8 @@ class _JanarymHomeState extends State<JanarymHome>
         return;
       case AssistantModeIntent.enterNavMode:
       case AssistantModeIntent.exitNavMode:
+      case AssistantModeIntent.enterBusMode:
+      case AssistantModeIntent.exitBusMode:
       case AssistantModeIntent.setPlaceLabel:
       case AssistantModeIntent.startOnboarding:
       case AssistantModeIntent.restartOnboarding:
@@ -4173,6 +4486,9 @@ class _JanarymHomeState extends State<JanarymHome>
         return;
       case AssistantMode.navigation:
         await _handleRouteModeCommand(userText);
+        return;
+      case AssistantMode.bus:
+        await _askGpt(userText, systemPrompt: _buildBlindPrompt());
         return;
       case AssistantMode.safety:
         await _handleHomeModeCommand(userText);
@@ -4194,9 +4510,6 @@ class _JanarymHomeState extends State<JanarymHome>
         return;
       case AssistantMode.memory:
         await _handleMemoryModeCommand(userText);
-        return;
-      case AssistantMode.find:
-        await _handleFindModeCommand(userText);
         return;
     }
   }
@@ -4255,7 +4568,7 @@ class _JanarymHomeState extends State<JanarymHome>
   }
 
   Future<void> _handleTextReaderModeCommand(String userText) async {
-    await _runManualTextReadSession(
+    await _runPrioritizedTextReadSession(
       userText,
       source: _TextReaderReadSource.voice,
     );
@@ -4271,7 +4584,7 @@ class _JanarymHomeState extends State<JanarymHome>
       return true;
     }
     if (_isTextReaderResumeCommand(normalized)) {
-      await _runManualTextReadSession(
+      await _runPrioritizedTextReadSession(
         userText,
         source: _TextReaderReadSource.voice,
       );
@@ -4439,7 +4752,7 @@ class _JanarymHomeState extends State<JanarymHome>
         return;
       }
     }
-    await _runManualTextReadSession(
+    await _runPrioritizedTextReadSession(
       rawText,
       source: _TextReaderReadSource.voice,
     );
@@ -4455,6 +4768,58 @@ class _JanarymHomeState extends State<JanarymHome>
       if (!_cameraGranted || !_cameraStreaming) return;
     }
     await _runAutoTextReaderTick();
+  }
+
+  Future<bool> _waitForTextReaderControllerIdle({
+    Duration timeout = const Duration(milliseconds: 1200),
+  }) async {
+    final deadline = DateTime.now().add(timeout);
+    while (_textReaderController.isBusy && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+    }
+    return !_textReaderController.isBusy;
+  }
+
+  Future<void> _runPrioritizedTextReadSession(
+    String rawText, {
+    required _TextReaderReadSource source,
+  }) async {
+    if (source == _TextReaderReadSource.auto) {
+      await _runManualTextReadSession(rawText, source: source);
+      return;
+    }
+
+    var pausedAutoRead = false;
+    if (!_manualTextReadInProgress && _textReaderController.isBusy) {
+      pausedAutoRead =
+          _assistantMode == AssistantMode.textReader && !_textReaderAutoPaused;
+      if (pausedAutoRead) {
+        await _pauseTextReaderContinuousReading();
+      }
+      final idle = await _waitForTextReaderControllerIdle();
+      appLog(
+        '[TextReader][manual_session] preempt_busy '
+        'source=${source.name} idle=$idle',
+      );
+      if (!idle) {
+        if (pausedAutoRead &&
+            mounted &&
+            _assistantMode == AssistantMode.textReader) {
+          await _resumeTextReaderContinuousReading(restart: false);
+        }
+        return;
+      }
+    }
+
+    try {
+      await _runManualTextReadSession(rawText, source: source);
+    } finally {
+      if (pausedAutoRead &&
+          mounted &&
+          _assistantMode == AssistantMode.textReader) {
+        await _resumeTextReaderContinuousReading(restart: false);
+      }
+    }
   }
 
   Future<void> _runManualTextReadSession(
@@ -5385,38 +5750,124 @@ class _JanarymHomeState extends State<JanarymHome>
       await _handleTextReaderModeCommand(userText);
       return;
     }
-    await _describeWithVision(userText, systemPrompt: _buildVisionPrompt());
+    final ocr = await _readTextFromCurrentFrame(
+      force: true,
+      timeout: const Duration(milliseconds: 1500),
+    );
+    final ocrText = _antiFraudOcrText(ocr);
+    var result = CurrencyCheckAnalyzer.analyze(ocrText: ocrText);
+
+    if (result.verdict == CurrencyCheckVerdict.uncertain) {
+      final jpegBytes = await _captureLatestJpegFrame();
+      if (jpegBytes != null && jpegBytes.isNotEmpty) {
+        try {
+          final raw = await _openAi.askWithImage(
+            _voiceText(
+              ru: 'Проверь купюру тенге. Верни JSON с полями verdict(authentic|counterfeit|uncertain), nominal, reason. Если уверенности нет, verdict должен быть uncertain.',
+              kk: 'Теңге купюрасын тексер. verdict(authentic|counterfeit|uncertain), nominal, reason өрістері бар JSON қайтар. Сенім жеткіліксіз болса, verdict uncertain болсын.',
+            ),
+            jpegBytes,
+            systemPrompt: _openAi.buildSystemPrompt(
+              basePrompt: _buildAntiFraudVisionPrompt(),
+            ),
+            history: const <OpenAiChatMessage>[],
+            taskMode: 'anti_fraud',
+            perceptionSnapshot: _buildPerceptionSnapshot(),
+            maxOutputTokens: 180,
+            requestTimeout: const Duration(seconds: 8),
+            maxAttempts: 2,
+          );
+          result = CurrencyCheckAnalyzer.analyze(
+            ocrText: ocrText,
+            visualResponse: raw,
+          );
+        } catch (error) {
+          appLog('[AntiFraud] vision error: $error');
+        }
+      }
+    }
+
+    final answer = _buildAntiFraudAnswer(result);
+    _rememberDialogTurn(userText, answer);
+    _lastAnswer = answer;
+    await _currencyCheckAuditService.record(
+      result: result,
+      rawSourceText: ocrText,
+    );
+    await _speak(answer);
+  }
+
+  String _antiFraudOcrText(OnDeviceTextReadResult? result) {
+    if (result == null) return '';
+    final parts = <String>[
+      result.rawText.trim(),
+      result.manualFallbackText.trim(),
+      ...result.blocks.map((block) => block.trim()),
+    ].where((part) => part.isNotEmpty).toList(growable: false);
+    return parts.join(' ').trim();
+  }
+
+  String _buildAntiFraudVisionPrompt() {
+    return _voiceText(
+      ru: 'Ты проверяешь только купюру тенге. Сначала ищи сувенирные или фальшивые надписи. Если по фото недостаточно данных, не угадывай и верни uncertain. Не проси пользователя ничего проверять руками.',
+      kk: 'Сен тек теңге купюрасын тексересің. Алдымен кәдесый не жалған жазуларды ізде. Егер фото жеткіліксіз болса, болжай салма да uncertain қайтар. Пайдаланушыдан қолмен тексеруді сұрама.',
+    );
+  }
+
+  String _buildAntiFraudAnswer(CurrencyCheckResult result) {
+    final nominalPart = result.nominal == null || result.nominal!.trim().isEmpty
+        ? ''
+        : _voiceText(
+            ru: ' Номинал похож на ${result.nominal} тенге.',
+            kk: ' Номиналы ${result.nominal} теңгеге ұқсайды.',
+          );
+    switch (result.verdict) {
+      case CurrencyCheckVerdict.counterfeit:
+        final reason = result.reasons.isEmpty
+            ? ''
+            : _voiceText(
+                ru: ' Обнаружены признаки: ${result.reasons.join(', ')}.',
+                kk: ' Белгілер табылды: ${result.reasons.join(', ')}.',
+              );
+        return _voiceText(
+          ru: 'Похоже, это сувенирная или поддельная купюра.$nominalPart$reason',
+          kk: 'Бұл кәдесый не жалған купюраға ұқсайды.$nominalPart$reason',
+        );
+      case CurrencyCheckVerdict.authentic:
+        return _voiceText(
+          ru: 'Явных сувенирных признаков не вижу.$nominalPart Но по одному кадру не могу гарантировать подлинность на сто процентов.',
+          kk: 'Айқын кәдесый белгілерін көріп тұрған жоқпын.$nominalPart Бірақ бір кадр бойынша түпнұсқалығын жүз пайыз растай алмаймын.',
+        );
+      case CurrencyCheckVerdict.uncertain:
+        return _voiceText(
+          ru: 'Не могу надежно подтвердить подлинность этой купюры по текущему кадру.$nominalPart',
+          kk: 'Осы кадр бойынша бұл купюраның түпнұсқалығын сенімді растай алмаймын.$nominalPart',
+        );
+    }
   }
 
   Future<void> _handleMemoryModeCommand(String userText) async {
-    final anchorName = _extractMemoryAnchorName(userText);
-    if (anchorName != null) {
-      String? summary;
-      try {
-        if (_looksLikeSceneMemoryCapture(anchorName)) {
-          summary = await _captureSceneAnchorSummary(anchorName);
-        } else {
-          summary = anchorName;
-        }
-      } catch (e) {
-        appLog('[Memory] save anchor failed: $e');
-      }
-      if (summary == null) {
-        await _speak(
-          _voiceText(
-            ru: 'Не смогла надежно сохранить текущую сцену.',
-            kk: 'Сахнаны сенімді сақтай алмадым.',
-          ),
+    final saveRequest = _extractMemorySaveRequest(userText);
+    if (saveRequest != null) {
+      if (_looksLikeVisualMemoryRequest(saveRequest.key) ||
+          _looksLikeVisualMemoryRequest(saveRequest.value)) {
+        final answer = _voiceText(
+          ru: 'Память сейчас сохраняет только текстовые заметки и коды. Продиктуйте название записи и сам текст.',
+          kk: 'Жад қазір тек мәтіндік жазбалар мен кодтарды сақтайды. Жазбаның атын және мәтінін айтыңыз.',
         );
+        _rememberDialogTurn(userText, answer);
+        _lastAnswer = answer;
+        await _speak(answer);
         return;
       }
       await _sceneMemoryService.saveAnchor(
-        anchorName: anchorName,
-        summary: summary,
+        anchorName: saveRequest.key,
+        summary: saveRequest.value,
+        kind: saveRequest.kind,
       );
       final answer = _voiceText(
-        ru: 'Сохранила как "$anchorName".',
-        kk: '"$anchorName" ретінде сақтадым.',
+        ru: 'Сохранила ${saveRequest.kindLabelRu} "${saveRequest.key}".',
+        kk: '"${saveRequest.key}" ${saveRequest.kindLabelKk} сақталды.',
       );
       _rememberDialogTurn(userText, answer);
       _lastAnswer = answer;
@@ -5430,15 +5881,15 @@ class _JanarymHomeState extends State<JanarymHome>
       if (anchor == null) {
         await _speak(
           _voiceText(
-            ru: 'Не нашла сохраненный якорь с таким именем.',
-            kk: 'Бұл атаумен сақталған якорь табылмады.',
+            ru: 'Не нашла сохраненную заметку или код с таким именем.',
+            kk: 'Бұл атаумен сақталған жазба немесе код табылмады.',
           ),
         );
         return;
       }
       final answer = _voiceText(
         ru: 'Для "${anchor.name}" сохранено: ${anchor.summary}',
-        kk: '"${anchor.name}" үшін сақталған сипаттама: ${anchor.summary}',
+        kk: '"${anchor.name}" үшін сақталғаны: ${anchor.summary}',
       );
       _rememberDialogTurn(userText, answer);
       _lastAnswer = answer;
@@ -5450,22 +5901,22 @@ class _JanarymHomeState extends State<JanarymHome>
     if (anchors.isEmpty) {
       await _speak(
         _voiceText(
-          ru: 'Пока нет сохраненных якорей сцены.',
-          kk: 'Әзірге сақталған сахна якорьлері жоқ.',
+          ru: 'Пока нет сохраненных заметок и кодов.',
+          kk: 'Әзірге сақталған жазбалар мен кодтар жоқ.',
         ),
       );
       return;
     }
     final answer = _voiceText(
-      ru: 'Последние сохраненные якоря: ${anchors.map((item) => item.name).join(', ')}.',
-      kk: 'Соңғы сақталған якорьлер: ${anchors.map((item) => item.name).join(', ')}.',
+      ru: 'Последние сохраненные записи: ${anchors.map((item) => item.name).join(', ')}.',
+      kk: 'Соңғы сақталған жазбалар: ${anchors.map((item) => item.name).join(', ')}.',
     );
     _rememberDialogTurn(userText, answer);
     _lastAnswer = answer;
     await _speak(answer);
   }
 
-  Future<void> _handleFindModeCommand(String userText) async {
+  Future<void> _handleObjectLocatorCommand(String userText) async {
     final target = _extractFindTarget(userText);
     if (target == null || target.isEmpty) {
       await _speak(
@@ -5490,14 +5941,15 @@ class _JanarymHomeState extends State<JanarymHome>
     );
   }
 
-  Future<void> _enterNavigationMode() async {
+  Future<void> _enterNavigationMode({bool speakAck = true}) async {
     if (_assistantMode == AssistantMode.navigation) {
-      await _speak(_voiceL10n.routeModeAlreadyEnabled);
+      if (speakAck) await _speak(_voiceL10n.routeModeAlreadyEnabled);
       return;
     }
     final changed = await _switchAssistantMode(
       AssistantMode.navigation,
       reason: 'intent_enter_nav',
+      announceTargetEntry: speakAck,
     );
     if (!changed) {
       await _speak(_voiceL10n.commandProcessingFailed);
@@ -5512,6 +5964,37 @@ class _JanarymHomeState extends State<JanarymHome>
     final changed = await _switchAssistantMode(
       AssistantMode.general,
       reason: 'intent_exit_nav',
+      announceSourceExit: true,
+    );
+    if (!changed) {
+      await _speak(_voiceL10n.commandProcessingFailed);
+    }
+  }
+
+  Future<void> _enterBusMode({bool speakAck = true}) async {
+    if (_assistantMode == AssistantMode.bus) {
+      if (speakAck) await _speak(_l10n.busModeAlreadyEnabled);
+      return;
+    }
+    final changed = await _switchAssistantMode(
+      AssistantMode.bus,
+      reason: 'intent_enter_bus',
+      announceTargetEntry: speakAck,
+    );
+    if (!changed) {
+      await _speak(_voiceL10n.commandProcessingFailed);
+    }
+  }
+
+  Future<void> _exitBusMode() async {
+    if (_assistantMode != AssistantMode.bus) {
+      await _speak(_l10n.busModeNotEnabled);
+      return;
+    }
+    final changed = await _switchAssistantMode(
+      AssistantMode.general,
+      reason: 'intent_exit_bus',
+      announceSourceExit: true,
     );
     if (!changed) {
       await _speak(_voiceL10n.commandProcessingFailed);
@@ -5522,20 +6005,47 @@ class _JanarymHomeState extends State<JanarymHome>
     AssistantMode target, {
     required String reason,
     bool autoTriggered = false,
+    bool announceTargetEntry = false,
+    bool announceSourceExit = false,
   }) async {
-    if (_assistantMode == target) return true;
+    if (_assistantMode == target) {
+      if (target == AssistantMode.navigation) {
+        _navigationController.resetState();
+      } else if (target == AssistantMode.bus) {
+        _busModeController.resetState();
+      }
+      if (mounted) {
+        setState(() {});
+      }
+      return true;
+    }
     if (!_isModeEnabled(target)) return false;
 
     if (_assistantMode == AssistantMode.navigation &&
         target != AssistantMode.navigation) {
-      await _navigationController.exitMode();
+      await _navigationController.exitMode(speak: announceSourceExit);
+      _lastNavCameraTarget = null;
+    }
+
+    if (_assistantMode == AssistantMode.bus && target != AssistantMode.bus) {
+      await _busModeController.exitMode(speak: announceSourceExit);
       _lastNavCameraTarget = null;
     }
 
     if (target == AssistantMode.navigation &&
         _assistantMode != AssistantMode.navigation) {
-      await _navigationController.enterMode();
+      await _navigationController.enterMode(speak: announceTargetEntry);
       if (!_navigationController.state.value.modeEnabled) {
+        return false;
+      }
+      _lastNavCameraTarget = null;
+      if (_modeNeedsLiveCamera(target)) {
+        unawaited(_initCameraLive());
+      }
+    } else if (target == AssistantMode.bus &&
+        _assistantMode != AssistantMode.bus) {
+      await _busModeController.enterMode(speak: announceTargetEntry);
+      if (!_busModeController.state.value.modeEnabled) {
         return false;
       }
       _lastNavCameraTarget = null;
@@ -6293,6 +6803,11 @@ class _JanarymHomeState extends State<JanarymHome>
         failureReason: attempt.failureReason,
         updateUi: _assistantMode == AssistantMode.textReader,
       );
+      if (_assistantMode != AssistantMode.textReader ||
+          _textReaderAutoPaused ||
+          _textReaderSessionCancelRequested) {
+        return;
+      }
       if (!attempt.hasResult) {
         if (_assistantMode == AssistantMode.textReader && !attempt.skipped) {
           appLog(
@@ -6417,33 +6932,9 @@ class _JanarymHomeState extends State<JanarymHome>
     return 'Подойдет легкая одежда, при ярком солнце добавьте головной убор.';
   }
 
-  Future<String?> _captureSceneAnchorSummary(String anchorName) async {
-    final jpegBytes = await _captureLatestJpegFrame();
-    if (jpegBytes == null || jpegBytes.isEmpty) return null;
-    final raw = await _openAi.askWithImage(
-      'Опиши устойчивые ориентиры этой сцены для памяти: $anchorName',
-      jpegBytes,
-      systemPrompt: _buildVisionPrompt(
-        extraInstruction: _voiceIsKazakh
-            ? 'Memory режимі. Бір сөйлеммен тек тұрақты ориентирлерді сипатта.'
-            : 'Режим memory. Одним предложением опиши только устойчивые ориентиры сцены.',
-      ),
-      history: _dialogHistoryMessages(),
-      taskMode: _assistantModeContextKey(_assistantMode),
-      perceptionSnapshot: _buildPerceptionSnapshot(),
-      maxOutputTokens: 120,
-    );
-    return _postprocessDialogAnswer(raw);
-  }
-
   String? _extractMemoryAnchorName(String text) {
-    final match = RegExp(
-      r'(?:запомни|сохрани|помни это как|есте сақта)\s+(.+)$',
-      caseSensitive: false,
-      unicode: true,
-    ).firstMatch(text.trim());
-    final value = (match?.group(1) ?? '').trim();
-    return value.isEmpty ? null : value;
+    final request = _extractMemorySaveRequest(text);
+    return request?.key;
   }
 
   String? _extractMemoryLookupName(String text) {
@@ -6456,24 +6947,110 @@ class _JanarymHomeState extends State<JanarymHome>
     return value.isEmpty ? null : value;
   }
 
-  bool _looksLikeSceneMemoryCapture(String text) {
+  _MemorySaveRequest? _extractMemorySaveRequest(String text) {
+    final trimmed = text.trim();
+    final patterns = <(RegExp, String, int, int)>[
+      (
+        RegExp(
+          r'^(?:запомни|сохрани|remember)\s+код\s+(.+?)\s*(?:[:=\-]|это)\s*(.+)$',
+          caseSensitive: false,
+          unicode: true,
+        ),
+        'code',
+        1,
+        2,
+      ),
+      (
+        RegExp(
+          r'^(?:запомни|сохрани|remember)\s+заметк[ауи]?\s+(.+?)\s*(?:[:=\-]|это)\s*(.+)$',
+          caseSensitive: false,
+          unicode: true,
+        ),
+        'note',
+        1,
+        2,
+      ),
+      (
+        RegExp(
+          r'^(?:запомни|сохрани|remember|есте сақта)\s+(.+?)\s*(?:[:=\-]|это)\s*(.+)$',
+          caseSensitive: false,
+          unicode: true,
+        ),
+        'note',
+        1,
+        2,
+      ),
+      (
+        RegExp(
+          r'^(?:запомни|сохрани|remember|есте сақта)\s+(.+)$',
+          caseSensitive: false,
+          unicode: true,
+        ),
+        'note',
+        1,
+        1,
+      ),
+    ];
+    for (final entry in patterns) {
+      final match = entry.$1.firstMatch(trimmed);
+      if (match == null) {
+        continue;
+      }
+      final key = (match.group(entry.$3) ?? '').trim();
+      final value = (match.group(entry.$4) ?? '').trim();
+      if (key.isEmpty || value.isEmpty) {
+        continue;
+      }
+      return _MemorySaveRequest(key: key, value: value, kind: entry.$2);
+    }
+    return null;
+  }
+
+  bool _looksLikeVisualMemoryRequest(String text) {
     final normalized = _router.normalize(text);
     if (normalized.isEmpty) return false;
     return normalized.contains('это место') ||
         normalized.contains('эту сцену') ||
         normalized.contains('эту комнату') ||
+        normalized.contains('кадр') ||
+        normalized.contains('фото') ||
+        normalized.contains('снимок') ||
         normalized.contains('осы жер') ||
-        normalized.contains('осы бөлме');
+        normalized.contains('осы бөлме') ||
+        normalized.contains('сурет');
   }
 
   String? _extractFindTarget(String text) {
-    final match = RegExp(
-      r'(?:найди|отыщи|find)\s+(.+)$',
-      caseSensitive: false,
-      unicode: true,
-    ).firstMatch(text.trim());
-    final value = (match?.group(1) ?? '').trim();
-    return value.isEmpty ? null : value;
+    final trimmed = text.trim();
+    final patterns = <RegExp>[
+      RegExp(
+        r'(?:найди|отыщи|find)\s+(.+)$',
+        caseSensitive: false,
+        unicode: true,
+      ),
+      RegExp(
+        r"(?:где находится|где лежит|где стоит|where is|where's)\s+(.+?)(?:\?|$)",
+        caseSensitive: false,
+        unicode: true,
+      ),
+      RegExp(
+        r'(?:қайда|қай жерде)\s+(.+?)(?:\?|$)',
+        caseSensitive: false,
+        unicode: true,
+      ),
+    ];
+    for (final pattern in patterns) {
+      final match = pattern.firstMatch(trimmed);
+      final value = (match?.group(1) ?? '').trim();
+      if (value.isNotEmpty) {
+        return value;
+      }
+    }
+    return null;
+  }
+
+  bool _looksLikeObjectLocatorRequest(String text) {
+    return _extractFindTarget(text) != null;
   }
 
   ReflexDetection? _matchFindTargetAgainstDetections(String target) {
@@ -6907,8 +7484,8 @@ class _JanarymHomeState extends State<JanarymHome>
 
   String _assistantFallbackAnswer() {
     return _voiceText(
-      ru: 'Поняла. Кратко: JANARYM работает голосом, описывает кадр с камеры и ведёт в режиме маршрута.',
-      kk: 'Түсіндім. Қысқаша жауап берейін: JANARYM дауыспен жұмыс істейді, камерадан сипаттайды және маршрут режимін жүргізеді.',
+      ru: 'Поняла. Кратко: JANARYM работает голосом, описывает кадр с камеры, ведёт маршрут и помогает с автобусами.',
+      kk: 'Түсіндім. Қысқаша жауап берейін: JANARYM дауыспен жұмыс істейді, камерадан сипаттайды, маршрут жүргізеді және автобустармен көмектеседі.',
     );
   }
 
@@ -7141,6 +7718,22 @@ class _JanarymHomeState extends State<JanarymHome>
     return false;
   }
 
+  bool _isBusModeHelpQuestion(String text) {
+    final normalized = _router.normalize(text);
+    if (normalized.isEmpty) return false;
+    const cues = <String>[
+      'режим автобуса',
+      'автобусный режим',
+      'как работает режим автобуса',
+      'автобус режимі',
+      'автобус режимі қалай жұмыс істейді',
+    ];
+    for (final cue in cues) {
+      if (normalized.contains(cue)) return true;
+    }
+    return false;
+  }
+
   bool _wantsDetailedByText(String text) {
     final normalized = _router.normalize(text);
     if (normalized.isEmpty) return false;
@@ -7171,18 +7764,18 @@ class _JanarymHomeState extends State<JanarymHome>
       if (short) {
         return '$mode Мен JANARYM ішінде дауыс, камера және режимдік көмек арқылы жұмыс істеймін. Қолжетімді режимдер: $enabledModes.';
       }
-      return '$mode Мен JANARYM ішіндегі ассистентпін. Негізгі мүмкіндіктерім: ояту сөзімен диалог, камерадағы көріністі қысқа сипаттау, қауіп туралы автоматты ескерту, маршрутты бастау, үйге апару, нысанды табу, есте сақтау, мәтін оқу, шоппинг, дайындау, дрескод және антимошенничество сценарийлері. Қолжетімді режимдер: $enabledModes.';
+      return '$mode Мен JANARYM ішіндегі ассистентпін. Негізгі мүмкіндіктерім: ояту сөзімен диалог, камерадағы көріністі қысқа сипаттау, қауіп туралы автоматты ескерту, маршрутты бастау, аялдамадағы автобустарды тексеру, нысанды табу, мәтіндік жазбалар мен кодтарды сақтау, мәтін оқу және купюраны тексеру. Қолжетімді режимдер: $enabledModes.';
     }
     if (short) {
       return '$mode Я ассистент JANARYM: работаю голосом, камерой и режимами задач. Доступные режимы: $enabledModes.';
     }
-    return '$mode Я ассистент внутри JANARYM. Могу: работать по wake-слову «Жанарым», кратко описывать сцену с камеры, автоматически предупреждать об опасности, вести маршрут, вести домой по сохраненной точке, искать объект, хранить память, читать текст, помогать в шоппинге, готовке, дрескоде и антимошенничестве. Доступные режимы: $enabledModes.';
+    return '$mode Я ассистент внутри JANARYM. Могу: работать по wake-слову «Жанарым», кратко описывать сцену с камеры, автоматически предупреждать об опасности, вести маршрут, проверять автобусы на остановках, искать объект, хранить текстовые заметки и коды, читать текст и проверять купюру. Доступные режимы: $enabledModes.';
   }
 
   String _identityAnswer() {
     return _voiceText(
-      ru: 'Я ассистент JANARYM внутри этого приложения. Помогаю голосом, камерой и режимом маршрута.',
-      kk: 'Менің атым JANARYM ассистенті. Мен осы қолданбаның ішінде сізге дауыспен, камерамен және маршрут режимімен көмектесемін.',
+      ru: 'Я ассистент JANARYM внутри этого приложения. Помогаю голосом, камерой, маршрутом и автобусами.',
+      kk: 'Менің атым JANARYM ассистенті. Мен осы қолданбаның ішінде сізге дауыспен, камерамен, маршрутпен және автобустармен көмектесемін.',
     );
   }
 
@@ -7214,6 +7807,20 @@ class _JanarymHomeState extends State<JanarymHome>
     return '$stateLine Режим маршрута работает так: вы включаете режим, называете адрес назначения, я строю маршрут и веду голосом по шагам. В любой момент можно спросить статус, следующий шаг или остановить маршрут. Также можно строить маршрут до сохранённых меток (например, дом/работа). Команды: «маршрут до ...», «статус маршрута», «что дальше», «стоп маршрут».';
   }
 
+  String _busModeHelpAnswer(bool detailed) {
+    final short = !detailed || _dialogBrevityMode == _DialogBrevityMode.short;
+    if (_voiceIsKazakh) {
+      if (short) {
+        return 'Автобус режимінде сіз аялдама атауын айтасыз, мен ең жақын физикалық аялдаманы таңдап, сол жақтағы автобустарды ғана айтамын.';
+      }
+      return 'Автобус режимі былай жұмыс істейді: сіз аялдама атауын немесе автобус нөмірін айтасыз, мен аттас аялдамалардың ішінен сізге ең жақын физикалық аялдаманы табамын да, тек сол аялдама бойынша маршруттар мен келу уақытын айтамын. Қарсы беттегі аялдама есепке алынбайды. Командалар: «аялдамада қандай автобустар», «10 автобус қашан келеді», «автобус режимін өшір».';
+    }
+    if (short) {
+      return 'В режиме автобуса вы называете остановку, а я выбираю ближайшую физическую остановку и говорю автобусы только для неё.';
+    }
+    return 'Режим автобуса работает так: вы называете остановку или номер автобуса, я нахожу ближайшую к вам физическую остановку с этим названием и отвечаю только по ней. Остановка через дорогу не учитывается, даже если автобус там приходит раньше. Команды: «какие автобусы на остановке ...», «когда автобус 10 на остановке ...», «выключи режим автобуса».';
+  }
+
   String _dialogStylePromptTail() {
     if (_dialogBrevityMode == _DialogBrevityMode.auto) return '';
     if (_voiceIsKazakh) {
@@ -7236,6 +7843,8 @@ class _JanarymHomeState extends State<JanarymHome>
     if (_voiceIsKazakh) {
       final modeLine = navigationMode
           ? 'Қазір маршрут режимі қосулы, навигация контекстін ұстан.'
+          : _assistantMode == AssistantMode.bus
+          ? 'Қазір автобус режимі қосулы, аялдама мен автобус контекстін басым ұста.'
           : 'Қазір жалпы режим қосулы.';
       return 'Сен JANARYM қолданбасының ішіндегі ассистентсің. '
           'Өзіңді ChatGPT немесе тілдік модель ретінде таныстырма. '
@@ -7243,11 +7852,12 @@ class _JanarymHomeState extends State<JanarymHome>
           '1) ояту сөзі "Жанарым" арқылы дауыс диалогы, '
           '2) камера кадрын қысқаша сипаттау, '
           '3) маршрут режимін қосу/өшіру, маршрут құру, маршрут күйі мен келесі қадамды айту, '
-          '4) үйге және сақталған меткаларға маршрут құру, '
-          '5) соңғы жауапты қайталау, '
-          '6) қысқа/толық жауап стилін ауыстыру, '
-          '7) автоматты қауіп ескертуі камера белсенді кезде әрқашан жұмыс істейді, '
-          '8) қосымша режимдер: ordinary/route/home/find/memory/text_reader/shopping/cooking/dress_code/anti_fraud. '
+          '4) автобус режимі: аялдамадағы автобустарды және келу уақытын тексеру (мысалы, "10-автобус қашан келеді?"), '
+          '5) үйге және сақталған меткаларға маршрут құру, '
+          '6) соңғы жауапты қайталау, '
+          '7) қысқа/толық жауап стилін ауыстыру, '
+          '8) автоматты қауіп ескертуі камера белсенді кезде әрқашан жұмыс істейді, '
+          '9) қосымша режимдер: ordinary/route/bus/memory/text_reader/anti_fraud. '
           'Қолданбада жоқ мүмкіндікті ойдан шығарма. '
           'Егер сұраныс қолданба шегінен тыс болса, оны қысқа айт та осы функциялардың жақынын ұсын. '
           'Қолжетімді режимдер: $enabledModes. Релиз кезеңі: $releaseStage. '
@@ -7256,6 +7866,8 @@ class _JanarymHomeState extends State<JanarymHome>
 
     final modeLine = navigationMode
         ? 'Сейчас активен режим маршрута, держи навигационный контекст как приоритет.'
+        : _assistantMode == AssistantMode.bus
+        ? 'Сейчас активен режим автобуса, держи контекст остановок и расписания как приоритет.'
         : 'Сейчас активен обычный режим.';
     return 'Ты ассистент внутри приложения JANARYM. '
         'Никогда не представляйся ChatGPT, ИИ-моделью или универсальным помощником. '
@@ -7264,11 +7876,12 @@ class _JanarymHomeState extends State<JanarymHome>
         '1) голосовой диалог через wake-слово "Жанарым", '
         '2) краткое описание сцены с последнего кадра камеры, '
         '3) режим маршрута: включение/выключение, построение маршрута, статус маршрута, следующий шаг, остановка маршрута, '
-        '4) маршрут домой и к сохранённым меткам, '
-        '5) повтор последнего ответа, '
-        '6) переключение стиля ответа (коротко/подробно/обычно), '
-        '7) автоматические предупреждения об опасности, пока камера активна, '
-        '8) дополнительные режимы: ordinary/route/home/find/memory/text_reader/shopping/cooking/dress_code/anti_fraud. '
+        '4) режим автобуса: расписание автобусов и маршруты на остановке (например, "когда придет 10 автобус" или "какие автобусы тут ходят"), '
+        '5) маршрут домой и к сохранённым меткам, '
+        '6) повтор последнего ответа, '
+        '7) переключение стиля ответа (коротко/подробно/обычно), '
+        '8) автоматические предупреждения об опасности, пока камера активна, '
+        '9) дополнительные режимы: ordinary/route/bus/memory/text_reader/anti_fraud. '
         'Не выдумывай функции, которых нет в приложении. '
         'Если запрос вне возможностей приложения, скажи это коротко и предложи ближайший поддерживаемый сценарий. '
         'Доступные режимы: $enabledModes. Стадия релиза: $releaseStage. '
@@ -7373,6 +7986,13 @@ class _JanarymHomeState extends State<JanarymHome>
         _voiceText(
           ru: 'Пользователь сейчас в режиме маршрута.',
           kk: 'Пайдаланушы қазір маршрут режимінде.',
+        ),
+      );
+    } else if (_assistantMode == AssistantMode.bus) {
+      parts.add(
+        _voiceText(
+          ru: 'Пользователь сейчас в режиме автобуса.',
+          kk: 'Пайдаланушы қазір автобус режимінде.',
         ),
       );
     }
@@ -7618,12 +8238,14 @@ class _JanarymHomeState extends State<JanarymHome>
     }
 
     if (destinationKindHint == NavigationDestinationKind.transitStop) {
-      final stopPrefix = _interactionLanguage == AppLanguage.kk ? 'аялдамасы ' : 'остановка ';
-      if (!destination.toLowerCase().contains('остановка') && 
+      final stopPrefix = _interactionLanguage == AppLanguage.kk
+          ? 'аялдамасы '
+          : 'остановка ';
+      if (!destination.toLowerCase().contains('остановка') &&
           !destination.toLowerCase().contains('аялдама')) {
         destination = _interactionLanguage == AppLanguage.kk
-            ? '\$destination \$stopPrefix'
-            : '\$stopPrefix\$destination';
+            ? '$destination $stopPrefix'
+            : '$stopPrefix$destination';
       }
     }
 
@@ -7878,6 +8500,48 @@ class _JanarymHomeState extends State<JanarymHome>
     await _tts.stop();
   }
 
+  Future<void> _handleBackgroundTapToggle() async {
+    if (_modePickerOpen) {
+      _modePickerAutoCloseTimer?.cancel();
+      if (mounted) {
+        setState(() => _modePickerOpen = false);
+      }
+      return;
+    }
+
+    if (_sttService.isListening) {
+      _followUpPending = false;
+      _setCircleState(CircleState.thinking);
+      unawaited(_sttService.stop(waitForTranscription: false));
+      return;
+    }
+
+    if (_isSpeaking ||
+        _textReaderSessionState == _TextReaderSessionState.speaking) {
+      await _stopTtsOnly();
+      _textReaderSessionCancelRequested = true;
+      return;
+    }
+
+    if (_commandInFlight ||
+        _followUpActive ||
+        _wakeHandling ||
+        _manualTextReadInProgress ||
+        _gptStatus == GptStatus.loading) {
+      _requestId++;
+      _followUpPending = false;
+      await _stopAll();
+      return;
+    }
+
+    final hasMic = _micGranted || await _ensureMicPermission();
+    if (!hasMic || _onboardingDialogInProgress) {
+      return;
+    }
+
+    await _handleWakeDetected();
+  }
+
   void _triggerFastModeFeedback() {
     _setCircleState(CircleState.end);
     unawaited(_vibrateEnd());
@@ -7925,6 +8589,8 @@ class _JanarymHomeState extends State<JanarymHome>
         return AssistantMode.general;
       case JanarymMode.route:
         return AssistantMode.navigation;
+      case JanarymMode.bus:
+        return AssistantMode.bus;
       case JanarymMode.safety:
         return AssistantMode.general;
       case JanarymMode.shopping:
@@ -7940,7 +8606,7 @@ class _JanarymHomeState extends State<JanarymHome>
       case JanarymMode.memory:
         return AssistantMode.memory;
       case JanarymMode.find:
-        return AssistantMode.find;
+        return AssistantMode.general;
     }
   }
 
@@ -7966,6 +8632,8 @@ class _JanarymHomeState extends State<JanarymHome>
         return JanarymMode.home;
       case AssistantMode.navigation:
         return JanarymMode.route;
+      case AssistantMode.bus:
+        return JanarymMode.bus;
       case AssistantMode.safety:
         return JanarymMode.home;
       case AssistantMode.shopping:
@@ -7980,8 +8648,6 @@ class _JanarymHomeState extends State<JanarymHome>
         return JanarymMode.text_reader;
       case AssistantMode.memory:
         return JanarymMode.memory;
-      case AssistantMode.find:
-        return JanarymMode.find;
     }
   }
 
@@ -8002,6 +8668,18 @@ class _JanarymHomeState extends State<JanarymHome>
     return _modeDescriptorForAssistantMode(
       mode,
     ).ui.label(isKazakh: _voiceIsKazakh);
+  }
+
+  String _manualModeSwitchAck(AssistantMode mode) {
+    switch (mode) {
+      case AssistantMode.navigation:
+        return _voiceL10n.navModeEnabled;
+      case AssistantMode.bus:
+        return _voiceL10n.busModeEnabled;
+      default:
+        final label = _spokenModeDisplayName(mode);
+        return _voiceIsKazakh ? '$label қосылды.' : '$label включен.';
+    }
   }
 
   AssistantMode? _detectModeSwitchByText(String text) {
@@ -8101,6 +8779,7 @@ class _JanarymHomeState extends State<JanarymHome>
         'багыт',
         'бағдар',
       ],
+      AssistantMode.bus: ['автобус', 'автобуст', 'bus'],
       AssistantMode.shopping: [
         'шоп',
         'покупк',
@@ -8128,7 +8807,6 @@ class _JanarymHomeState extends State<JanarymHome>
       ],
       AssistantMode.textReader: ['чтен', 'чтени', 'reader', 'оқу', 'мәтін'],
       AssistantMode.memory: ['памят', 'жад', 'есте', 'сақтау'],
-      AssistantMode.find: ['поиск', 'find', 'іздеу', 'табу'],
     };
 
     final modeFragments = <AssistantMode, List<String>>{
@@ -8138,6 +8816,12 @@ class _JanarymHomeState extends State<JanarymHome>
         'маршрут',
         'навигация',
         'бағыт режимі',
+      ],
+      AssistantMode.bus: [
+        'режим автобуса',
+        'автобусный режим',
+        'режим автобус',
+        'автобус режимі',
       ],
       AssistantMode.shopping: ['шоппинг', 'покупки', 'shopping', 'сатып алу'],
       AssistantMode.cooking: ['готовка', 'кухня', 'cooking', 'ас дайындау'],
@@ -8159,22 +8843,13 @@ class _JanarymHomeState extends State<JanarymHome>
         'оқу режимі',
       ],
       AssistantMode.memory: ['память', 'жад', 'есте сақтау'],
-      AssistantMode.find: [
-        'режим найти',
-        'режим поиска',
-        'включи найти',
-        'включи поиск',
-        'табу режимі',
-        'іздеу режимі',
-      ],
     };
 
     for (final entry in modeTokenPrefixes.entries) {
-      final allowBare = entry.key != AssistantMode.find;
       if (wantsMode(
         entry.value,
         fragments: modeFragments[entry.key] ?? const <String>[],
-        allowBare: allowBare,
+        allowBare: true,
       )) {
         appLog('[ModeSwitch] matched "${entry.key.name}" from "$stripped"');
         return entry.key;
@@ -8201,17 +8876,11 @@ class _JanarymHomeState extends State<JanarymHome>
           label: kk ? 'Бағдарлағыш' : 'Маршрутизатор',
           icon: Icons.alt_route_rounded,
         ),
-      if (_isModeEnabled(AssistantMode.navigation))
+      if (_isModeEnabled(AssistantMode.bus))
         _ModeMenuEntry(
-          actionId: 'go_home',
-          label: kk ? 'Үйге' : 'Домой',
-          icon: Icons.house_rounded,
-        ),
-      if (_isModeEnabled(AssistantMode.find))
-        _ModeMenuEntry(
-          mode: AssistantMode.find,
-          label: kk ? 'Табу' : 'Найти',
-          icon: Icons.search_rounded,
+          mode: AssistantMode.bus,
+          label: kk ? 'Автобустар' : 'Автобусы',
+          icon: Icons.directions_bus_rounded,
         ),
       if (_isModeEnabled(AssistantMode.memory))
         _ModeMenuEntry(
@@ -8224,24 +8893,6 @@ class _JanarymHomeState extends State<JanarymHome>
           mode: AssistantMode.textReader,
           label: kk ? 'Мәтін оқу' : 'Чтение текста',
           icon: Icons.text_snippet_rounded,
-        ),
-      if (_isModeEnabled(AssistantMode.shopping))
-        _ModeMenuEntry(
-          mode: AssistantMode.shopping,
-          label: kk ? 'Шоппинг' : 'Шоппинг',
-          icon: Icons.shopping_bag_rounded,
-        ),
-      if (_isModeEnabled(AssistantMode.cooking))
-        _ModeMenuEntry(
-          mode: AssistantMode.cooking,
-          label: kk ? 'Дайындау' : 'Готовка',
-          icon: Icons.restaurant_menu_rounded,
-        ),
-      if (_isModeEnabled(AssistantMode.dressCode))
-        _ModeMenuEntry(
-          mode: AssistantMode.dressCode,
-          label: kk ? 'Дресс-код' : 'Дрескод',
-          icon: Icons.checkroom_rounded,
         ),
       if (_isModeEnabled(AssistantMode.antiFraud))
         _ModeMenuEntry(
@@ -8630,6 +9281,7 @@ class _JanarymHomeState extends State<JanarymHome>
           child: InkWell(
             borderRadius: BorderRadius.circular(999),
             onTap: () async {
+              final previousMode = _assistantMode;
               final changed = await _switchAssistantMode(
                 mode,
                 reason: 'mode_picker',
@@ -8638,6 +9290,9 @@ class _JanarymHomeState extends State<JanarymHome>
               _modePickerAutoCloseTimer?.cancel();
               setState(() => _modePickerOpen = false);
               if (!changed) return;
+              if (previousMode != mode) {
+                await _speak(_manualModeSwitchAck(mode));
+              }
               _triggerFastModeFeedback();
             },
             child: AnimatedContainer(
@@ -9081,7 +9736,7 @@ class _JanarymHomeState extends State<JanarymHome>
                 await _cancelActiveTextReaderSession();
                 return;
               }
-              await _runManualTextReadSession(
+              await _runPrioritizedTextReadSession(
                 widget.appLanguage == AppLanguage.kk
                     ? 'мәтінді оқы'
                     : 'прочитай',
@@ -9332,11 +9987,7 @@ class _JanarymHomeState extends State<JanarymHome>
       body: GestureDetector(
         behavior: HitTestBehavior.translucent,
         onTap: () async {
-          if (_isSpeaking ||
-              _textReaderSessionState == _TextReaderSessionState.speaking) {
-            await _stopTtsOnly();
-            _textReaderSessionCancelRequested = true;
-          }
+          await _handleBackgroundTapToggle();
         },
         child: Stack(
           children: [
@@ -9673,11 +10324,15 @@ class _JanarymHomeState extends State<JanarymHome>
           modeDescriptorFor: _modeDescriptorForAssistantMode,
           onModeSelected: (mode) async {
             Navigator.of(sheetCtx).pop();
+            final previousMode = _assistantMode;
             final changed = await _switchAssistantMode(
               mode,
               reason: 'mode_picker',
             );
             if (changed && mounted) {
+              if (previousMode != mode) {
+                await _speak(_manualModeSwitchAck(mode));
+              }
               _triggerFastModeFeedback();
             }
           },

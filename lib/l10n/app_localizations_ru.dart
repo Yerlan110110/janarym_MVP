@@ -94,6 +94,9 @@ class AppLocalizationsRu extends AppLocalizations {
   String get modeNavigation => 'Режим маршрута';
 
   @override
+  String get modeBus => 'Режим автобуса';
+
+  @override
   String get modeGeneral => 'Обычный режим';
 
   @override
@@ -180,6 +183,9 @@ class AppLocalizationsRu extends AppLocalizations {
   String get enableRouteModeFirst => 'Сначала включите режим маршрута.';
 
   @override
+  String get enableBusModeFirst => 'Сначала включите режим автобуса.';
+
+  @override
   String get routeModeDescribeBlocked =>
       'Сейчас включен режим маршрута. Выйдите из режима маршрута для команд описания.';
 
@@ -209,6 +215,12 @@ class AppLocalizationsRu extends AppLocalizations {
 
   @override
   String get routeModeNotEnabled => 'Режим маршрута не включен.';
+
+  @override
+  String get busModeAlreadyEnabled => 'Режим автобуса уже включен.';
+
+  @override
+  String get busModeNotEnabled => 'Режим автобуса не включен.';
 
   @override
   String get noCameraAccess => 'Нет доступа к камере.';
@@ -255,6 +267,12 @@ class AppLocalizationsRu extends AppLocalizations {
 
   @override
   String get navModeDisabled => 'Режим маршрута выключен.';
+
+  @override
+  String get busModeEnabled => 'Режим автобуса включен.';
+
+  @override
+  String get busModeDisabled => 'Режим автобуса выключен.';
 
   @override
   String get navEnableFirst => 'Сначала включите режим маршрута.';

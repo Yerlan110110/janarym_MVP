@@ -16,6 +16,16 @@ void main() {
       expect(decision.modeIntent, AssistantModeIntent.exitNavMode);
     });
 
+    test('parses enter bus mode intent', () {
+      final decision = router.route('включи режим автобуса');
+      expect(decision.modeIntent, AssistantModeIntent.enterBusMode);
+    });
+
+    test('parses exit bus mode intent', () {
+      final decision = router.route('выйти из режима автобуса');
+      expect(decision.modeIntent, AssistantModeIntent.exitBusMode);
+    });
+
     test('parses nav start and extracts destination', () {
       final decision = router.route('маршрут до абая 10 алматы');
       expect(decision.modeIntent, AssistantModeIntent.navStart);
@@ -35,7 +45,7 @@ void main() {
 
     test('parses stop routes query', () {
       final decision = router.route('какие маршруты на остановке университет');
-      expect(decision.modeIntent, AssistantModeIntent.navStopRoutes);
+      expect(decision.modeIntent, AssistantModeIntent.busStopRoutes);
       expect(decision.destinationQuery, 'университет');
       expect(
         decision.destinationKindHint,
@@ -47,7 +57,7 @@ void main() {
       final decision = router.route(
         'когда автобус 10 на остановке университет',
       );
-      expect(decision.modeIntent, AssistantModeIntent.navStopSchedule);
+      expect(decision.modeIntent, AssistantModeIntent.busStopSchedule);
       expect(decision.destinationQuery, 'университет');
       expect(decision.transitRouteName, '10');
       expect(
@@ -60,7 +70,7 @@ void main() {
       final decision = router.route(
         'когда придет автобус номер 10 на остановку университет',
       );
-      expect(decision.modeIntent, AssistantModeIntent.navStopSchedule);
+      expect(decision.modeIntent, AssistantModeIntent.busStopSchedule);
       expect(decision.destinationQuery, 'университет');
       expect(decision.transitRouteName, '10');
     });
@@ -69,7 +79,7 @@ void main() {
       final decision = router.route(
         'на остановке университет когда придет автобус 10',
       );
-      expect(decision.modeIntent, AssistantModeIntent.navStopSchedule);
+      expect(decision.modeIntent, AssistantModeIntent.busStopSchedule);
       expect(decision.destinationQuery, 'университет');
       expect(decision.transitRouteName, '10');
     });
@@ -78,7 +88,7 @@ void main() {
       final decision = router.route(
         'через сколько придет автобус 10 на остановку университет',
       );
-      expect(decision.modeIntent, AssistantModeIntent.navStopSchedule);
+      expect(decision.modeIntent, AssistantModeIntent.busStopSchedule);
       expect(decision.destinationQuery, 'университет');
       expect(decision.transitRouteName, '10');
     });
@@ -176,11 +186,11 @@ void main() {
       );
       expect(
         router.route('аялдама университет қандай маршруттар').modeIntent,
-        AssistantModeIntent.navStopRoutes,
+        AssistantModeIntent.busStopRoutes,
       );
       expect(
         router.route('аялдама университет автобус 10 қашан').modeIntent,
-        AssistantModeIntent.navStopSchedule,
+        AssistantModeIntent.busStopSchedule,
       );
     });
 

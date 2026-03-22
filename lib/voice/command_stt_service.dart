@@ -10,7 +10,7 @@ import 'package:record/record.dart';
 import '../l10n/app_locale_controller.dart';
 import '../l10n/app_localizations.dart';
 
-enum CommandSttStatus { idle, listening, error }
+enum CommandSttStatus { idle, listening, processing, error }
 
 enum CommandListenProfile { quickWake, normal, navigation }
 
@@ -40,6 +40,7 @@ class CommandSttState {
   });
 
   bool get isListening => status == CommandSttStatus.listening;
+  bool get isProcessing => status == CommandSttStatus.processing;
 }
 
 class CommandSttService {
@@ -77,6 +78,8 @@ class CommandSttService {
   AppLanguage? _currentLanguageHint;
   bool _currentAllowAutoLanguage = true;
   bool _currentAlwaysTranscribe = false;
+  Future<void>? _finishFuture;
+  Future<void>? _recordingStoppedFuture;
 
   bool get isListening => state.value.isListening;
   AppLocalizations get _l10n => lookupAppLocalizations(_language.locale);
@@ -192,15 +195,42 @@ class CommandSttService {
     return completer.future;
   }
 
-  Future<void> stop() async {
-    await _finish();
+  Future<void> stop({bool waitForTranscription = true}) async {
+    final inFlight = _finishFuture;
+    if (inFlight != null) {
+      if (waitForTranscription) {
+        await inFlight;
+      } else {
+        await (_recordingStoppedFuture ?? inFlight);
+      }
+      return;
+    }
+
+    final recordingStopped = Completer<void>();
+    _recordingStoppedFuture = recordingStopped.future;
+    final future = _finish(recordingStopped: recordingStopped);
+    _finishFuture = future;
+    future.whenComplete(() {
+      if (identical(_finishFuture, future)) {
+        _finishFuture = null;
+      }
+      if (identical(_recordingStoppedFuture, recordingStopped.future)) {
+        _recordingStoppedFuture = null;
+      }
+    });
+
+    if (waitForTranscription) {
+      await future;
+    } else {
+      await recordingStopped.future;
+    }
   }
 
   Future<void> dispose() async {
-    await _finish();
+    await stop();
   }
 
-  Future<void> _finish() async {
+  Future<void> _finish({Completer<void>? recordingStopped}) async {
     if (_finishing) return;
     _finishing = true;
 
@@ -226,6 +256,10 @@ class CommandSttService {
         await _recorder.stop();
       }
     } catch (_) {}
+
+    if (!(recordingStopped?.isCompleted ?? true)) {
+      recordingStopped!.complete();
+    }
 
     // Notify the caller that they can play the "end" sound
     _onRecordingFinishedCallback?.call();
@@ -253,6 +287,11 @@ class CommandSttService {
         );
         try {
           if (shouldTranscribe) {
+            _setState(
+              status: CommandSttStatus.processing,
+              liveWords: '',
+              clearError: true,
+            );
             final text = await _transcribeFile(file);
             _setState(finalWords: text ?? '', liveWords: '');
           }

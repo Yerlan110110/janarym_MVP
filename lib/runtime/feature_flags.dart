@@ -68,7 +68,7 @@ class RuntimeFeatureFlags {
       shoppingEnabled: _readBool('MODE_SHOPPING_ENABLED', fallback: false),
       cookingEnabled: _readBool('MODE_COOKING_ENABLED', fallback: false),
       dressCodeEnabled: _readBool('MODE_DRESS_CODE_ENABLED', fallback: false),
-      antiFraudEnabled: _readBool('MODE_ANTI_FRAUD_ENABLED', fallback: false),
+      antiFraudEnabled: _readBool('MODE_ANTI_FRAUD_ENABLED', fallback: true),
       textReaderEnabled: _readBool('MODE_TEXT_READER_ENABLED', fallback: true),
       memoryEnabled: _readBool('MODE_MEMORY_ENABLED', fallback: true),
       findEnabled: _readBool('MODE_FIND_ENABLED', fallback: true),
@@ -91,14 +91,16 @@ class RuntimeFeatureFlags {
 
   List<String> enabledModes() {
     final result = <String>['home'];
-    if (navigationEnabled) result.add('navigation');
+    if (navigationEnabled) {
+      result.add('navigation');
+      result.add('bus');
+    }
     if (shoppingEnabled) result.add('shopping');
     if (cookingEnabled) result.add('cooking');
     if (dressCodeEnabled) result.add('dress_code');
     if (antiFraudEnabled) result.add('anti_fraud');
     if (textReaderEnabled) result.add('text_reader');
     if (memoryEnabled) result.add('memory');
-    if (findEnabled) result.add('find');
     return result;
   }
 

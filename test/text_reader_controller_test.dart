@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:collection';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -203,5 +204,81 @@ void main() {
       expect(controller.state, TextReaderState.idle);
       expect(controller.isPaused, isFalse);
     });
+
+    test(
+      'pause cancels in-flight auto tick before it can emit a result',
+      () async {
+        final readCompleter = Completer<OnDeviceTextReadResult?>();
+        final controller = TextReaderController(
+          engine: const TextReaderEngine(),
+          readOnDevice: ({required force, required timeout}) =>
+              readCompleter.future,
+          readVisionFallback:
+              ({
+                required autoRead,
+                required reason,
+                required timeoutMs,
+                required maxAttempts,
+              }) async => 'ignored',
+        );
+
+        final pending = controller.runAutoTick();
+        await Future<void>.delayed(Duration.zero);
+        controller.pause();
+        expect(controller.state, TextReaderState.paused);
+        expect(controller.isBusy, isTrue);
+
+        readCompleter.complete(
+          buildResult(rawText: 'Видимый текст', lines: const ['Видимый текст']),
+        );
+        final result = await pending;
+
+        expect(result.skipped, isTrue);
+        expect(result.hasResult, isFalse);
+        expect(controller.state, TextReaderState.paused);
+        expect(controller.isBusy, isFalse);
+      },
+    );
+
+    test(
+      'stop keeps in-flight manual run exclusive until it settles',
+      () async {
+        final readCompleter = Completer<OnDeviceTextReadResult?>();
+        final controller = TextReaderController(
+          engine: const TextReaderEngine(),
+          readOnDevice: ({required force, required timeout}) =>
+              readCompleter.future,
+          readVisionFallback:
+              ({
+                required autoRead,
+                required reason,
+                required timeoutMs,
+                required maxAttempts,
+              }) async => null,
+        );
+
+        final first = controller.runManual(source: TextReaderReadSource.voice);
+        await Future<void>.delayed(Duration.zero);
+        controller.stop();
+
+        expect(controller.state, TextReaderState.idle);
+        expect(controller.isBusy, isTrue);
+
+        final second = await controller.runManual(
+          source: TextReaderReadSource.tap,
+        );
+        expect(second.skipped, isTrue);
+
+        readCompleter.complete(
+          buildResult(rawText: 'Старый текст', lines: const ['Старый текст']),
+        );
+        final firstResult = await first;
+
+        expect(firstResult.skipped, isTrue);
+        expect(firstResult.hasResult, isFalse);
+        expect(controller.isBusy, isFalse);
+        expect(controller.state, TextReaderState.idle);
+      },
+    );
   });
 }

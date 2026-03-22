@@ -46,6 +46,14 @@ class YandexNavigationRouteService implements NavigationRouteService {
     _instructionEngine.setLanguage(language);
   }
 
+  static bool _mapKitInitialized = false;
+
+  /// Ensures YandexMapKit is initialized before any search/route call.
+  /// This is handled in the native Android code (MainApplication.kt).
+  static Future<void> _ensureMapKitInitialized() async {
+    // No-op. Native side already initialized in MainApplication.kt.
+  }
+
   final InstructionEngine _instructionEngine;
   AppLanguage _language;
   static const BoundingBox _astanaBounds = BoundingBox(
@@ -69,8 +77,7 @@ class YandexNavigationRouteService implements NavigationRouteService {
     NavigationDestinationKind destinationKind =
         NavigationDestinationKind.generic,
   }) async {
-    // Interface keeps origin; Astana-only mode intentionally ignores it.
-    final _ = origin;
+    await _ensureMapKitInitialized();
     final cleanQuery = _normalizeAstanaQuery(
       destinationKind == NavigationDestinationKind.transitStop
           ? _normalizeTransitStopQuery(query.trim())
@@ -81,6 +88,7 @@ class YandexNavigationRouteService implements NavigationRouteService {
       query: cleanQuery,
       limit: limit,
       destinationKind: destinationKind,
+      origin: origin,
     );
   }
 
@@ -88,6 +96,7 @@ class YandexNavigationRouteService implements NavigationRouteService {
     required String query,
     required int limit,
     required NavigationDestinationKind destinationKind,
+    required NavPoint origin,
   }) async {
     final geometry = Geometry.fromBoundingBox(_astanaBounds);
 
@@ -102,7 +111,7 @@ class YandexNavigationRouteService implements NavigationRouteService {
         geometry: true,
         searchType: SearchType.geo,
         resultPageSize: resultPageSize,
-        userPosition: const Point(latitude: 51.1284, longitude: 71.4304),
+        userPosition: Point(latitude: origin.latitude, longitude: origin.longitude),
       ),
     );
 
@@ -156,9 +165,11 @@ class YandexNavigationRouteService implements NavigationRouteService {
     required NavPoint origin,
     required NavPoint destination,
   }) async {
-    if (!_isInsideAstana(destination)) {
+    if (!_isInsideAstana(destination) || !_isInsideAstana(origin)) {
       throw Exception(_l10n.routeAstanaOnly);
     }
+
+    await _ensureMapKitInitialized();
 
     final points = <RequestPoint>[
       RequestPoint(

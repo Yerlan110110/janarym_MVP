@@ -6,7 +6,7 @@ class PersonalizationDatabase {
     : _databaseFactory = dbFactory ?? databaseFactory,
       _databaseName = databaseName ?? _defaultDbName;
 
-  static const int schemaVersion = 3;
+  static const int schemaVersion = 4;
   static const String _defaultDbName = 'janarym_personalization_v1.db';
 
   final DatabaseFactory _databaseFactory;
@@ -42,6 +42,9 @@ class PersonalizationDatabase {
     if (version >= 3) {
       await _migrateToV3(db);
     }
+    if (version >= 4) {
+      await _migrateToV4(db);
+    }
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
@@ -53,6 +56,9 @@ class PersonalizationDatabase {
     }
     if (oldVersion < 3) {
       await _migrateToV3(db);
+    }
+    if (oldVersion < 4) {
+      await _migrateToV4(db);
     }
   }
 
@@ -306,6 +312,23 @@ class PersonalizationDatabase {
     );
   }
 
+  Future<void> _migrateToV4(DatabaseExecutor db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS memory_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        key_name TEXT NOT NULL,
+        key_name_norm TEXT NOT NULL UNIQUE,
+        note_value TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'note',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_memory_notes_updated ON memory_notes(updated_at DESC);',
+    );
+  }
+
   Future<T> runInTransaction<T>(
     Future<T> Function(Transaction tx) action,
   ) async {
@@ -336,6 +359,21 @@ class PersonalizationDatabase {
       WHERE id NOT IN (
         SELECT id FROM scene_objects
         ORDER BY last_seen_at DESC, id DESC
+        LIMIT ?
+      )
+      ''',
+      <Object>[maxEntries],
+    );
+  }
+
+  Future<void> pruneMemoryNotes({int maxEntries = 150}) async {
+    final db = await database;
+    await db.rawDelete(
+      '''
+      DELETE FROM memory_notes
+      WHERE id NOT IN (
+        SELECT id FROM memory_notes
+        ORDER BY updated_at DESC, id DESC
         LIMIT ?
       )
       ''',

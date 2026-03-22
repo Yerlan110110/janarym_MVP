@@ -42,11 +42,14 @@ class DgisTransitService implements NavigationTransitService {
   DgisTransitService({
     http.Client? httpClient,
     AppLanguage language = AppLanguage.ru,
+    DateTime Function()? nowProvider,
   }) : _httpClient = httpClient ?? http.Client(),
-       _language = language;
+       _language = language,
+       _nowProvider = nowProvider ?? DateTime.now;
 
   final http.Client _httpClient;
   AppLanguage _language;
+  final DateTime Function() _nowProvider;
 
   static const String _placesHost = 'catalog.api.2gis.com';
   static const String _publicTransportHost = 'routing.api.2gis.com';
@@ -75,64 +78,41 @@ class DgisTransitService implements NavigationTransitService {
   }) async {
     final apiKey = _apiKey;
     if (apiKey.isEmpty) {
-      final cleanQuery = _normalizeStopQuery(query);
-      final label = cleanQuery.isEmpty ? 'Хан Шатыр' : cleanQuery;
-      final mockPoint = _mockStopPoint(cleanQuery);
-      return [
-        TransitStopCandidate(
-          id: 'mock_stop_$label',
-          stationId: 'mock_st_$label',
-          platformIds: const [],
-          title: label,
-          subtitle: 'Астана, Казахстан',
-          point: mockPoint,
-          routes: const [
-            TransitRouteSummary(
-              routeId: 'mock_10',
-              displayName: '10',
-              transportType: 'bus',
-              directionLabels: ['Вокзал Нурлы Жол'],
-            ),
-            TransitRouteSummary(
-              routeId: 'mock_12',
-              displayName: '12',
-              transportType: 'bus',
-              directionLabels: ['Аэропорт'],
-            ),
-            TransitRouteSummary(
-              routeId: 'mock_40',
-              displayName: '40',
-              transportType: 'bus',
-              directionLabels: ['Пирамида'],
-            ),
-          ],
-        )
-      ];
+      throw const TransitServiceUnavailable('2GIS API key is not configured');
     }
 
     final cleanQuery = _normalizeStopQuery(query);
-    if (cleanQuery.isEmpty) return const [];
 
-    final uri = Uri.https(_placesHost, '/3.0/items', <String, String>{
+    final Map<String, String> params = {
       'key': apiKey,
-      'q': cleanQuery,
       'type': 'station,station_platform',
       'fields':
           'items.point,items.full_address_name,items.routes,items.directions,'
           'items.station_id,items.platforms',
       'locale': _placesLocale,
       'location': '${nearLocation.longitude},${nearLocation.latitude}',
-      'point': '${nearLocation.longitude},${nearLocation.latitude}',
-      'radius': '40000',
-      'search_nearby': 'true',
-      'search_is_query_text_complete': 'true',
+      'radius': '35000',
       'sort': 'relevance',
-    });
+    };
+
+    if (cleanQuery.isNotEmpty) {
+      params['q'] = cleanQuery;
+      params['search_nearby'] = 'false';
+    } else {
+      params['point'] = '${nearLocation.longitude},${nearLocation.latitude}';
+      params['search_nearby'] = 'true';
+    }
+
+    final uri = Uri.https(_placesHost, '/3.0/items', params);
 
     final response = await _httpClient
         .get(uri)
         .timeout(const Duration(seconds: 8));
+
     if (response.statusCode < 200 || response.statusCode >= 300) {
+      print(
+        '[TRANSIT] Places API error: ${response.statusCode} Body: ${response.body}',
+      );
       throw TransitServiceUnavailable(
         '2GIS places request failed with ${response.statusCode}',
       );
@@ -189,27 +169,13 @@ class DgisTransitService implements NavigationTransitService {
   }) async {
     final apiKey = _apiKey;
     if (apiKey.isEmpty) {
-      final now = DateTime.now();
-      final t1 = now.add(const Duration(minutes: 4));
-      final t2 = now.add(const Duration(minutes: 14));
-      final t3 = now.add(const Duration(minutes: 27));
-      String formatTime(DateTime t) {
-        return '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
-      }
-      return [
-        TransitScheduleEntry(
-          routeName: routeName,
-          destinationLabel: 'Орталық',
-          exactTimes: [formatTime(t1), formatTime(t2), formatTime(t3)],
-          intervalMinutes: null,
-          sourceType: TransitScheduleSourceType.precise,
-        )
-      ];
+      throw const TransitServiceUnavailable('2GIS API key is not configured');
     }
 
     final normalizedRoute = _normalizeRouteName(routeName);
     if (normalizedRoute.isEmpty) return const [];
 
+    final requestedAt = _nowProvider();
     final entries = <TransitScheduleEntry>[];
     final seen = <String>{};
     for (final target in _scheduleProbeTargets(stop.point, nearLocation)) {
@@ -218,21 +184,32 @@ class DgisTransitService implements NavigationTransitService {
         apiKey: apiKey,
         source: stop.point,
         target: target,
+        startTime: requestedAt,
       );
       for (final option in options) {
-        final routeNames = _extractRouteNames(option);
-        if (!routeNames.any(
-          (name) => _normalizeRouteName(name) == normalizedRoute,
-        )) {
-          continue;
-        }
+        final routeNames = _extractBoardingRouteNames(option);
+        final isMatch = routeNames.any((name) {
+          final d = _normalizeRouteName(name);
+          if (d == normalizedRoute) return true;
+
+          final searchDigits = routeName.replaceAll(RegExp(r'[^0-9]'), '');
+          final dataDigits = name.replaceAll(RegExp(r'[^0-9]'), '');
+          if (searchDigits.isNotEmpty && searchDigits == dataDigits)
+            return true;
+
+          return d.contains(normalizedRoute) || normalizedRoute.contains(d);
+        });
+
+        if (!isMatch) continue;
         final scheduleItems = option['schedules'];
         if (scheduleItems is! List) continue;
         final destinationLabel = _directionLabelForRoute(stop, normalizedRoute);
         final parsed = _parseScheduleEntries(
           scheduleItems,
+          rawScheduleEvents: option['schedules_events'],
           routeName: routeName,
           destinationLabel: destinationLabel,
+          requestedAt: requestedAt,
         );
         for (final entry in parsed) {
           final key = _scheduleEntryKey(entry);
@@ -273,6 +250,7 @@ class DgisTransitService implements NavigationTransitService {
     required String apiKey,
     required NavPoint source,
     required NavPoint target,
+    required DateTime startTime,
   }) async {
     final uri = Uri.https(
       _publicTransportHost,
@@ -293,6 +271,7 @@ class DgisTransitService implements NavigationTransitService {
           'lon': target.longitude,
         },
       },
+      'start_time': startTime.millisecondsSinceEpoch ~/ 1000,
       'transport': _transitTypes,
       'max_result_count': 12,
       'locale': _publicTransportLocale,
@@ -308,6 +287,9 @@ class DgisTransitService implements NavigationTransitService {
       return const [];
     }
     if (response.statusCode < 200 || response.statusCode >= 300) {
+      print(
+        '[TRANSIT] Public transport API error: ${response.statusCode} Body: ${response.body} URI: $uri',
+      );
       throw TransitServiceUnavailable(
         '2GIS public transport request failed with ${response.statusCode}',
       );
@@ -335,6 +317,7 @@ class DgisTransitService implements NavigationTransitService {
   TransitStopCandidate? _parseStop(Map<String, dynamic> item) {
     final id = '${item['id'] ?? ''}'.trim();
     if (id.isEmpty) return null;
+    final type = '${item['type'] ?? ''}'.toLowerCase();
     final point =
         _parsePoint(item['point']) ??
         _parsePoint(
@@ -366,6 +349,7 @@ class DgisTransitService implements NavigationTransitService {
       subtitle: subtitle,
       point: point,
       routes: routes,
+      isPlatformLevel: type == 'station_platform',
     );
   }
 
@@ -494,11 +478,17 @@ class DgisTransitService implements NavigationTransitService {
 
   List<TransitScheduleEntry> _parseScheduleEntries(
     List<dynamic> rawSchedules, {
+    required Object? rawScheduleEvents,
     required String routeName,
     required String destinationLabel,
+    required DateTime requestedAt,
   }) {
-    final exactTimes = <String>[];
+    final exactTimes = <DateTime>[];
     int? smallestIntervalMinutes;
+    final scheduleEvents = _parseScheduleEvents(
+      rawScheduleEvents,
+      requestedAt: requestedAt,
+    );
 
     for (final rawSchedule in rawSchedules) {
       if (rawSchedule is! Map) continue;
@@ -507,13 +497,29 @@ class DgisTransitService implements NavigationTransitService {
       final preciseTime = _stringOrNull(schedule['precise_time']);
       final period = (schedule['period'] as num?)?.toInt();
       if (type == 'precise' && preciseTime != null) {
-        exactTimes.add(preciseTime);
+        final preciseDateTime = _resolvePreciseScheduleDateTime(
+          schedule,
+          preciseTime: preciseTime,
+          requestedAt: requestedAt,
+        );
+        if (preciseDateTime == null) continue;
+        if (preciseDateTime.isBefore(
+          requestedAt.subtract(const Duration(minutes: 1)),
+        )) {
+          continue;
+        }
+        exactTimes.add(preciseDateTime);
         continue;
       }
       if (type == 'periodic' &&
           period != null &&
           period > 0 &&
-          period < 0xFFFFFFFF) {
+          period < 0xFFFFFFFF &&
+          _periodicScheduleLooksActive(
+            schedule,
+            scheduleEvents: scheduleEvents,
+            requestedAt: requestedAt,
+          )) {
         if (smallestIntervalMinutes == null ||
             period < smallestIntervalMinutes) {
           smallestIntervalMinutes = period;
@@ -522,11 +528,17 @@ class DgisTransitService implements NavigationTransitService {
     }
 
     if (exactTimes.isNotEmpty) {
+      exactTimes.sort();
       return <TransitScheduleEntry>[
         TransitScheduleEntry(
           routeName: routeName,
           destinationLabel: destinationLabel,
-          exactTimes: exactTimes.toSet().toList(growable: false)..sort(),
+          exactTimes:
+              exactTimes
+                  .map(_formatScheduleTime)
+                  .toSet()
+                  .toList(growable: false)
+                ..sort(),
           intervalMinutes: null,
           sourceType: TransitScheduleSourceType.precise,
         ),
@@ -546,24 +558,27 @@ class DgisTransitService implements NavigationTransitService {
     return const [];
   }
 
-  List<String> _extractRouteNames(Map<String, dynamic> option) {
-    final result = <String>{};
+  List<String> _extractBoardingRouteNames(Map<String, dynamic> option) {
     final waypoints = option['waypoints'];
-    if (waypoints is List) {
-      for (final rawWaypoint in waypoints) {
-        if (rawWaypoint is! Map) continue;
-        final waypoint = Map<String, dynamic>.from(rawWaypoint);
-        final routeNames = waypoint['routes_names'];
-        if (routeNames is! List) continue;
-        for (final rawName in routeNames) {
-          final name = _stringOrNull(rawName);
-          if (name != null) {
-            result.add(name);
-          }
+    if (waypoints is! List) return const [];
+
+    for (final rawWaypoint in waypoints) {
+      if (rawWaypoint is! Map) continue;
+      final waypoint = Map<String, dynamic>.from(rawWaypoint);
+      final routeNames = waypoint['routes_names'];
+      if (routeNames is! List) continue;
+      final result = <String>{};
+      for (final rawName in routeNames) {
+        final name = _stringOrNull(rawName);
+        if (name != null) {
+          result.add(name);
         }
       }
+      if (result.isNotEmpty) {
+        return result.toList(growable: false);
+      }
     }
-    return result.toList(growable: false);
+    return const [];
   }
 
   String _directionLabelForRoute(
@@ -611,32 +626,176 @@ class DgisTransitService implements NavigationTransitService {
   }
 
   String _normalizeRouteName(String routeName) {
-    return routeName.replaceAll(RegExp(r'[\s-]+'), '').toUpperCase();
+    String n = routeName.split('(')[0].split('（')[0].trim();
+    return n
+        .toUpperCase()
+        .replaceAll('МАРШРУТ', '')
+        .replaceAll('АВТОБУС', '')
+        .replaceAll(RegExp(r'[^A-Z0-9\u0410-\u044F\u0401\u0451]'), '');
   }
 
-  /// Returns a real Astana bus-stop coordinate for the mock service.
-  /// Matches by keyword so different stop names land on different points.
-  NavPoint _mockStopPoint(String query) {
-    final q = query.toLowerCase();
-    // Well-known Astana stops with verified coordinates inside city bounds
-    const stops = <(String, double, double)>[
-      ('хан шатыр', 51.1305, 71.4053),     // Khan Shatyr mall stop
-      ('байтерек', 51.1285, 71.4306),       // Baiterek tower stop
-      ('думан', 51.1432, 71.4572),          // Duman entertainment centre
-      ('абай', 51.1799, 71.4465),           // Abai ave stop
-      ('нурлы жол', 51.1068, 71.3910),      // Nurly Zhol railway station
-      ('пирамида', 51.1279, 71.4226),       // Palace of Peace stop
-      ('аэропорт', 51.0220, 71.4670),       // Astana airport (edge but inside)
-      ('достык', 51.1611, 71.4697),         // Dostyk plaza
-      ('мега', 51.1940, 71.4330),           // Mega mall
-    ];
-    for (final (keyword, lat, lon) in stops) {
-      if (q.contains(keyword)) {
-        return NavPoint(latitude: lat, longitude: lon);
-      }
+  String _formatScheduleTime(DateTime dateTime) {
+    final hh = dateTime.hour.toString().padLeft(2, '0');
+    final mm = dateTime.minute.toString().padLeft(2, '0');
+    return '$hh:$mm';
+  }
+
+  DateTime? _resolvePreciseScheduleDateTime(
+    Map<String, dynamic> schedule, {
+    required String preciseTime,
+    required DateTime requestedAt,
+  }) {
+    final fromStartTime = _resolveScheduleDateTime(schedule, requestedAt);
+    if (fromStartTime != null) {
+      return fromStartTime;
     }
-    // Default: central Astana (near Baiterek) — always inside bounds
-    return const NavPoint(latitude: 51.1285, longitude: 71.4306);
+    return _timeOfDayOnRequestedDate(preciseTime, requestedAt: requestedAt);
+  }
+
+  DateTime? _resolveScheduleDateTime(
+    Map<String, dynamic> schedule,
+    DateTime requestedAt,
+  ) {
+    final utcSeconds = _normalizedUnixSeconds(schedule['start_time_utc']);
+    if (utcSeconds != null) {
+      return DateTime.fromMillisecondsSinceEpoch(
+        utcSeconds * 1000,
+        isUtc: true,
+      ).toLocal();
+    }
+
+    final localSeconds = _secondsFromDayStart(schedule['start_time']);
+    if (localSeconds == null) return null;
+
+    var candidate = _startOfRequestedDay(
+      requestedAt,
+    ).add(Duration(seconds: localSeconds));
+    if (candidate.isBefore(requestedAt.subtract(const Duration(hours: 12)))) {
+      candidate = candidate.add(const Duration(days: 1));
+    }
+    return candidate;
+  }
+
+  int? _normalizedUnixSeconds(Object? value) {
+    final raw = _intValue(value);
+    if (raw == null || raw <= 0) return null;
+
+    var candidate = raw;
+    const maxReasonableUnixSeconds = 4102444800; // 2100-01-01T00:00:00Z
+    const unsignedIntSpan = 4294967296;
+    while (candidate > maxReasonableUnixSeconds) {
+      candidate -= unsignedIntSpan;
+    }
+    if (candidate <= 0) return null;
+    return candidate;
+  }
+
+  int? _secondsFromDayStart(Object? value) {
+    final seconds = _intValue(value);
+    if (seconds == null || seconds < 0) return null;
+    if (seconds >= const Duration(days: 1).inSeconds) return null;
+    return seconds;
+  }
+
+  int? _intValue(Object? value) {
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    if (value is String) return int.tryParse(value.trim());
+    return null;
+  }
+
+  DateTime? _timeOfDayOnRequestedDate(
+    String value, {
+    required DateTime requestedAt,
+  }) {
+    final match = RegExp(r'^(\d{1,2}):(\d{2})$').firstMatch(value.trim());
+    if (match == null) return null;
+    final hours = int.tryParse(match.group(1)!);
+    final minutes = int.tryParse(match.group(2)!);
+    if (hours == null || minutes == null) return null;
+    if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+    return requestedAt.isUtc
+        ? DateTime.utc(
+            requestedAt.year,
+            requestedAt.month,
+            requestedAt.day,
+            hours,
+            minutes,
+          )
+        : DateTime(
+            requestedAt.year,
+            requestedAt.month,
+            requestedAt.day,
+            hours,
+            minutes,
+          );
+  }
+
+  DateTime _startOfRequestedDay(DateTime requestedAt) {
+    return requestedAt.isUtc
+        ? DateTime.utc(requestedAt.year, requestedAt.month, requestedAt.day)
+        : DateTime(requestedAt.year, requestedAt.month, requestedAt.day);
+  }
+
+  List<_TransitScheduleEvent> _parseScheduleEvents(
+    Object? rawEvents, {
+    required DateTime requestedAt,
+  }) {
+    if (rawEvents is! List) return const [];
+    final result = <_TransitScheduleEvent>[];
+    for (final rawEvent in rawEvents) {
+      if (rawEvent is! Map) continue;
+      final event = Map<String, dynamic>.from(rawEvent);
+      final type = _stringOrNull(event['type'])?.toLowerCase();
+      if (type == null) continue;
+      final dateTime = _resolvePreciseScheduleDateTime(
+        event,
+        preciseTime: _stringOrNull(event['precise_time']) ?? '',
+        requestedAt: requestedAt,
+      );
+      if (dateTime == null) continue;
+      result.add(_TransitScheduleEvent(type: type, dateTime: dateTime));
+    }
+    return result;
+  }
+
+  bool _periodicScheduleLooksActive(
+    Map<String, dynamic> schedule, {
+    required List<_TransitScheduleEvent> scheduleEvents,
+    required DateTime requestedAt,
+  }) {
+    final grace = requestedAt.add(const Duration(minutes: 1));
+    final scheduleStart = _resolveScheduleDateTime(schedule, requestedAt);
+    if (scheduleStart != null && scheduleStart.isAfter(grace)) {
+      return false;
+    }
+
+    final beginEvents = scheduleEvents
+        .where((event) => event.type.contains('begin'))
+        .map((event) => event.dateTime)
+        .toList(growable: false);
+    if (beginEvents.isNotEmpty &&
+        beginEvents.every((event) => event.isAfter(grace))) {
+      return false;
+    }
+
+    final endEvents = scheduleEvents
+        .where(
+          (event) =>
+              event.type.contains('end') || event.type.contains('finish'),
+        )
+        .map((event) => event.dateTime)
+        .toList(growable: false);
+    if (endEvents.isNotEmpty &&
+        endEvents.every(
+          (event) =>
+              event.isBefore(requestedAt) ||
+              event.isAtSameMomentAs(requestedAt),
+        )) {
+      return false;
+    }
+
+    return true;
   }
 
   List<NavPoint> _scheduleProbeTargets(NavPoint stop, NavPoint? nearLocation) {
@@ -686,4 +845,11 @@ class DgisTransitService implements NavigationTransitService {
       b.intervalMinutes ?? 1 << 30,
     );
   }
+}
+
+class _TransitScheduleEvent {
+  const _TransitScheduleEvent({required this.type, required this.dateTime});
+
+  final String type;
+  final DateTime dateTime;
 }

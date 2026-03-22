@@ -116,10 +116,14 @@ void main() {
       () async {
         dotenv.loadFromString(envString: 'DGIS_API_KEY=test-key');
         late Uri requestedUri;
+        late Map<String, dynamic> requestBody;
+        final fixedNow = DateTime.utc(2026, 3, 22, 0, 30);
         final service = DgisTransitService(
+          nowProvider: () => fixedNow,
           httpClient: MockClient((request) async {
             if (request.url.host == 'routing.api.2gis.com') {
               requestedUri = request.url;
+              requestBody = jsonDecode(request.body) as Map<String, dynamic>;
               return http.Response.bytes(
                 utf8.encode(
                   jsonEncode(<Map<String, dynamic>>[
@@ -133,12 +137,14 @@ void main() {
                       'schedules': <Map<String, dynamic>>[
                         <String, dynamic>{
                           'type': 'precise',
-                          'precise_time': '17:36',
+                          'precise_time': '00:36',
+                          'start_time': 36 * 60,
                           'period': 4294967295,
                         },
                         <String, dynamic>{
                           'type': 'precise',
-                          'precise_time': '17:42',
+                          'precise_time': '00:42',
+                          'start_time': 42 * 60,
                           'period': 4294967295,
                         },
                       ],
@@ -163,9 +169,13 @@ void main() {
 
         expect(requestedUri.host, 'routing.api.2gis.com');
         expect(requestedUri.path, '/public_transport/2.0');
+        expect(
+          requestBody['start_time'],
+          fixedNow.millisecondsSinceEpoch ~/ 1000,
+        );
         expect(entries, hasLength(1));
         expect(entries.first.sourceType, TransitScheduleSourceType.precise);
-        expect(entries.first.exactTimes, ['17:36', '17:42']);
+        expect(entries.first.exactTimes, ['00:36', '00:42']);
         expect(entries.first.destinationLabel, 'Вокзал');
 
         service.dispose();
@@ -174,7 +184,9 @@ void main() {
 
     test('getScheduledArrivals parses periodic schedule', () async {
       dotenv.loadFromString(envString: 'DGIS_API_KEY=test-key');
+      final fixedNow = DateTime.utc(2026, 3, 22, 0, 30);
       final service = DgisTransitService(
+        nowProvider: () => fixedNow,
         httpClient: MockClient((request) async {
           return http.Response.bytes(
             utf8.encode(
@@ -191,6 +203,14 @@ void main() {
                       'type': 'periodic',
                       'period': 6,
                       'precise_time': '',
+                      'start_time': 20 * 60,
+                    },
+                  ],
+                  'schedules_events': <Map<String, dynamic>>[
+                    <String, dynamic>{
+                      'type': 'begin_trips',
+                      'precise_time': '00:20',
+                      'start_time': 20 * 60,
                     },
                   ],
                 },
@@ -216,6 +236,185 @@ void main() {
       expect(entries.first.exactTimes, isEmpty);
       service.dispose();
     });
+
+    test(
+      'getScheduledArrivals ignores transfer options where route appears later',
+      () async {
+        dotenv.loadFromString(envString: 'DGIS_API_KEY=test-key');
+        final fixedNow = DateTime.utc(2026, 3, 22, 0, 30);
+        final service = DgisTransitService(
+          nowProvider: () => fixedNow,
+          httpClient: MockClient((request) async {
+            return http.Response.bytes(
+              utf8.encode(
+                jsonEncode(<Map<String, dynamic>>[
+                  <String, dynamic>{
+                    'waypoints': <Map<String, dynamic>>[
+                      <String, dynamic>{
+                        'routes_names': <String>['49'],
+                        'subtype': 'bus',
+                      },
+                      <String, dynamic>{
+                        'routes_names': <String>['10'],
+                        'subtype': 'bus',
+                      },
+                    ],
+                    'schedules': <Map<String, dynamic>>[
+                      <String, dynamic>{
+                        'type': 'precise',
+                        'precise_time': '00:35',
+                        'start_time': 35 * 60,
+                        'period': 4294967295,
+                      },
+                    ],
+                  },
+                  <String, dynamic>{
+                    'waypoints': <Map<String, dynamic>>[
+                      <String, dynamic>{
+                        'routes_names': <String>['10'],
+                        'subtype': 'bus',
+                      },
+                    ],
+                    'schedules': <Map<String, dynamic>>[
+                      <String, dynamic>{
+                        'type': 'precise',
+                        'precise_time': '00:44',
+                        'start_time': 44 * 60,
+                        'period': 4294967295,
+                      },
+                    ],
+                  },
+                ]),
+              ),
+              200,
+              headers: const <String, String>{
+                'content-type': 'application/json; charset=utf-8',
+              },
+            );
+          }),
+        );
+
+        final entries = await service.getScheduledArrivals(
+          stop: stop,
+          routeName: '10',
+          nearLocation: const NavPoint(latitude: 51.13, longitude: 71.45),
+        );
+
+        expect(entries, hasLength(1));
+        expect(entries.first.exactTimes, ['00:44']);
+        service.dispose();
+      },
+    );
+
+    test(
+      'getScheduledArrivals drops periodic schedule before service starts',
+      () async {
+        dotenv.loadFromString(envString: 'DGIS_API_KEY=test-key');
+        final fixedNow = DateTime.utc(2026, 3, 22, 0, 30);
+        final service = DgisTransitService(
+          nowProvider: () => fixedNow,
+          httpClient: MockClient((request) async {
+            return http.Response.bytes(
+              utf8.encode(
+                jsonEncode(<Map<String, dynamic>>[
+                  <String, dynamic>{
+                    'waypoints': <Map<String, dynamic>>[
+                      <String, dynamic>{
+                        'routes_names': <String>['10'],
+                        'subtype': 'bus',
+                      },
+                    ],
+                    'schedules': <Map<String, dynamic>>[
+                      <String, dynamic>{
+                        'type': 'periodic',
+                        'period': 20,
+                        'precise_time': '',
+                        'start_time': 6 * 3600 + 55 * 60,
+                      },
+                    ],
+                    'schedules_events': <Map<String, dynamic>>[
+                      <String, dynamic>{
+                        'type': 'begin_trips',
+                        'precise_time': '06:55',
+                        'start_time': 6 * 3600 + 55 * 60,
+                      },
+                    ],
+                  },
+                ]),
+              ),
+              200,
+              headers: const <String, String>{
+                'content-type': 'application/json; charset=utf-8',
+              },
+            );
+          }),
+        );
+
+        final entries = await service.getScheduledArrivals(
+          stop: stop,
+          routeName: '10',
+          nearLocation: const NavPoint(latitude: 51.13, longitude: 71.45),
+        );
+
+        expect(entries, isEmpty);
+        service.dispose();
+      },
+    );
+
+    test(
+      'getScheduledArrivals drops precise times already in the past',
+      () async {
+        dotenv.loadFromString(envString: 'DGIS_API_KEY=test-key');
+        final fixedNow = DateTime.utc(2026, 3, 22, 0, 10);
+        final service = DgisTransitService(
+          nowProvider: () => fixedNow,
+          httpClient: MockClient((request) async {
+            return http.Response.bytes(
+              utf8.encode(
+                jsonEncode(<Map<String, dynamic>>[
+                  <String, dynamic>{
+                    'waypoints': <Map<String, dynamic>>[
+                      <String, dynamic>{
+                        'routes_names': <String>['10'],
+                        'subtype': 'bus',
+                      },
+                    ],
+                    'schedules': <Map<String, dynamic>>[
+                      <String, dynamic>{
+                        'type': 'precise',
+                        'precise_time': '00:05',
+                        'start_time': 5 * 60,
+                        'period': 4294967295,
+                      },
+                      <String, dynamic>{
+                        'type': 'precise',
+                        'precise_time': '00:15',
+                        'start_time': 15 * 60,
+                        'period': 4294967295,
+                      },
+                    ],
+                  },
+                ]),
+              ),
+              200,
+              headers: const <String, String>{
+                'content-type': 'application/json; charset=utf-8',
+              },
+            );
+          }),
+        );
+
+        final entries = await service.getScheduledArrivals(
+          stop: stop,
+          routeName: '10',
+          nearLocation: const NavPoint(latitude: 51.13, longitude: 71.45),
+        );
+
+        expect(entries, hasLength(1));
+        expect(entries.first.exactTimes, ['00:15']);
+        service.dispose();
+      },
+    );
 
     test('missing API key is treated as soft unavailability', () async {
       final service = DgisTransitService(

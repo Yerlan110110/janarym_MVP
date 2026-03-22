@@ -248,6 +248,12 @@ abstract class AppLocalizations {
   /// **'Режим маршрута'**
   String get modeNavigation;
 
+  /// No description provided for @modeBus.
+  ///
+  /// In ru, this message translates to:
+  /// **'Режим автобуса'**
+  String get modeBus;
+
   /// No description provided for @modeGeneral.
   ///
   /// In ru, this message translates to:
@@ -416,6 +422,12 @@ abstract class AppLocalizations {
   /// **'Сначала включите режим маршрута.'**
   String get enableRouteModeFirst;
 
+  /// No description provided for @enableBusModeFirst.
+  ///
+  /// In ru, this message translates to:
+  /// **'Сначала включите режим автобуса.'**
+  String get enableBusModeFirst;
+
   /// No description provided for @routeModeDescribeBlocked.
   ///
   /// In ru, this message translates to:
@@ -469,6 +481,18 @@ abstract class AppLocalizations {
   /// In ru, this message translates to:
   /// **'Режим маршрута не включен.'**
   String get routeModeNotEnabled;
+
+  /// No description provided for @busModeAlreadyEnabled.
+  ///
+  /// In ru, this message translates to:
+  /// **'Режим автобуса уже включен.'**
+  String get busModeAlreadyEnabled;
+
+  /// No description provided for @busModeNotEnabled.
+  ///
+  /// In ru, this message translates to:
+  /// **'Режим автобуса не включен.'**
+  String get busModeNotEnabled;
 
   /// No description provided for @noCameraAccess.
   ///
@@ -553,6 +577,18 @@ abstract class AppLocalizations {
   /// In ru, this message translates to:
   /// **'Режим маршрута выключен.'**
   String get navModeDisabled;
+
+  /// No description provided for @busModeEnabled.
+  ///
+  /// In ru, this message translates to:
+  /// **'Режим автобуса включен.'**
+  String get busModeEnabled;
+
+  /// No description provided for @busModeDisabled.
+  ///
+  /// In ru, this message translates to:
+  /// **'Режим автобуса выключен.'**
+  String get busModeDisabled;
 
   /// No description provided for @navEnableFirst.
   ///

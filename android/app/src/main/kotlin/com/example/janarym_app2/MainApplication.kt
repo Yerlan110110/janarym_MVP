@@ -12,8 +12,9 @@ class MainApplication : Application() {
     val apiKey = readYandexApiKeyFromFlutterAssets()
     if (apiKey.isNotBlank()) {
       MapKitFactory.setApiKey(apiKey)
+      MapKitFactory.initialize(this)
       if (isDebuggableApp()) {
-        Log.i("MainApplication", "Yandex MapKit API key loaded from .env")
+        Log.i("MainApplication", "Yandex MapKit API key loaded and initialized from .env")
       }
     } else {
       if (isDebuggableApp()) {

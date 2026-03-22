@@ -5,9 +5,11 @@ import '../voice/wake_phrase_matcher.dart';
 enum AssistantModeIntent {
   enterNavMode,
   exitNavMode,
+  enterBusMode,
+  exitBusMode,
   navStart,
-  navStopRoutes,
-  navStopSchedule,
+  busStopRoutes,
+  busStopSchedule,
   routeToPlaceLabel,
   setPlaceLabel,
   startOnboarding,
@@ -155,6 +157,25 @@ class CommandRouter {
     'навигация режимін өшір',
   ];
 
+  static const List<String> enterBusModeTriggers = [
+    'включи режим автобуса',
+    'режим автобуса включи',
+    'включи автобусный режим',
+    'автобусный режим включи',
+    'автобус режимін қос',
+    'автобус режимін іске қос',
+  ];
+
+  static const List<String> exitBusModeTriggers = [
+    'выйти из режима автобуса',
+    'выйди из режима автобуса',
+    'выключи режим автобуса',
+    'выйти из автобусного режима',
+    'выключи автобусный режим',
+    'автобус режимінен шық',
+    'автобус режимін өшір',
+  ];
+
   static const List<String> navStartTriggers = [
     'построй маршрут до остановки',
     'проложи маршрут до остановки',
@@ -195,14 +216,18 @@ class CommandRouter {
   static const List<String> transitStopRoutesTriggers = [
     'какие маршруты на остановке',
     'какие автобусы на остановке',
-    'маршруты на остановке',
-    'автобусы на остановке',
     'какие маршруты ходят на остановке',
+    'какие автобусы ходят на остановке',
+    'какие остановки ходят на остановке',
+    'автобусы ходят на остановке',
+    'автобусы на остановке',
+    'маршруты на остановке',
     'аялдамада қандай маршруттар',
     'аялдамада қандай автобустар',
+    'қандай автобустар келеді',
   ];
 
-  static const List<String> transitScheduleQuestionTriggers = [
+  static const List<String> transitScheduleTriggers = [
     'когда',
     'во сколько',
     'через сколько',
@@ -456,13 +481,27 @@ class CommandRouter {
     required bool isAffirmative,
     required bool isNegative,
   }) {
+    if (_extractTransitSchedule(text) != null) {
+      return AssistantModeIntent.busStopSchedule;
+    }
+    if (_extractTransitStopRoutesQuery(text) != null) {
+      return AssistantModeIntent.busStopRoutes;
+    }
+
     if (isAffirmative) return AssistantModeIntent.confirmYes;
     if (isNegative) return AssistantModeIntent.confirmNo;
+
     if (enterNavModeTriggers.any(text.contains)) {
       return AssistantModeIntent.enterNavMode;
     }
     if (exitNavModeTriggers.any(text.contains)) {
       return AssistantModeIntent.exitNavMode;
+    }
+    if (enterBusModeTriggers.any(text.contains)) {
+      return AssistantModeIntent.enterBusMode;
+    }
+    if (exitBusModeTriggers.any(text.contains)) {
+      return AssistantModeIntent.exitBusMode;
     }
     if (navStopTriggers.any(text.contains)) {
       return AssistantModeIntent.navStop;
@@ -476,12 +515,7 @@ class CommandRouter {
     if (navRejectChoiceTriggers.any(text.contains)) {
       return AssistantModeIntent.navRejectChoice;
     }
-    if (_extractTransitSchedule(text) != null) {
-      return AssistantModeIntent.navStopSchedule;
-    }
-    if (_extractTransitStopRoutesQuery(text) != null) {
-      return AssistantModeIntent.navStopRoutes;
-    }
+
     if (onboardingTriggers.any(text.contains)) {
       return AssistantModeIntent.startOnboarding;
     }
@@ -514,8 +548,7 @@ class CommandRouter {
     if (readTextTriggers.any(text.contains)) {
       return AssistantModeIntent.readText;
     }
-    final hasVisionDirection = _directionFromText(text) != null;
-    if (hasVisionDirection || describeTriggers.any(text.contains)) {
+    if (describeTriggers.any(text.contains)) {
       return AssistantModeIntent.visionDescribe;
     }
     return AssistantModeIntent.unknown;
@@ -540,30 +573,46 @@ class CommandRouter {
   }
 
   String? _extractTransitStopRoutesQuery(String text) {
+    // 1. Try triggers-based extraction (legacy fallback)
     for (final trigger in transitStopRoutesTriggers) {
       final index = text.indexOf(trigger);
-      if (index < 0) continue;
-      final tail = text.substring(index + trigger.length).trim();
-      final query = _stripTransitStopPrefix(tail);
-      if (query.isNotEmpty) return query;
+      if (index >= 0) {
+        final tail = text.substring(index + trigger.length).trim();
+        final query = _stripTransitStopPrefix(tail);
+        if (query.isNotEmpty) return query;
+      }
     }
 
-    final ruRearMatch = RegExp(
-      r'^остановк[аеи]\s+(.+?)\s+(какие\s+(маршруты|автобусы)|маршруты|автобусы)$',
-      unicode: true,
-    ).firstMatch(text);
-    if (ruRearMatch != null) {
-      final query = _stripTransitStopPrefix(ruRearMatch.group(1) ?? '');
-      if (query.isNotEmpty) return query;
-    }
+    // 2. Try flexible regex patterns
+    final patterns = <RegExp>[
+      RegExp(
+        r'(?:какие\s+)?(?:автобусы|маршруты)(?:\s+ходят)?(?:\s+на)?\s+остановк[аеиуы]\s+(.+)$',
+        unicode: true,
+        caseSensitive: false,
+      ),
+      RegExp(
+        r'(?:какие\s+)?(?:автобусы|маршруты)(?:\s+ходят)?\s+через\s+остановк[аеиуы]\s+(.+)$',
+        unicode: true,
+        caseSensitive: false,
+      ),
+      RegExp(
+        r'остановк[аеиуы]\s+(.+?)\s+(?:какие\s+)?(?:автобусы|маршруты)(?:\s+ходят)?$',
+        unicode: true,
+        caseSensitive: false,
+      ),
+      RegExp(
+        r'аялдама(?:да|сына)?\s+(.+?)\s+(?:қандай\s+)?(?:маршруттар|автобустар)(?:\s+келеді)?$',
+        unicode: true,
+        caseSensitive: false,
+      ),
+    ];
 
-    final kkRearMatch = RegExp(
-      r'^аялдама\s+(.+?)\s+қандай\s+(маршруттар|автобустар)$',
-      unicode: true,
-    ).firstMatch(text);
-    if (kkRearMatch != null) {
-      final query = _stripTransitStopPrefix(kkRearMatch.group(1) ?? '');
-      if (query.isNotEmpty) return query;
+    for (final pattern in patterns) {
+      final match = pattern.firstMatch(text);
+      if (match != null) {
+        final query = _stripTransitStopPrefix(match.group(1) ?? '').trim();
+        if (query.isNotEmpty) return query;
+      }
     }
 
     return null;
@@ -572,24 +621,24 @@ class CommandRouter {
   _TransitScheduleQuery? _extractTransitSchedule(String text) {
     final patterns = <RegExp>[
       RegExp(
-        r'^когда\s+(автобус|маршрут)\s+([0-9\p{L}-]+)\s+на\s+остановк[еаи]\s+(.+)$',
+        r'^(?:когда|через сколько|во сколько)\s+(?:придет|приедет|будет)?\s*(?:автобус|маршрут)?\s*(?:номер\s+)?([0-9\p{L}-]+)\s+(?:на|до|к)?\s*остановк[аеиуы]\s+(.+)$',
         unicode: true,
+        caseSensitive: false,
       ),
       RegExp(
-        r'^(автобус|маршрут)\s+([0-9\p{L}-]+)\s+когда\s+на\s+остановк[еаи]\s+(.+)$',
+        r'^(?:автобус|маршрут)\s+(?:номер\s+)?([0-9\p{L}-]+)\s+(?:когда|через сколько|во сколько)\s+(?:придет|приедет|будет)?\s*(?:на|до|к)?\s*остановк[аеиуы]\s+(.+)$',
         unicode: true,
+        caseSensitive: false,
       ),
       RegExp(
-        r'^автобус\s+([0-9\p{L}-]+)\s+на\s+остановк[еаи]\s+(.+?)\s+когда$',
+        r'^(?:автобус|маршрут)?\s*(?:номер\s+)?([0-9\p{L}-]+)\s+(?:когда|через сколько|во сколько)\s+(?:на|до|к)?\s*остановк[аеиуы]\s+(.+)$',
         unicode: true,
+        caseSensitive: false,
       ),
       RegExp(
-        r'^аялдама\s+(.+?)\s+автобус\s+([0-9\p{L}-]+)\s+қашан$',
+        r'^аялдама(?:да|сына)?\s+(.+?)\s+(?:автобус|маршрут)?\s*(?:номер\s+)?([0-9\p{L}-]+)\s+(?:қашан|қашан келеді|қашан болады)$',
         unicode: true,
-      ),
-      RegExp(
-        r'^аялдамада\s+(.+?)\s+([0-9\p{L}-]+)\s+автобус\s+қашан$',
-        unicode: true,
+        caseSensitive: false,
       ),
     ];
 
@@ -625,7 +674,7 @@ class CommandRouter {
         _containsTransitRouteReference(text))) {
       return false;
     }
-    return transitScheduleQuestionTriggers.any(text.contains);
+    return transitScheduleTriggers.any(text.contains);
   }
 
   bool _containsTransitRouteReference(String text) {
@@ -672,22 +721,13 @@ class CommandRouter {
         r'(?:^|\s)остановк[аеиуы]\s+(.+?)\s+(?:когда|через сколько|во сколько|придет|придёт|приедет|подъедет|будет)(?:\s|$)',
         unicode: true,
       ),
-      RegExp(
-        r'(?:^|\s)(?:на|до|к)\s+остановк[аеиуы]\s+(.+)$',
-        unicode: true,
-      ),
-      RegExp(
-        r'(?:^|\s)остановк[аеиуы]\s+(.+)$',
-        unicode: true,
-      ),
+      RegExp(r'(?:^|\s)(?:на|до|к)\s+остановк[аеиуы]\s+(.+)$', unicode: true),
+      RegExp(r'(?:^|\s)остановк[аеиуы]\s+(.+)$', unicode: true),
       RegExp(
         r'(?:^|\s)аялдама(?:ға|га|да|ны|сына)?\s+(.+?)\s+(?:қашан|кашан|келеді|келедi)(?:\s|$)',
         unicode: true,
       ),
-      RegExp(
-        r'(?:^|\s)аялдама(?:ға|га|да|ны|сына)?\s+(.+)$',
-        unicode: true,
-      ),
+      RegExp(r'(?:^|\s)аялдама(?:ға|га|да|ны|сына)?\s+(.+)$', unicode: true),
     ];
     for (final pattern in patterns) {
       final match = pattern.firstMatch(text);
