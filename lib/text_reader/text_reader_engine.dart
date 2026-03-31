@@ -163,8 +163,14 @@ class TextReaderEngine {
     if (looksPseudoRussianOcr) return TextReaderQuality.weak;
 
     final script = TextReadingNormalizer.detectScript(compact);
+    final likelyEnglish = TextReadingNormalizer.isLikelyEnglishText(compact);
     if (script == DetectedTextScript.mixed &&
         !TextReadingNormalizer.shouldUseEnglishTts(compact)) {
+      return TextReaderQuality.weak;
+    }
+    if (script == DetectedTextScript.latin &&
+        !likelyEnglish &&
+        !structuredData.hasAny) {
       return TextReaderQuality.weak;
     }
     if (script == DetectedTextScript.unknown &&
@@ -184,6 +190,12 @@ class TextReaderEngine {
     ).allMatches(compact).length;
     if (!safe && !structuredData.hasAny) {
       return TextReaderQuality.weak;
+    }
+    if (script == DetectedTextScript.latin &&
+        likelyEnglish &&
+        meaningfulTokens >= 2 &&
+        alnumCount >= 10) {
+      return TextReaderQuality.strong;
     }
     if (meaningfulTokens >= 2 && alnumCount >= 8) {
       return TextReaderQuality.strong;

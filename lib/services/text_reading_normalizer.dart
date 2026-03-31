@@ -155,6 +155,9 @@ class TextReadingNormalizer {
   static bool isSpeechSafe(String text) {
     final source = _collapseWhitespace(text);
     if (source.isEmpty) return false;
+    if (isLikelyEnglishText(source)) {
+      return _isEnglishSpeechSafe(source);
+    }
 
     final tokens = source
         .split(RegExp(r'\s+'))
@@ -199,6 +202,32 @@ class TextReadingNormalizer {
     }
 
     return true;
+  }
+
+  static bool isLikelyEnglishText(String text) {
+    final source = _collapseWhitespace(text);
+    if (source.length < 2) return false;
+    if (_countMatches(source, _cyrillicChar) != 0) return false;
+    if (detectScript(source) != DetectedTextScript.latin) return false;
+
+    final tokens = _pseudoRussianLatinWordToken
+        .allMatches(source)
+        .map((match) => match.group(0) ?? '')
+        .where((token) => token.isNotEmpty)
+        .toList(growable: false);
+    if (tokens.isEmpty) return false;
+
+    final suspiciousCount = tokens.where(_isSuspiciousEnglishTtsToken).length;
+    if (suspiciousCount > 0 && suspiciousCount * 2 >= tokens.length) {
+      return false;
+    }
+
+    final englishLikeCount = tokens.where(_looksEnglishLikeToken).length;
+    if (englishLikeCount == 0) return false;
+    if (tokens.length <= 2) {
+      return englishLikeCount == tokens.length;
+    }
+    return englishLikeCount * 10 >= tokens.length * 6;
   }
 
   static bool _isPhoneticallyPlausible(String token) {
@@ -253,15 +282,17 @@ class TextReadingNormalizer {
     // Russian: 3 vowels in a row is basically impossible in real words (except rare ones)
     if (RegExp(
       r'[\u0430\u0435\u0451\u0438\u043e\u0443\u044b\u044d\u044e\u044f]{3,}',
-    ).hasMatch(lower))
+    ).hasMatch(lower)) {
       return false;
+    }
     if (RegExp(r'[aeiouy]{4,}').hasMatch(lower)) return false;
 
     // Too many consonants in a row (RU/EN)
     if (RegExp(
       r'[\u0431\u0432\u0433\u0434\u0436\u0437\u0439\u043a\u043b\u043c\u043d\u043f\u0440\u0441\u0442\u0444\u0445\u0446\u0447\u0448\u0449]{4,}',
-    ).hasMatch(lower))
+    ).hasMatch(lower)) {
       return false;
+    }
     if (RegExp(r'[bcdfghjklmnpqrstvwxz]{6,}').hasMatch(lower)) return false;
 
     // 3. Technical / OCR noise (All-caps strings without vowels or too long)
@@ -282,44 +313,25 @@ class TextReadingNormalizer {
     return true;
   }
 
-  static bool shouldUseEnglishTts(String text) {
-    final source = _collapseWhitespace(text);
-    if (source.length < 2) return false;
-    if (_countMatches(source, _cyrillicChar) != 0) return false;
-
-    if (detectScript(source) != DetectedTextScript.latin) {
-      return false;
-    }
-
-    final lower = source.toLowerCase();
-    final latinCount = _countMatches(source, _latinChar);
-    if (latinCount == 0) return false;
-    final latinTokens = _pseudoRussianLatinWordToken
-        .allMatches(source)
+  static bool _isEnglishSpeechSafe(String text) {
+    final tokens = _pseudoRussianLatinWordToken
+        .allMatches(text)
         .map((match) => match.group(0) ?? '')
         .where((token) => token.isNotEmpty)
         .toList(growable: false);
-    if (latinTokens.isNotEmpty) {
-      final suspiciousCount = latinTokens
-          .where(_isSuspiciousEnglishTtsToken)
-          .length;
-      if (suspiciousCount > 0 && suspiciousCount * 2 >= latinTokens.length) {
-        return false;
-      }
+    if (tokens.isEmpty) return false;
+
+    final safeTokens = tokens.where(_looksEnglishLikeToken).length;
+    if (tokens.length <= 2) {
+      return safeTokens == tokens.length;
     }
+    return safeTokens * 10 >= tokens.length * 7;
+  }
 
-    // Reject nonsense like "ZZZ" or "LLLL"
-    if (!isSpeechSafe(source)) return false;
-
-    // Phonetic density check: English words must have vowels
-    final vowelCount = _countMatches(lower, RegExp('[aeiouy]'));
-    if (vowelCount == 0 && source.length >= 3) {
-      // Small whitelist for English vowel-less abbreviations
-      final whitelist = {'dr', 'mr', 'mrs', 'st', 'rd', 'th', 'lb', 'kg'};
-      if (!whitelist.contains(lower)) return false;
-    }
-
-    return true;
+  static bool shouldUseEnglishTts(String text) {
+    final source = _collapseWhitespace(text);
+    if (!isLikelyEnglishText(source)) return false;
+    return _isEnglishSpeechSafe(source);
   }
 
   static bool looksLikePseudoRussianOcr(String text) {
@@ -331,7 +343,7 @@ class TextReadingNormalizer {
         script == DetectedTextScript.unknown) {
       return false;
     }
-    if (shouldUseEnglishTts(source)) return false;
+    if (isLikelyEnglishText(source)) return false;
 
     final tokens = _pseudoRussianLatinWordToken
         .allMatches(source)
@@ -405,7 +417,7 @@ class TextReadingNormalizer {
     if (_upperLatinToken.hasMatch(token) && token.length >= 5) {
       return true;
     }
-    if (RegExp(r'(?=.*[A-Z])(?=.*[a-z]).{5,}').hasMatch(token)) {
+    if (_hasWeirdMixedCase(token)) {
       return true;
     }
 
@@ -419,12 +431,84 @@ class TextReadingNormalizer {
         _countMatches(token, _hardLookalikeLatinChar) >= 2) {
       return true;
     }
-    if (RegExp(r'(?=.*[A-Z])(?=.*[a-z]).{5,}').hasMatch(token)) return true;
+    if (_hasWeirdMixedCase(token)) return true;
     return lower.endsWith('tb') ||
         lower.endsWith('tm') ||
         lower.contains('cei') ||
         lower.contains('npe') ||
         lower.contains('npu') ||
         lower.contains('ctb');
+  }
+
+  static bool _looksEnglishLikeToken(String token) {
+    if (!_latinOnlyToken.hasMatch(token)) return false;
+    if (_isSuspiciousEnglishTtsToken(token)) return false;
+
+    final lower = token.toLowerCase();
+    if (RegExp(r'^(.)\1{2,}$').hasMatch(lower)) return false;
+
+    const shortWords = {
+      'a',
+      'an',
+      'as',
+      'at',
+      'by',
+      'do',
+      'go',
+      'he',
+      'if',
+      'in',
+      'is',
+      'it',
+      'me',
+      'my',
+      'no',
+      'of',
+      'ok',
+      'on',
+      'or',
+      'to',
+      'up',
+      'us',
+      'we',
+    };
+    const noVowelWhitelist = {
+      'dr',
+      'mr',
+      'mrs',
+      'st',
+      'rd',
+      'th',
+      'lb',
+      'oz',
+      'kg',
+      'ui',
+      'usb',
+      'gps',
+      'sms',
+      'wifi',
+      'gpt',
+    };
+
+    if (token.length <= 2) {
+      return shortWords.contains(lower);
+    }
+
+    final vowelCount = _countMatches(lower, RegExp(r'[aeiouy]'));
+    if (vowelCount == 0) {
+      return noVowelWhitelist.contains(lower) ||
+          (_upperLatinToken.hasMatch(token) && token.length <= 4);
+    }
+
+    if (RegExp(r'[bcdfghjklmnpqrstvwxz]{7,}').hasMatch(lower)) return false;
+
+    return true;
+  }
+
+  static bool _hasWeirdMixedCase(String token) {
+    if (token.length < 5) return false;
+    if (!RegExp(r'(?=.*[A-Z])(?=.*[a-z])').hasMatch(token)) return false;
+    if (RegExp(r'^[A-Z][a-z]+$').hasMatch(token)) return false;
+    return true;
   }
 }

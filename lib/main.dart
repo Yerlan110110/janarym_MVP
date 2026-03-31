@@ -41,10 +41,12 @@ import 'services/scene_memory_service.dart';
 import 'services/shopping_mode_service.dart';
 import 'services/text_reader_decision_helper.dart';
 import 'services/text_reading_normalizer.dart';
+import 'services/vision_prompt_context.dart';
 import 'text_reader/text_reader_controller.dart';
 import 'text_reader/text_reader_engine.dart';
 import 'text_reader/text_reader_types.dart';
 import 'widgets/bbox_painter.dart';
+import 'widgets/mode_picker_sheet.dart';
 import 'voice/android_stt_wake_service.dart';
 import 'voice/command_stt_service.dart';
 import 'voice/mic_cue_policy.dart';
@@ -177,19 +179,238 @@ class _JanarymAppState extends State<JanarymApp> {
     return AnimatedBuilder(
       animation: _localeController,
       builder: (context, _) {
+        final locale = _localeController.locale;
         return MaterialApp(
           title: 'Janarym',
           debugShowCheckedModeBanner: false,
           theme: ThemeData(useMaterial3: true, brightness: Brightness.dark),
-          locale: _localeController.locale,
+          locale: locale,
           localizationsDelegates: AppLocalizations.localizationsDelegates,
           supportedLocales: AppLocalizations.supportedLocales,
-          home: JanarymHome(
-            appLanguage: _localeController.language,
-            onLanguageChanged: _localeController.setLanguage,
-          ),
+          home: !_localeController.isInitialized
+              ? const _AppBootstrapScreen()
+              : _localeController.requiresExplicitSelection
+              ? _InitialLanguageSelectionScreen(
+                  currentLanguage: _localeController.language,
+                  onSelected: _localeController.setLanguage,
+                )
+              : JanarymHome(
+                  appLanguage: _localeController.language,
+                  onLanguageChanged: _localeController.setLanguage,
+                ),
         );
       },
+    );
+  }
+}
+
+class _AppBootstrapScreen extends StatelessWidget {
+  const _AppBootstrapScreen();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Scaffold(
+      backgroundColor: Color(0xFF020617),
+      body: Center(
+        child: SizedBox(
+          width: 28,
+          height: 28,
+          child: CircularProgressIndicator(strokeWidth: 2.4),
+        ),
+      ),
+    );
+  }
+}
+
+class _InitialLanguageSelectionScreen extends StatelessWidget {
+  const _InitialLanguageSelectionScreen({
+    required this.currentLanguage,
+    required this.onSelected,
+  });
+
+  final AppLanguage currentLanguage;
+  final Future<void> Function(AppLanguage language) onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context);
+    return Scaffold(
+      backgroundColor: const Color(0xFF020617),
+      body: DecoratedBox(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFF020617), Color(0xFF0F172A), Color(0xFF1E293B)],
+          ),
+        ),
+        child: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 420),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Container(
+                      width: 84,
+                      height: 84,
+                      margin: const EdgeInsets.only(bottom: 24),
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: const RadialGradient(
+                          colors: [Color(0xFFE879F9), Color(0xFF2563EB)],
+                        ),
+                        boxShadow: const [
+                          BoxShadow(
+                            color: Color(0x332563EB),
+                            blurRadius: 36,
+                            spreadRadius: 6,
+                          ),
+                        ],
+                      ),
+                      child: const Icon(
+                        Icons.record_voice_over_rounded,
+                        color: Colors.white,
+                        size: 38,
+                      ),
+                    ),
+                    Text(
+                      currentLanguage == AppLanguage.kk
+                          ? 'Тілді таңдаңыз'
+                          : 'Выберите язык',
+                      textAlign: TextAlign.center,
+                      style: Theme.of(context).textTheme.headlineMedium
+                          ?.copyWith(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w800,
+                          ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      currentLanguage == AppLanguage.kk
+                          ? 'Қолданба тілі мен дауысты таңдаңыз\nВыберите язык приложения и озвучки'
+                          : 'Выберите язык приложения и озвучки\nҚолданба тілі мен дауысты таңдаңыз',
+                      textAlign: TextAlign.center,
+                      style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                        color: Colors.white70,
+                        height: 1.45,
+                      ),
+                    ),
+                    const SizedBox(height: 28),
+                    _LanguageSelectButton(
+                      label: l10n.languageRu,
+                      subtitle: currentLanguage == AppLanguage.kk
+                          ? 'Орысша интерфейс пен дауыс'
+                          : 'Русский интерфейс и голос',
+                      selected: currentLanguage == AppLanguage.ru,
+                      onPressed: () => onSelected(AppLanguage.ru),
+                    ),
+                    const SizedBox(height: 12),
+                    _LanguageSelectButton(
+                      label: l10n.languageKk,
+                      subtitle: currentLanguage == AppLanguage.kk
+                          ? 'Қазақша интерфейс пен дауыс'
+                          : 'Казахский интерфейс и голос',
+                      selected: currentLanguage == AppLanguage.kk,
+                      onPressed: () => onSelected(AppLanguage.kk),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _LanguageSelectButton extends StatelessWidget {
+  const _LanguageSelectButton({
+    required this.label,
+    required this.subtitle,
+    required this.selected,
+    required this.onPressed,
+  });
+
+  final String label;
+  final String subtitle;
+  final bool selected;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final borderColor = selected
+        ? const Color(0xFFF59E0B)
+        : const Color(0x33FFFFFF);
+    final background = selected
+        ? const Color(0x1AF59E0B)
+        : const Color(0x141E293B);
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onPressed,
+        borderRadius: BorderRadius.circular(22),
+        child: Ink(
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
+          decoration: BoxDecoration(
+            color: background,
+            borderRadius: BorderRadius.circular(22),
+            border: Border.all(color: borderColor, width: 1.4),
+          ),
+          child: Row(
+            children: [
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0F172A),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Icon(
+                  Icons.translate_rounded,
+                  color: selected ? const Color(0xFFF59E0B) : Colors.white70,
+                ),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      label,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 17,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      subtitle,
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Icon(
+                selected
+                    ? Icons.check_circle_rounded
+                    : Icons.arrow_forward_ios_rounded,
+                color: selected ? const Color(0xFFF59E0B) : Colors.white38,
+                size: selected ? 24 : 18,
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
@@ -260,22 +481,6 @@ class _DialogTurn {
 
   final String userText;
   final String assistantText;
-}
-
-class _ModeMenuEntry {
-  const _ModeMenuEntry({
-    required this.label,
-    required this.icon,
-    this.mode,
-    this.actionId,
-  });
-
-  final String label;
-  final IconData icon;
-  final AssistantMode? mode;
-  final String? actionId;
-
-  bool get isMode => mode != null;
 }
 
 class JanarymHome extends StatefulWidget {
@@ -377,6 +582,7 @@ class _JanarymHomeState extends State<JanarymHome>
   static const int _manualTextReadFirstTimeoutMs = 850;
   static const int _manualTextReadRetryTimeoutMs = 550;
   static const int _manualTextReadInterAttemptDelayMs = 90;
+  static const int _manualMicMaxListenSeconds = 45;
   bool _followUpActive = false;
   bool _followUpPending = false;
   bool _wakeHandling = false;
@@ -514,8 +720,10 @@ class _JanarymHomeState extends State<JanarymHome>
     max: 1.3,
   );
   final String _ttsPreferredVoiceRu = _readEnvString('TTS_PREFERRED_VOICE_RU');
+  final String _ttsPreferredVoiceKk = _readEnvString('TTS_PREFERRED_VOICE_KK');
   AppLanguage _ttsConfiguredLanguage = AppLanguage.ru;
   String _ttsConfiguredLocaleCode = 'ru-RU';
+  Map<String, String>? _ttsConfiguredVoice;
   final String _wakeAckTextRu = _readEnvString(
     'WAKE_ACK_TEXT_RU',
     fallback: 'Что нужно?',
@@ -555,6 +763,22 @@ class _JanarymHomeState extends State<JanarymHome>
     fallback: false,
   );
   final bool _wakeCueEnabled = _readEnvBool('WAKE_CUE_ENABLED', fallback: true);
+  final bool _cameraVisualPreviewEnabled = _readEnvBool(
+    'CAMERA_VISUAL_PREVIEW_ENABLED',
+    fallback: true,
+  );
+  final String _cameraStreamResolutionRaw = _readEnvString(
+    'CAMERA_STREAM_RESOLUTION',
+    fallback: '',
+  ).toLowerCase();
+  final int _cameraStreamFps = _readEnvInt(
+    'CAMERA_STREAM_FPS',
+    fallback: !kIsWeb && defaultTargetPlatform == TargetPlatform.android
+        ? 24
+        : 30,
+    min: 12,
+    max: 30,
+  );
   final int _frameCaptureThrottleMs = _readEnvInt(
     'FRAME_CAPTURE_THROTTLE_MS',
     fallback: 400,
@@ -600,9 +824,7 @@ class _JanarymHomeState extends State<JanarymHome>
   String _lastTextReaderVisionSignature = '';
   int _lastTextReaderVisionMs = 0;
   bool _textReaderVisionRequestInFlight = false;
-  bool get _wakeDebugOverlayEnabled =>
-      _featureFlags.developerDiagnosticsEnabled &&
-      _readEnvBool('WAKE_DEBUG_OVERLAY', fallback: true);
+  bool get _wakeDebugOverlayEnabled => false;
   static const Duration _wakeFallbackIdleWait = Duration(milliseconds: 520);
   static const Duration _wakeFallbackAfterListenWait = Duration(
     milliseconds: 520,
@@ -679,6 +901,7 @@ class _JanarymHomeState extends State<JanarymHome>
       database: _personalizationDatabase,
       codec: _securePayloadCodec,
     );
+    _logCameraRuntimeMode();
     WidgetsBinding.instance.addObserver(this);
     _circleController = AnimationController(
       vsync: this,
@@ -1396,10 +1619,18 @@ class _JanarymHomeState extends State<JanarymHome>
 
       final selected = _selectBestVoiceForLocaleCode(voices, localeCode);
       if (selected == null) return;
-      await _tts.setVoice(selected);
-      appLog(
-        '[TTS] voice selected: ${selected['name']} (${selected['locale']})',
-      );
+      final applied = Map<String, String>.from(selected);
+      await _tts.setVoice(applied);
+      _ttsConfiguredVoice = applied;
+      appLog('[TTS] voice selected: ${applied['name']} (${applied['locale']})');
+    } catch (_) {}
+  }
+
+  Future<void> _reapplyConfiguredTtsVoice() async {
+    final configuredVoice = _ttsConfiguredVoice;
+    if (configuredVoice == null || configuredVoice.isEmpty) return;
+    try {
+      await _tts.setVoice(configuredVoice);
     } catch (_) {}
   }
 
@@ -1412,6 +1643,7 @@ class _JanarymHomeState extends State<JanarymHome>
     if (!force &&
         _ttsConfiguredLocaleCode.toLowerCase() ==
             desiredLocaleCode.toLowerCase()) {
+      await _reapplyConfiguredTtsVoice();
       return;
     }
     await _configureTtsForLocaleCode(desiredLocaleCode);
@@ -1490,7 +1722,7 @@ class _JanarymHomeState extends State<JanarymHome>
     List<Map<String, String>> voices,
     AppLanguage language,
   ) {
-    final preferredName = _ttsPreferredVoiceRu.trim().toLowerCase();
+    final preferredName = _preferredVoiceNameFor(language);
     final localePrefix = language == AppLanguage.kk ? 'kk' : 'ru';
     Map<String, String>? best;
     var bestScore = -1 << 20;
@@ -1505,6 +1737,13 @@ class _JanarymHomeState extends State<JanarymHome>
         score += 200;
       } else if (locale.startsWith(localePrefix)) {
         score += 160;
+      } else if (language == AppLanguage.kk &&
+          (name.contains('kazakh') ||
+              name.contains('qazaq') ||
+              locale.contains('kz'))) {
+        score += 150;
+      } else if (language == AppLanguage.kk && name.contains('multilingual')) {
+        score += 110;
       } else if (locale.startsWith('ru')) {
         score += 60;
       }
@@ -1999,9 +2238,9 @@ class _JanarymHomeState extends State<JanarymHome>
       _cameraFpsWindowStartedMs = 0;
       createdController = CameraController(
         back,
-        ResolutionPreset.high,
+        _cameraResolutionPreset(),
         enableAudio: false,
-        fps: 30,
+        fps: _cameraStreamFps,
         imageFormatGroup: ImageFormatGroup.yuv420,
       );
 
@@ -3055,30 +3294,7 @@ class _JanarymHomeState extends State<JanarymHome>
     }
   }
 
-  void _openModePickerFromWake() {
-    if (!mounted) return;
-    _modePickerAutoCloseTimer?.cancel();
-    if (!_modePickerOpen) {
-      setState(() => _modePickerOpen = true);
-    }
-    _modePickerAutoCloseTimer = Timer(const Duration(seconds: 4), () {
-      if (!mounted) return;
-      if (_modePickerOpen) {
-        setState(() => _modePickerOpen = false);
-      }
-    });
-  }
-
-  String _resolvedWakeAckText() {
-    if (!_wakeReplyEnabled) return '';
-    if (_voiceIsKazakh) {
-      return _wakeAckTextKk.trim();
-    }
-    return _wakeAckTextRu.trim();
-  }
-
   Future<void> _runWakeAcknowledgeThenListen() async {
-    _openModePickerFromWake();
     _wakeWordOnlyMode = false;
     _stopWakeFallbackLoop();
     appLog('[WakeFlow] detected');
@@ -3116,6 +3332,7 @@ class _JanarymHomeState extends State<JanarymHome>
     _isSpeaking = true;
     try {
       await _ensureTtsLocaleForCurrentMode(force: true);
+      await _reapplyConfiguredTtsVoice();
       await _tts.stop();
       await _tts.setSpeechRate(_wakeAckSpeechRate);
       await _tts.setPitch(_ttsPitch);
@@ -3125,6 +3342,60 @@ class _JanarymHomeState extends State<JanarymHome>
       await _tts.setPitch(_ttsPitch);
       _isSpeaking = false;
       _setCircleState(CircleState.listening);
+    }
+  }
+
+  Future<void> _startManualMicSession() async {
+    if (_commandInFlight || !_micGranted) return;
+
+    _commandInFlight = true;
+    final localRequestId = ++_requestId;
+    final wakeHealthy =
+        !_useSttWakeEngine &&
+        _requireWakeWord &&
+        _wakeService.state.value.status != WakeWordStatus.error;
+
+    try {
+      _wakeWordOnlyMode = false;
+      _stopWakeFallbackLoop();
+      await _tts.stop();
+      await _stopPrimaryWake(reason: 'manual_button');
+      if (_followUpActive) {
+        await _sttService.stop();
+        _followUpActive = false;
+      }
+
+      _setCircleState(CircleState.listening);
+      appLog('[STT] start (manual_button) press_to_stop=true');
+      final text = await _sttService.startCommandListening(
+        profile: CommandListenProfile.normal,
+        languageHint: _interactionLanguage,
+        allowAutoLanguage: false,
+        alwaysTranscribe: true,
+        stopOnSilence: false,
+        durationSeconds: _manualMicMaxListenSeconds,
+      );
+
+      if (_useSttWakeEngine) {
+        await _syncPrimaryWakeMode();
+      } else if (wakeHealthy) {
+        await _wakeService.start();
+      }
+
+      if (localRequestId != _requestId) return;
+
+      final cleaned = (text ?? '').trim();
+      if (cleaned.isNotEmpty) {
+        await _handleUserText(cleaned);
+      } else {
+        _setCircleState(CircleState.wake);
+      }
+    } catch (e) {
+      appLog('[STT] manual_button failed: $e');
+      await _speak(_voiceL10n.commandProcessingFailed);
+    } finally {
+      _commandInFlight = false;
+      _restoreWakeStateIfIdle();
     }
   }
 
@@ -3673,6 +3944,34 @@ class _JanarymHomeState extends State<JanarymHome>
     return _OnboardingTurnResult.advanced;
   }
 
+  Future<bool> _maybeHandleOnboardingLanguageSwitch(
+    String rawText,
+    CommandDecision decision,
+  ) async {
+    final detection = SpokenLanguageDetector.detect(
+      rawText,
+      fallbackLanguage: _interactionLanguage,
+    );
+    if (!detection.explicitSwitch &&
+        decision.modeIntent != AssistantModeIntent.switchVoiceLanguage) {
+      return false;
+    }
+
+    _applyDetectedInteractionLanguage(
+      detection,
+      rawText,
+      forDialogSession: true,
+    );
+    await _speakOnboardingLine(_voiceLanguageSwitchAck());
+    final question = _personalizationController.currentQuestionText(
+      _interactionLanguage,
+    );
+    if (question.isNotEmpty) {
+      await _speakOnboardingLine(question);
+    }
+    return true;
+  }
+
   void _maybeStartOnboardingDialog() {
     if (!_micGranted || !_personalizationReady || _onboardingDialogInProgress) {
       return;
@@ -3731,6 +4030,9 @@ class _JanarymHomeState extends State<JanarymHome>
           'stt_error=${_sttService.state.value.lastError ?? '-'}',
         );
         final decision = _router.route(rawText);
+        if (await _maybeHandleOnboardingLanguageSwitch(rawText, decision)) {
+          continue;
+        }
         if (decision.modeIntent == AssistantModeIntent.restartOnboarding) {
           await _personalizationController.restartOnboardingFromScratch();
           await _speakOnboardingLine(
@@ -7530,6 +7832,16 @@ class _JanarymHomeState extends State<JanarymHome>
     return best;
   }
 
+  String _preferredVoiceNameFor(AppLanguage language) {
+    final preferred =
+        (language == AppLanguage.kk
+                ? _ttsPreferredVoiceKk
+                : _ttsPreferredVoiceRu)
+            .trim()
+            .toLowerCase();
+    return preferred;
+  }
+
   _DialogStyleDirectiveResult _applyDialogStyleDirective(String rawText) {
     final source = rawText.trim();
     if (source.isEmpty) {
@@ -7924,37 +8236,25 @@ class _JanarymHomeState extends State<JanarymHome>
 
   Map<String, Object?> _buildPerceptionSnapshot() {
     final descriptor = _currentModeDescriptor();
-    return <String, Object?>{
-      'mode': descriptor.contextKey,
-      'mode_sub_state': _modeOrchestrator.value.subState,
-      'camera_streaming': _cameraStreaming,
-      'frame_age_ms': _lastFrameAt == null
-          ? null
-          : DateTime.now().difference(_lastFrameAt!).inMilliseconds,
-      'hazard_hint': _latestHazardHint.isEmpty ? null : _latestHazardHint,
-      'safety_level': _currentReflexSafetyLevel().name,
-      'perception_filters': descriptor.perception.toSnapshot(),
-    };
+    return VisionPromptContextBuilder.buildPerceptionSnapshot(
+      descriptor: descriptor,
+      modeSubState: _modeOrchestrator.value.subState,
+      cameraStreaming: _cameraStreaming,
+      frameAt: _lastFrameAt,
+      latestHazardHint: _latestHazardHint,
+      safetyLevel: _currentReflexSafetyLevel().name,
+    );
   }
 
   String _sceneSummaryForPrompt() {
     final descriptor = _currentModeDescriptor();
-    final frameAgeMs = _lastFrameAt == null
-        ? 'unknown'
-        : DateTime.now().difference(_lastFrameAt!).inMilliseconds.toString();
-    final focus = <String>[
-      ...descriptor.perception.hazardLabelsOfInterest,
-      ...descriptor.perception.ocrFocus,
-    ].join(',');
-    final modeState = _modeOrchestrator.value.subState;
-    if (_latestHazardHint.isNotEmpty) {
-      return 'mode=${descriptor.contextKey}, sub_state=$modeState, '
-          'camera=${_cameraStreaming ? 'on' : 'off'}, '
-          'frame_age_ms=$frameAgeMs, hazard=$_latestHazardHint, focus=$focus';
-    }
-    return 'mode=${descriptor.contextKey}, sub_state=$modeState, '
-        'camera=${_cameraStreaming ? 'on' : 'off'}, '
-        'frame_age_ms=$frameAgeMs, focus=$focus';
+    return VisionPromptContextBuilder.buildSceneSummary(
+      descriptor: descriptor,
+      modeSubState: _modeOrchestrator.value.subState,
+      cameraStreaming: _cameraStreaming,
+      frameAt: _lastFrameAt,
+      latestHazardHint: _latestHazardHint,
+    );
   }
 
   String _activeSafetyContext() {
@@ -8454,6 +8754,7 @@ class _JanarymHomeState extends State<JanarymHome>
       if (ensureLocale) {
         await _ensureTtsLocaleForCurrentMode();
       }
+      await _reapplyConfiguredTtsVoice();
       await _tts.stop();
       await _tts.speak(t);
     } finally {
@@ -8539,7 +8840,7 @@ class _JanarymHomeState extends State<JanarymHome>
       return;
     }
 
-    await _handleWakeDetected();
+    await _startManualMicSession();
   }
 
   void _triggerFastModeFeedback() {
@@ -8769,7 +9070,15 @@ class _JanarymHomeState extends State<JanarymHome>
     }
 
     final modeTokenPrefixes = <AssistantMode, List<String>>{
-      AssistantMode.general: ['обычн', 'главн', 'home', 'қалыпты', 'жалпы'],
+      AssistantMode.general: [
+        'обычн',
+        'главн',
+        'home',
+        'қалыпты',
+        'жалпы',
+        'кәдімгі',
+        'жай',
+      ],
       AssistantMode.navigation: [
         'маршрут',
         'навигац',
@@ -8810,7 +9119,15 @@ class _JanarymHomeState extends State<JanarymHome>
     };
 
     final modeFragments = <AssistantMode, List<String>>{
-      AssistantMode.general: ['обычный режим', 'главный режим', 'home scan'],
+      AssistantMode.general: [
+        'обычный режим',
+        'главный режим',
+        'home scan',
+        'қалыпты режим',
+        'жалпы режим',
+        'кәдімгі режим',
+        'жай режим',
+      ],
       AssistantMode.navigation: [
         'маршрутизатор',
         'маршрут',
@@ -8862,46 +9179,46 @@ class _JanarymHomeState extends State<JanarymHome>
     return null;
   }
 
-  List<_ModeMenuEntry> _modeMenuItems() {
+  List<ModeMenuEntry<AssistantMode>> _modeMenuItems() {
     final kk = widget.appLanguage == AppLanguage.kk;
-    final items = <_ModeMenuEntry>[
-      _ModeMenuEntry(
+    final items = <ModeMenuEntry<AssistantMode>>[
+      ModeMenuEntry<AssistantMode>(
         mode: AssistantMode.general,
         label: kk ? 'Қалыпты' : 'Обычный',
         icon: Icons.home_rounded,
       ),
       if (_isModeEnabled(AssistantMode.navigation))
-        _ModeMenuEntry(
+        ModeMenuEntry<AssistantMode>(
           mode: AssistantMode.navigation,
           label: kk ? 'Бағдарлағыш' : 'Маршрутизатор',
           icon: Icons.alt_route_rounded,
         ),
       if (_isModeEnabled(AssistantMode.bus))
-        _ModeMenuEntry(
+        ModeMenuEntry<AssistantMode>(
           mode: AssistantMode.bus,
           label: kk ? 'Автобустар' : 'Автобусы',
           icon: Icons.directions_bus_rounded,
         ),
       if (_isModeEnabled(AssistantMode.memory))
-        _ModeMenuEntry(
+        ModeMenuEntry<AssistantMode>(
           mode: AssistantMode.memory,
           label: kk ? 'Жад' : 'Память',
           icon: Icons.bookmark_rounded,
         ),
       if (_isModeEnabled(AssistantMode.textReader))
-        _ModeMenuEntry(
+        ModeMenuEntry<AssistantMode>(
           mode: AssistantMode.textReader,
           label: kk ? 'Мәтін оқу' : 'Чтение текста',
           icon: Icons.text_snippet_rounded,
         ),
       if (_isModeEnabled(AssistantMode.antiFraud))
-        _ModeMenuEntry(
+        ModeMenuEntry<AssistantMode>(
           mode: AssistantMode.antiFraud,
           label: kk ? 'Антиалаяқ' : 'Антимошеничество',
           icon: Icons.shield_rounded,
         ),
       if (!_useSttWakeEngine)
-        _ModeMenuEntry(
+        ModeMenuEntry<AssistantMode>(
           actionId: 'voice_enrollment',
           label: kk ? 'Дауыс профилі' : 'Голосовой профиль',
           icon: Icons.record_voice_over_rounded,
@@ -9010,57 +9327,98 @@ class _JanarymHomeState extends State<JanarymHome>
     return _modeDescriptorForAssistantMode(mode).ui.icon;
   }
 
+  ResolutionPreset _cameraResolutionPreset() {
+    switch (_cameraStreamResolutionRaw) {
+      case 'low':
+        return ResolutionPreset.low;
+      case 'medium':
+        return ResolutionPreset.medium;
+      case 'veryhigh':
+      case 'very_high':
+      case 'very-high':
+        return ResolutionPreset.veryHigh;
+      case 'max':
+        return ResolutionPreset.max;
+      case 'high':
+        return ResolutionPreset.high;
+      case 'ultrahigh':
+      case 'ultra_high':
+      case 'ultra-high':
+        return ResolutionPreset.ultraHigh;
+      case '':
+        return !kIsWeb && defaultTargetPlatform == TargetPlatform.android
+            ? ResolutionPreset.medium
+            : ResolutionPreset.high;
+      default:
+        return !kIsWeb && defaultTargetPlatform == TargetPlatform.android
+            ? ResolutionPreset.medium
+            : ResolutionPreset.high;
+    }
+  }
+
   Widget _buildCameraStage() {
     final controller = _cameraController;
     if (controller == null || !controller.value.isInitialized) {
-      return Container(
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [Color(0xFF020617), Color(0xFF09021A), Color(0xFF140230)],
-          ),
-        ),
-      );
+      return _buildStableHudBackground();
+    }
+
+    if (!_cameraVisualPreviewEnabled) {
+      return _buildStableHudBackground();
     }
 
     return ColoredBox(
       color: Colors.black,
       child: Center(
-        child: RepaintBoundary(
-          child: AspectRatio(
-            aspectRatio: _cameraPreviewAspectRatio(controller),
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                RotatedBox(
-                  quarterTurns: _cameraPreviewQuarterTurns(controller),
-                  child: controller.buildPreview(),
-                ),
-                IgnorePointer(
-                  child: RepaintBoundary(
-                    child: RotatedBox(
-                      quarterTurns: _cameraPreviewQuarterTurns(controller),
-                      child: CustomPaint(
-                        painter: BBoxPainter(
-                          entries: _reflexBBoxes,
-                          mirrorHorizontally:
-                              controller.description.lensDirection ==
-                              CameraLensDirection.front,
+        child: ExcludeSemantics(
+          child: RepaintBoundary(
+            child: AspectRatio(
+              aspectRatio: _cameraPreviewAspectRatio(controller),
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  RotatedBox(
+                    quarterTurns: _cameraPreviewQuarterTurns(controller),
+                    child: controller.buildPreview(),
+                  ),
+                  IgnorePointer(
+                    child: RepaintBoundary(
+                      child: RotatedBox(
+                        quarterTurns: _cameraPreviewQuarterTurns(controller),
+                        child: CustomPaint(
+                          painter: BBoxPainter(
+                            entries: _reflexBBoxes,
+                            mirrorHorizontally:
+                                controller.description.lensDirection ==
+                                CameraLensDirection.front,
+                          ),
                         ),
                       ),
                     ),
                   ),
-                ),
-                if (_featureFlags.developerDiagnosticsEnabled)
-                  Positioned(
-                    top: 14,
-                    left: 14,
-                    child: IgnorePointer(child: _buildDebugMetricsBadge()),
-                  ),
-              ],
+                ],
+              ),
             ),
           ),
+        ),
+      ),
+    );
+  }
+
+  void _logCameraRuntimeMode() {
+    appLog(
+      '[Camera] visual_preview=${_cameraVisualPreviewEnabled ? 'on' : 'off'} '
+      'resolution=${_cameraResolutionPreset().name} '
+      'fps=$_cameraStreamFps',
+    );
+  }
+
+  Widget _buildStableHudBackground() {
+    return Container(
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Color(0xFF020617), Color(0xFF09021A), Color(0xFF140230)],
         ),
       ),
     );
@@ -9151,182 +9509,109 @@ class _JanarymHomeState extends State<JanarymHome>
     return IgnorePointer(
       ignoring: !_modePickerOpen,
       child: AnimatedOpacity(
-        duration: const Duration(milliseconds: 220),
+        duration: const Duration(milliseconds: 260),
         curve: Curves.easeOutCubic,
         opacity: _modePickerOpen ? 1 : 0,
-        child: AnimatedSlide(
-          duration: const Duration(milliseconds: 240),
-          curve: Curves.easeOutCubic,
-          offset: _modePickerOpen ? Offset.zero : const Offset(0.06, 0.12),
-          child: AnimatedScale(
-            duration: const Duration(milliseconds: 240),
-            curve: Curves.easeOutBack,
-            scale: _modePickerOpen ? 1 : 0.88,
-            child: Align(
-              alignment: Alignment.bottomRight,
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 240),
-                child: SingleChildScrollView(
-                  reverse: true,
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    children: [
-                      for (int i = 0; i < menuItems.length; i++) ...[
-                        AnimatedSlide(
-                          duration: Duration(milliseconds: 170 + i * 22),
-                          curve: Curves.easeOutCubic,
-                          offset: _modePickerOpen
-                              ? Offset.zero
-                              : const Offset(0.22, 0),
-                          child: menuItems[i].isMode
-                              ? _buildModeGlassButton(
-                                  menuItems[i].mode!,
-                                  label: menuItems[i].label,
-                                  iconOverride: menuItems[i].icon,
-                                )
-                              : _buildMenuActionGlassButton(
-                                  actionId: menuItems[i].actionId!,
-                                  label: menuItems[i].label,
-                                  icon: menuItems[i].icon,
-                                ),
-                        ),
-                        if (i != menuItems.length - 1)
-                          const SizedBox(height: 10),
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () async {
+                  _modePickerAutoCloseTimer?.cancel();
+                  if (mounted) {
+                    setState(() => _modePickerOpen = false);
+                  }
+                  await _vibrateEnd();
+                },
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 260),
+                  curve: Curves.easeOutCubic,
+                  decoration: BoxDecoration(
+                    gradient: RadialGradient(
+                      center: const Alignment(0.55, 0.82),
+                      radius: 1.25,
+                      colors: [
+                        Colors.white.withOpacity(0.04),
+                        Colors.black.withOpacity(_modePickerOpen ? 0.38 : 0.0),
                       ],
-                    ],
+                    ),
+                  ),
+                  child: BackdropFilter(
+                    filter: ImageFilter.blur(
+                      sigmaX: _modePickerOpen ? 12 : 0,
+                      sigmaY: _modePickerOpen ? 12 : 0,
+                    ),
+                    child: const SizedBox.expand(),
                   ),
                 ),
               ),
             ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildMenuActionGlassButton({
-    required String actionId,
-    required String label,
-    required IconData icon,
-  }) {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(999),
-      child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
-        child: Material(
-          color: Colors.white.withOpacity(0.10),
-          child: InkWell(
-            borderRadius: BorderRadius.circular(999),
-            onTap: () async {
-              _modePickerAutoCloseTimer?.cancel();
-              if (mounted) {
-                setState(() => _modePickerOpen = false);
-              }
-              await _vibrateEnd();
-              switch (actionId) {
-                case 'go_home':
-                  await _handleGoHomeShortcut(
-                    widget.appLanguage == AppLanguage.kk ? 'үйге' : 'домой',
-                  );
-                  break;
-                case 'voice_enrollment':
-                  await _openWakeEnrollmentSheet();
-                  break;
-              }
-            },
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 220),
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(999),
-                border: Border.all(color: Colors.white30),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(icon, size: 18, color: Colors.white),
-                  const SizedBox(width: 10),
-                  Text(
-                    label,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 14,
-                      fontWeight: FontWeight.w600,
+            SafeArea(
+              child: Align(
+                alignment: Alignment.bottomCenter,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 24, 16, 108),
+                  child: AnimatedSlide(
+                    duration: const Duration(milliseconds: 320),
+                    curve: Curves.easeOutCubic,
+                    offset: _modePickerOpen
+                        ? Offset.zero
+                        : const Offset(0, 0.12),
+                    child: AnimatedScale(
+                      duration: const Duration(milliseconds: 340),
+                      curve: Curves.easeOutBack,
+                      scale: _modePickerOpen ? 1 : 0.92,
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 420),
+                        child: ModePickerSheet(
+                          menuItems: menuItems,
+                          currentMode: _assistantMode,
+                          appLanguage: widget.appLanguage,
+                          modeDescriptorFor: _modeDescriptorForAssistantMode,
+                          onModeSelected: (mode) async {
+                            final previousMode = _assistantMode;
+                            final changed = await _switchAssistantMode(
+                              mode,
+                              reason: 'mode_picker',
+                            );
+                            if (!mounted) return;
+                            _modePickerAutoCloseTimer?.cancel();
+                            setState(() => _modePickerOpen = false);
+                            await _vibrateEnd();
+                            if (!changed) return;
+                            if (previousMode != mode) {
+                              await _speak(_manualModeSwitchAck(mode));
+                            }
+                            _triggerFastModeFeedback();
+                          },
+                          onActionSelected: (actionId) async {
+                            _modePickerAutoCloseTimer?.cancel();
+                            if (mounted) {
+                              setState(() => _modePickerOpen = false);
+                            }
+                            await _vibrateEnd();
+                            switch (actionId) {
+                              case 'go_home':
+                                await _handleGoHomeShortcut(
+                                  widget.appLanguage == AppLanguage.kk
+                                      ? 'үйге'
+                                      : 'домой',
+                                );
+                                break;
+                              case 'voice_enrollment':
+                                await _openWakeEnrollmentSheet();
+                                break;
+                            }
+                          },
+                        ),
+                      ),
                     ),
                   ),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildModeGlassButton(
-    AssistantMode mode, {
-    String? label,
-    IconData? iconOverride,
-  }) {
-    final active = _assistantMode == mode;
-    final displayLabel = label ?? _modeDisplayName(mode);
-    final displayIcon = iconOverride ?? _modeIcon(mode);
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(999),
-      child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
-        child: Material(
-          color: Colors.white.withOpacity(active ? 0.2 : 0.1),
-          child: InkWell(
-            borderRadius: BorderRadius.circular(999),
-            onTap: () async {
-              final previousMode = _assistantMode;
-              final changed = await _switchAssistantMode(
-                mode,
-                reason: 'mode_picker',
-              );
-              if (!mounted) return;
-              _modePickerAutoCloseTimer?.cancel();
-              setState(() => _modePickerOpen = false);
-              if (!changed) return;
-              if (previousMode != mode) {
-                await _speak(_manualModeSwitchAck(mode));
-              }
-              _triggerFastModeFeedback();
-            },
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 220),
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(999),
-                border: Border.all(
-                  color: active
-                      ? _modeAccentColor(mode).withOpacity(0.9)
-                      : Colors.white30,
                 ),
               ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    displayIcon,
-                    size: 18,
-                    color: active ? _modeAccentColor(mode) : Colors.white70,
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    displayLabel,
-                    style: TextStyle(
-                      color: active ? Colors.white : Colors.white70,
-                      fontSize: 13,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ],
-              ),
             ),
-          ),
+          ],
         ),
       ),
     );
@@ -9628,15 +9913,15 @@ class _JanarymHomeState extends State<JanarymHome>
       animation: _modeFabPulse,
       builder: (context, _) {
         final scale = _modePickerOpen ? 1.0 : _modeFabPulse.value;
-        final glowOpacity = _modePickerOpen ? 0.45 : 0.28;
+        final glowOpacity = _modePickerOpen ? 0.34 : 0.22;
         return Transform.scale(
           scale: scale,
           child: ClipRRect(
             borderRadius: BorderRadius.circular(999),
             child: BackdropFilter(
-              filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+              filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
               child: Material(
-                color: Colors.black.withOpacity(0.35),
+                color: Colors.white.withOpacity(_modePickerOpen ? 0.12 : 0.08),
                 child: InkWell(
                   borderRadius: BorderRadius.circular(999),
                   onTap: () async {
@@ -9658,11 +9943,23 @@ class _JanarymHomeState extends State<JanarymHome>
                       vertical: 12,
                     ),
                     decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: [
+                          Colors.white.withOpacity(
+                            _modePickerOpen ? 0.18 : 0.12,
+                          ),
+                          Colors.white.withOpacity(
+                            _modePickerOpen ? 0.08 : 0.04,
+                          ),
+                        ],
+                      ),
                       borderRadius: BorderRadius.circular(999),
                       border: Border.all(
                         color: _modePickerOpen
-                            ? const Color(0xFF93C5FD)
-                            : Colors.white30,
+                            ? const Color(0xFFA5D8FF)
+                            : Colors.white.withOpacity(0.26),
                       ),
                       boxShadow: [
                         BoxShadow(
@@ -9671,8 +9968,9 @@ class _JanarymHomeState extends State<JanarymHome>
                                       ? const Color(0xFF60A5FA)
                                       : const Color(0xFF0EA5E9))
                                   .withOpacity(glowOpacity),
-                          blurRadius: _modePickerOpen ? 18 : 14,
-                          spreadRadius: _modePickerOpen ? 2 : 1,
+                          blurRadius: _modePickerOpen ? 24 : 18,
+                          spreadRadius: _modePickerOpen ? 3 : 1,
+                          offset: const Offset(0, 12),
                         ),
                       ],
                     ),
@@ -9691,9 +9989,11 @@ class _JanarymHomeState extends State<JanarymHome>
                           ),
                         ),
                         const SizedBox(width: 8),
-                        const Text(
-                          'Режимы',
-                          style: TextStyle(
+                        Text(
+                          widget.appLanguage == AppLanguage.kk
+                              ? 'Режимдер'
+                              : 'Режимы',
+                          style: const TextStyle(
                             color: Colors.white,
                             fontSize: 14,
                             fontWeight: FontWeight.w700,
@@ -9724,9 +10024,9 @@ class _JanarymHomeState extends State<JanarymHome>
     return ClipRRect(
       borderRadius: BorderRadius.circular(999),
       child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+        filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
         child: Material(
-          color: Colors.black.withOpacity(0.32),
+          color: Colors.white.withOpacity(0.08),
           child: InkWell(
             borderRadius: BorderRadius.circular(999),
             onTap: () async {
@@ -9748,15 +10048,24 @@ class _JanarymHomeState extends State<JanarymHome>
               curve: Curves.easeOutCubic,
               padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
               decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [
+                    Colors.white.withOpacity(0.14),
+                    const Color(0xFF22C55E).withOpacity(0.08),
+                  ],
+                ),
                 borderRadius: BorderRadius.circular(999),
                 border: Border.all(
-                  color: const Color(0xFF86EFAC).withOpacity(0.8),
+                  color: const Color(0xFF86EFAC).withOpacity(0.68),
                 ),
                 boxShadow: [
                   BoxShadow(
-                    color: const Color(0xFF22C55E).withOpacity(0.28),
-                    blurRadius: 16,
-                    spreadRadius: 1,
+                    color: const Color(0xFF22C55E).withOpacity(0.22),
+                    blurRadius: 22,
+                    spreadRadius: 2,
+                    offset: const Offset(0, 12),
                   ),
                 ],
               ),
@@ -10023,21 +10332,20 @@ class _JanarymHomeState extends State<JanarymHome>
               child: _buildTopStatusBar(statusColor),
             ),
 
-            // --- Wake debug overlay (dev) ---
-            if (_wakeDebugOverlayEnabled)
-              Positioned(
-                left: 16,
-                bottom: bottomPadding + 130,
-                child: _buildWakeDebugOverlay(),
+            Positioned(
+              right: 20,
+              bottom: bottomPadding + 24,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  if (_assistantMode == AssistantMode.textReader) ...[
+                    _buildTextReaderActionButton(),
+                    const SizedBox(height: 12),
+                  ],
+                  _buildModeToggleButton(),
+                ],
               ),
-
-            // --- Text reader action button ---
-            if (_assistantMode == AssistantMode.textReader)
-              Positioned(
-                right: 20,
-                bottom: bottomPadding + 130,
-                child: _buildTextReaderActionButton(),
-              ),
+            ),
 
             // --- Main circle button (bottom center) ---
             Positioned(
@@ -10046,6 +10354,8 @@ class _JanarymHomeState extends State<JanarymHome>
               right: 0,
               child: Center(child: _buildMainCircleButton(statusColor)),
             ),
+
+            Positioned.fill(child: _buildModePickerOverlay()),
           ],
         ),
       ),
@@ -10209,12 +10519,11 @@ class _JanarymHomeState extends State<JanarymHome>
             _circleState == CircleState.speaking;
 
         return GestureDetector(
-          onTap: () => _openModeBottomSheet(),
+          onTap: () async {
+            await _handleBackgroundTapToggle();
+          },
           onLongPress: () async {
-            // Long press triggers command listening directly
-            if (!_commandInFlight && !_wakeHandling) {
-              await _handleWakeDetected();
-            }
+            await _openModeBottomSheet();
           },
           child: Stack(
             alignment: Alignment.center,
@@ -10306,52 +10615,13 @@ class _JanarymHomeState extends State<JanarymHome>
     );
   }
 
-  void _openModeBottomSheet() {
-    final menuItems = _modeMenuItems();
-    showModalBottomSheet<void>(
-      context: context,
-      backgroundColor: Colors.transparent,
-      barrierColor: Colors.black.withOpacity(0.50),
-      isScrollControlled: true,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
-      ),
-      builder: (sheetCtx) {
-        return _ModePickerSheet(
-          menuItems: menuItems,
-          currentMode: _assistantMode,
-          appLanguage: widget.appLanguage,
-          modeDescriptorFor: _modeDescriptorForAssistantMode,
-          onModeSelected: (mode) async {
-            Navigator.of(sheetCtx).pop();
-            final previousMode = _assistantMode;
-            final changed = await _switchAssistantMode(
-              mode,
-              reason: 'mode_picker',
-            );
-            if (changed && mounted) {
-              if (previousMode != mode) {
-                await _speak(_manualModeSwitchAck(mode));
-              }
-              _triggerFastModeFeedback();
-            }
-          },
-          onActionSelected: (actionId) async {
-            Navigator.of(sheetCtx).pop();
-            switch (actionId) {
-              case 'go_home':
-                await _handleGoHomeShortcut(
-                  widget.appLanguage == AppLanguage.kk ? 'үйге' : 'домой',
-                );
-                break;
-              case 'voice_enrollment':
-                await _openWakeEnrollmentSheet();
-                break;
-            }
-          },
-        );
-      },
-    );
+  Future<void> _openModeBottomSheet() async {
+    if (_modePickerOpen) return;
+    _modePickerAutoCloseTimer?.cancel();
+    if (mounted) {
+      setState(() => _modePickerOpen = true);
+    }
+    await _vibrateStart();
   }
 
   Widget _buildOnboardingCard() {
@@ -11063,94 +11333,6 @@ class _AssistantOrb extends StatelessWidget {
               ),
             ),
         ],
-      ),
-    );
-  }
-}
-
-class _ModePickerSheet extends StatelessWidget {
-  const _ModePickerSheet({
-    required this.menuItems,
-    required this.currentMode,
-    required this.appLanguage,
-    required this.modeDescriptorFor,
-    required this.onModeSelected,
-    required this.onActionSelected,
-  });
-
-  final List<_ModeMenuEntry> menuItems;
-  final AssistantMode currentMode;
-  final AppLanguage appLanguage;
-  final ModeDescriptor Function(AssistantMode) modeDescriptorFor;
-  final ValueChanged<AssistantMode> onModeSelected;
-  final ValueChanged<String> onActionSelected;
-
-  @override
-  Widget build(BuildContext context) {
-    final isKazakh = appLanguage == AppLanguage.kk;
-
-    return Container(
-      decoration: BoxDecoration(
-        color: Theme.of(context).scaffoldBackgroundColor,
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
-      ),
-      padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 16),
-      child: SafeArea(
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Center(
-                child: Container(
-                  height: 4,
-                  width: 40,
-                  margin: const EdgeInsets.only(bottom: 24),
-                  decoration: BoxDecoration(
-                    color: Colors.grey.withOpacity(0.3),
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-              ),
-              ...menuItems.map((item) {
-                final isSelected = item.isMode && item.mode == currentMode;
-                final subtitle = (item.isMode && item.mode != null)
-                    ? modeDescriptorFor(
-                        item.mode!,
-                      ).ui.shortLabel(isKazakh: isKazakh)
-                    : null;
-
-                return ListTile(
-                  leading: Icon(
-                    item.icon,
-                    color: isSelected
-                        ? Theme.of(context).colorScheme.primary
-                        : null,
-                  ),
-                  title: Text(
-                    item.label,
-                    style: TextStyle(
-                      fontWeight: isSelected
-                          ? FontWeight.bold
-                          : FontWeight.normal,
-                      color: isSelected
-                          ? Theme.of(context).colorScheme.primary
-                          : null,
-                    ),
-                  ),
-                  subtitle: subtitle != null ? Text(subtitle) : null,
-                  onTap: () {
-                    if (item.isMode && item.mode != null) {
-                      onModeSelected(item.mode!);
-                    } else if (item.actionId != null) {
-                      onActionSelected(item.actionId!);
-                    }
-                  },
-                );
-              }),
-            ],
-          ),
-        ),
       ),
     );
   }

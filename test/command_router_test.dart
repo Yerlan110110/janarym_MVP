@@ -130,7 +130,19 @@ void main() {
         AssistantModeIntent.switchVoiceLanguage,
       );
       expect(
+        router.route('говори на казахском').modeIntent,
+        AssistantModeIntent.switchVoiceLanguage,
+      );
+      expect(
+        router.route('қазақ тілінде сөйле').modeIntent,
+        AssistantModeIntent.switchVoiceLanguage,
+      );
+      expect(
         router.route('на русском').modeIntent,
+        AssistantModeIntent.switchVoiceLanguage,
+      );
+      expect(
+        router.route('орыс тілінде сөйле').modeIntent,
         AssistantModeIntent.switchVoiceLanguage,
       );
     });

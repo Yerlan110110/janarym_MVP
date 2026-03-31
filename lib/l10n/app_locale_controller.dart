@@ -38,27 +38,33 @@ class AppLocaleController extends ChangeNotifier {
 
   AppLanguage _language = AppLanguage.ru;
   bool _initialized = false;
+  bool _hasSavedSelection = false;
 
   AppLanguage get language => _language;
   Locale get locale => _language.locale;
   bool get isInitialized => _initialized;
+  bool get hasSavedSelection => _hasSavedSelection;
+  bool get requiresExplicitSelection => _initialized && !_hasSavedSelection;
 
   Future<void> init() async {
     final prefs = await SharedPreferences.getInstance();
     final stored = prefs.getString(AppLanguageX.prefsKey);
     if (stored != null && stored.isNotEmpty) {
       _language = AppLanguageX.fromStored(stored);
+      _hasSavedSelection = true;
     } else {
       final systemLocale = WidgetsBinding.instance.platformDispatcher.locale;
       _language = AppLanguageX.fromLocale(systemLocale);
+      _hasSavedSelection = false;
     }
     _initialized = true;
     notifyListeners();
   }
 
   Future<void> setLanguage(AppLanguage language) async {
-    if (_language == language) return;
+    if (_language == language && _hasSavedSelection) return;
     _language = language;
+    _hasSavedSelection = true;
     notifyListeners();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(AppLanguageX.prefsKey, language.storageValue);

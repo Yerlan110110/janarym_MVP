@@ -53,16 +53,35 @@ void main() {
         TextReadingNormalizer.shouldUseEnglishTts('YTO CAenaTb ceiyac'),
         isFalse,
       );
-      expect(
-        TextReadingNormalizer.shouldUseEnglishTts('KAMEPA'),
-        isFalse,
-      );
+      expect(TextReadingNormalizer.shouldUseEnglishTts('KAMEPA'), isFalse);
       expect(
         TextReadingNormalizer.shouldUseEnglishTts('Что сделать сейчас'),
         isFalse,
       );
+      expect(TextReadingNormalizer.shouldUseEnglishTts('Dev Мode'), isFalse);
       expect(
-        TextReadingNormalizer.shouldUseEnglishTts('Dev Мode'),
+        TextReadingNormalizer.shouldUseEnglishTts(
+          'Open settings and tap Continue',
+        ),
+        isTrue,
+      );
+    });
+
+    test('distinguishes safe english from latin OCR noise', () {
+      expect(
+        TextReadingNormalizer.isSpeechSafe('Open settings and tap Continue'),
+        isTrue,
+      );
+      expect(
+        TextReadingNormalizer.isLikelyEnglishText('Battery level 100 percent'),
+        isTrue,
+      );
+      expect(
+        TextReadingNormalizer.isLikelyEnglishText('CAXAP KAMEPA'),
+        isFalse,
+      );
+      expect(
+        TextReadingNormalizer.isSpeechSafe('ZXCVBN QWRTPL LKJHG'),
         isFalse,
       );
     });

@@ -249,7 +249,8 @@ String buildManualFallbackText(
     return normalized;
   }
   if (script == DetectedTextScript.latin &&
-      normalized.length >= (aggressiveShortText ? 12 : 24)) {
+      normalized.length >= (aggressiveShortText ? 10 : 18) &&
+      TextReadingNormalizer.isLikelyEnglishText(normalized)) {
     return normalized;
   }
   return '';
@@ -317,7 +318,10 @@ bool shouldAcceptWeakManualCandidate({
       return false;
     }
   }
-  return !TextReadingNormalizer.shouldUseEnglishTts(trimmed);
+  if (dominantScript == DetectedTextScript.latin) {
+    return TextReadingNormalizer.isLikelyEnglishText(trimmed);
+  }
+  return true;
 }
 
 double _noiseRatio(String text) {

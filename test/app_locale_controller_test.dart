@@ -19,6 +19,7 @@ void main() {
 
     expect(controller.language, AppLanguage.kk);
     expect(controller.locale, const Locale('kk'));
+    expect(controller.requiresExplicitSelection, isTrue);
 
     addTearDown(binding.platformDispatcher.clearLocaleTestValue);
   });
@@ -33,6 +34,7 @@ void main() {
 
     expect(controller.language, AppLanguage.ru);
     expect(controller.locale, const Locale('ru'));
+    expect(controller.requiresExplicitSelection, isFalse);
   });
 
   test('persists selected language between controller instances', () async {
@@ -45,5 +47,29 @@ void main() {
 
     expect(nextController.language, AppLanguage.kk);
     expect(nextController.locale, const Locale('kk'));
+    expect(nextController.requiresExplicitSelection, isFalse);
   });
+
+  test(
+    'persists explicit selection even when it matches system language',
+    () async {
+      final binding = TestWidgetsFlutterBinding.ensureInitialized();
+      binding.platformDispatcher.localeTestValue = const Locale('ru', 'RU');
+
+      final controller = AppLocaleController();
+      await controller.init();
+      expect(controller.requiresExplicitSelection, isTrue);
+
+      await controller.setLanguage(AppLanguage.ru);
+      expect(controller.requiresExplicitSelection, isFalse);
+
+      final nextController = AppLocaleController();
+      await nextController.init();
+
+      expect(nextController.language, AppLanguage.ru);
+      expect(nextController.requiresExplicitSelection, isFalse);
+
+      addTearDown(binding.platformDispatcher.clearLocaleTestValue);
+    },
+  );
 }

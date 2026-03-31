@@ -26,6 +26,28 @@ void main() {
       expect(result.explicitSwitch, isTrue);
     });
 
+    test('detects extended kazakh language switch phrases', () {
+      final result = SpokenLanguageDetector.detect(
+        'говори на казахском',
+        fallbackLanguage: AppLanguage.ru,
+      );
+
+      expect(result.language, AppLanguage.kk);
+      expect(result.confidence, SpokenLanguageConfidence.high);
+      expect(result.explicitSwitch, isTrue);
+    });
+
+    test('detects extended russian language switch phrases', () {
+      final result = SpokenLanguageDetector.detect(
+        'орыс тілінде сөйле',
+        fallbackLanguage: AppLanguage.kk,
+      );
+
+      expect(result.language, AppLanguage.ru);
+      expect(result.confidence, SpokenLanguageConfidence.high);
+      expect(result.explicitSwitch, isTrue);
+    });
+
     test('detects russian by lexicon', () {
       final result = SpokenLanguageDetector.detect(
         'что видишь справа',

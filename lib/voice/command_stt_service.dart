@@ -26,6 +26,22 @@ bool shouldTranscribeRecordedCommand({
   return hadVoice || listenMs >= minForceMs;
 }
 
+bool shouldAutoStopCommandListening({
+  required bool stopOnSilence,
+  required bool voiceDetected,
+  required int listenedMs,
+  required int silenceMs,
+  required int minListenMs,
+  required int silenceHoldMs,
+  required int? maxNoSpeechMs,
+}) {
+  if (!voiceDetected) {
+    return maxNoSpeechMs != null && listenedMs >= maxNoSpeechMs;
+  }
+  if (!stopOnSilence) return false;
+  return listenedMs >= minListenMs && silenceMs >= silenceHoldMs;
+}
+
 class CommandSttState {
   final CommandSttStatus status;
   final String liveWords;
@@ -78,6 +94,7 @@ class CommandSttService {
   AppLanguage? _currentLanguageHint;
   bool _currentAllowAutoLanguage = true;
   bool _currentAlwaysTranscribe = false;
+  bool _currentStopOnSilence = true;
   Future<void>? _finishFuture;
   Future<void>? _recordingStoppedFuture;
 
@@ -100,6 +117,7 @@ class CommandSttService {
     int? restartCooldownMs,
     int? maxNoSpeechMs,
     bool alwaysTranscribe = false,
+    bool stopOnSilence = true,
     VoidCallback? onRecordingFinished,
   }) async {
     if (_completer != null) return _completer!.future;
@@ -109,6 +127,7 @@ class CommandSttService {
     _currentLanguageHint = languageHint;
     _currentAllowAutoLanguage = allowAutoLanguage;
     _currentAlwaysTranscribe = alwaysTranscribe;
+    _currentStopOnSilence = stopOnSilence;
 
     _setState(
       status: CommandSttStatus.listening,
@@ -250,6 +269,7 @@ class CommandSttService {
     _currentAllowAutoLanguage = true;
     final alwaysTranscribe = _currentAlwaysTranscribe;
     _currentAlwaysTranscribe = false;
+    _currentStopOnSilence = true;
 
     try {
       if (await _recorder.isRecording()) {
@@ -358,16 +378,17 @@ class CommandSttService {
         final lastVoiceAt = _lastVoiceAt ?? startedAt;
         final listenedMs = now.difference(startedAt).inMilliseconds;
         final silenceMs = now.difference(lastVoiceAt).inMilliseconds;
-        if (!_voiceDetected &&
-            maxNoSpeechMs != null &&
-            listenedMs >= maxNoSpeechMs) {
+        if (shouldAutoStopCommandListening(
+          stopOnSilence: _currentStopOnSilence,
+          voiceDetected: _voiceDetected,
+          listenedMs: listenedMs,
+          silenceMs: silenceMs,
+          minListenMs: minListenMs,
+          silenceHoldMs: silenceHoldMs,
+          maxNoSpeechMs: maxNoSpeechMs,
+        )) {
           await stop();
           return;
-        }
-        if (_voiceDetected &&
-            listenedMs >= minListenMs &&
-            silenceMs >= silenceHoldMs) {
-          await stop();
         }
       } catch (_) {
         // Ignore amplitude probe issues; timeout will still finish recording.

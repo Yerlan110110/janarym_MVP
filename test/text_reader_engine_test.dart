@@ -74,5 +74,49 @@ void main() {
       expect(scan.structuredData.price, 350);
       expect(scan.structuredData.calories, 120);
     });
+
+    test('accepts clear english OCR as readable text', () {
+      final scan = engine.fromOnDevice(
+        buildResult(
+          rawText: 'Open settings and tap Continue',
+          lines: const ['Open settings', 'and tap Continue'],
+          script: DetectedTextScript.latin,
+        ),
+      );
+
+      expect(scan, isNotNull);
+      expect(scan!.isAcceptable, isTrue);
+      expect(
+        scan.quality,
+        anyOf(TextReaderQuality.acceptable, TextReaderQuality.strong),
+      );
+    });
+
+    test('prefers repeated english burst candidate over weak latin noise', () {
+      final burst = <OnDeviceTextReadResult>[
+        buildResult(
+          rawText: 'ZXCVBN QWRTY',
+          lines: const ['ZXCVBN QWRTY'],
+          script: DetectedTextScript.latin,
+          safe: false,
+        ),
+        buildResult(
+          rawText: 'Open settings and tap Continue',
+          lines: const ['Open settings and tap Continue'],
+          script: DetectedTextScript.latin,
+        ),
+        buildResult(
+          rawText: 'Open settings and tap Continue',
+          lines: const ['Open settings and tap Continue'],
+          script: DetectedTextScript.latin,
+        ),
+      ];
+
+      final best = engine.selectBestBurst(burst);
+
+      expect(best, isNotNull);
+      expect(best!.fullText, 'Open settings and tap Continue');
+      expect(best.isAcceptable, isTrue);
+    });
   });
 }
