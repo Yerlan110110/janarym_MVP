@@ -206,6 +206,12 @@ abstract class AppLocalizations {
   /// **'Не удалось запустить камеру: {error}'**
   String cameraStartFailed(Object error);
 
+  /// No description provided for @errorGeminiKeyMissing.
+  ///
+  /// In ru, this message translates to:
+  /// **'GEMINI_API_KEY не задан (проверь .env)'**
+  String get errorGeminiKeyMissing;
+
   /// No description provided for @errorOpenAiKeyMissing.
   ///
   /// In ru, this message translates to:

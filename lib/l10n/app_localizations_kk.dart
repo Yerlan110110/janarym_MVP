@@ -69,6 +69,10 @@ class AppLocalizationsKk extends AppLocalizations {
   }
 
   @override
+  String get errorGeminiKeyMissing =>
+      'GEMINI_API_KEY берілмеген (.env файлын тексеріңіз)';
+
+  @override
   String get errorOpenAiKeyMissing =>
       'OPENAI_API_KEY берілмеген (.env файлын тексеріңіз)';
 

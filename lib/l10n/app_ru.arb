@@ -23,6 +23,7 @@
       "error": {}
     }
   },
+  "errorGeminiKeyMissing": "GEMINI_API_KEY не задан (проверь .env)",
   "errorOpenAiKeyMissing": "OPENAI_API_KEY не задан (проверь .env)",
   "errorEmptyImageFrame": "Пустой кадр изображения.",
   "errorExtractTextFailed": "Не удалось извлечь текст ответа.",

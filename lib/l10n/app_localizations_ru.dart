@@ -69,6 +69,9 @@ class AppLocalizationsRu extends AppLocalizations {
   }
 
   @override
+  String get errorGeminiKeyMissing => 'GEMINI_API_KEY не задан (проверь .env)';
+
+  @override
   String get errorOpenAiKeyMissing => 'OPENAI_API_KEY не задан (проверь .env)';
 
   @override

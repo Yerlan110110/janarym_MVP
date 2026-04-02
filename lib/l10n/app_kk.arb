@@ -23,6 +23,7 @@
       "error": {}
     }
   },
+  "errorGeminiKeyMissing": "GEMINI_API_KEY берілмеген (.env файлын тексеріңіз)",
   "errorOpenAiKeyMissing": "OPENAI_API_KEY берілмеген (.env файлын тексеріңіз)",
   "errorEmptyImageFrame": "Кадр бос.",
   "errorExtractTextFailed": "Жауап мәтінін алу мүмкін болмады.",

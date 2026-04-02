@@ -22,7 +22,7 @@ import 'logic/command_router.dart';
 import 'bus/models/bus_mode_state.dart';
 import 'navigation/navigation_mode_controller.dart';
 import 'navigation/models/navigation_mode_state.dart';
-import 'openai_client.dart';
+import 'gemini_client.dart';
 import 'personalization/data/personalization_database.dart';
 import 'personalization/data/secure_payload_codec.dart';
 import 'personalization/models/personalization_models.dart';
@@ -127,22 +127,31 @@ Future<void> _loadRuntimeEnv() async {
   }
 
   final defaults = await loadOptionalAsset('.env.example');
+  final local = await loadOptionalAsset('.env');
   final runtime = await loadOptionalAsset('assets/runtime/env.runtime');
 
   dotenv.loadFromString(
     envString: defaults,
-    overrideWith: runtime.isEmpty ? const [] : [runtime],
+    overrideWith: [
+      if (local.isNotEmpty) local,
+      if (runtime.isNotEmpty) runtime,
+    ],
     isOptional: true,
   );
 
-  final openAiKeyLoaded =
+  final geminiKeyLoaded = (dotenv.maybeGet('GEMINI_API_KEY') ?? '')
+      .trim()
+      .isNotEmpty;
+  final openAiSttKeyLoaded =
       (dotenv.maybeGet('OPENAI_API_KEY') ?? dotenv.maybeGet('OPENAI_KEY') ?? '')
           .trim()
           .isNotEmpty;
   debugPrint(
     '[Env] defaults_loaded=${defaults.isNotEmpty} '
+    'local_loaded=${local.isNotEmpty} '
     'runtime_loaded=${runtime.isNotEmpty} '
-    'openai_key_loaded=$openAiKeyLoaded',
+    'gemini_key_loaded=$geminiKeyLoaded '
+    'openai_stt_key_loaded=$openAiSttKeyLoaded',
   );
 }
 
@@ -503,7 +512,7 @@ class _JanarymHomeState extends State<JanarymHome>
   final AudioPlayer _sfxPlayer = AudioPlayer();
   final WakeCueService _wakeCueService = WakeCueService();
   final CommandRouter _router = CommandRouter();
-  final OpenAiClient _openAi = OpenAiClient();
+  final GeminiClient _gemini = GeminiClient();
   final PersonalizationDatabase _personalizationDatabase =
       PersonalizationDatabase();
   final SecurePayloadCodec _securePayloadCodec = SecurePayloadCodec();
@@ -583,6 +592,7 @@ class _JanarymHomeState extends State<JanarymHome>
   static const int _manualTextReadRetryTimeoutMs = 550;
   static const int _manualTextReadInterAttemptDelayMs = 90;
   static const int _manualMicMaxListenSeconds = 45;
+  static const int _interactiveLlmMaxContextTurns = 3;
   bool _followUpActive = false;
   bool _followUpPending = false;
   bool _wakeHandling = false;
@@ -940,7 +950,7 @@ class _JanarymHomeState extends State<JanarymHome>
     _wakeService = WakeWordService(onWakeWordDetected: _handleWakeDetected);
     _sttWakeService = AndroidSttWakeService(debugLogs: _sttWakeDebugLogs);
     unawaited(_wakeCueService.preload());
-    _openAi.setLanguage(_interactionLanguage);
+    _gemini.setLanguage(_interactionLanguage);
     _dialogBrevityMode = _parseInitialBrevityMode(_dialogBrevityDefaultRaw);
     _micMessage = _l10n.checkingMic;
     _cameraMessage = _l10n.checkingCamera;
@@ -1003,7 +1013,7 @@ class _JanarymHomeState extends State<JanarymHome>
     _modeOrchestrator.dispose();
     unawaited(_reflexEngine.dispose());
     unawaited(_perceptionEventBus.dispose());
-    _openAi.dispose();
+    _gemini.dispose();
     _cameraKeepAliveTimer?.cancel();
     _cameraKeepAliveTimer = null;
     _modePickerAutoCloseTimer?.cancel();
@@ -1473,7 +1483,7 @@ class _JanarymHomeState extends State<JanarymHome>
     required String reason,
   }) {
     if (_interactionLanguage == language) {
-      _openAi.setLanguage(language);
+      _gemini.setLanguage(language);
       _sttService.setLanguage(language);
       _navigationController.setLanguage(language);
       _busModeController.setLanguage(language);
@@ -1481,11 +1491,11 @@ class _JanarymHomeState extends State<JanarymHome>
     }
     _interactionLanguage = language;
     _interactionLanguageUpdatedAt = DateTime.now();
-    _openAi.setLanguage(language);
+    _gemini.setLanguage(language);
     _sttService.setLanguage(language);
     _navigationController.setLanguage(language);
     _busModeController.setLanguage(language);
-    appLog('[OpenAI] interaction_language=${language.name}');
+    appLog('[Gemini] interaction_language=${language.name}');
     appLog('[VoiceLang] pinned=${language.name} reason=$reason');
     if (mounted) {
       unawaited(_configureTtsForLanguage(language));
@@ -5846,11 +5856,11 @@ class _JanarymHomeState extends State<JanarymHome>
         '[TextReader][vision_fallback] start '
         'fast=$fastMode auto=$autoRead reason=$reason',
       );
-      final raw = await _openAi.askWithImage(
+      final raw = await _gemini.askWithImage(
         userPrompt,
         jpegBytes,
-        systemPrompt: _openAi.buildSystemPrompt(basePrompt: systemPrompt),
-        history: const <OpenAiChatMessage>[],
+        systemPrompt: _gemini.buildSystemPrompt(basePrompt: systemPrompt),
+        history: const <LlmChatMessage>[],
         taskMode: 'text_reader_ocr',
         perceptionSnapshot: <String, Object?>{
           'ocr_only': true,
@@ -6063,16 +6073,16 @@ class _JanarymHomeState extends State<JanarymHome>
       final jpegBytes = await _captureLatestJpegFrame();
       if (jpegBytes != null && jpegBytes.isNotEmpty) {
         try {
-          final raw = await _openAi.askWithImage(
+          final raw = await _gemini.askWithImage(
             _voiceText(
               ru: 'Проверь купюру тенге. Верни JSON с полями verdict(authentic|counterfeit|uncertain), nominal, reason. Если уверенности нет, verdict должен быть uncertain.',
               kk: 'Теңге купюрасын тексер. verdict(authentic|counterfeit|uncertain), nominal, reason өрістері бар JSON қайтар. Сенім жеткіліксіз болса, verdict uncertain болсын.',
             ),
             jpegBytes,
-            systemPrompt: _openAi.buildSystemPrompt(
+            systemPrompt: _gemini.buildSystemPrompt(
               basePrompt: _buildAntiFraudVisionPrompt(),
             ),
-            history: const <OpenAiChatMessage>[],
+            history: const <LlmChatMessage>[],
             taskMode: 'anti_fraud',
             perceptionSnapshot: _buildPerceptionSnapshot(),
             maxOutputTokens: 180,
@@ -6396,19 +6406,18 @@ class _JanarymHomeState extends State<JanarymHome>
       _gptStatus = GptStatus.loading;
       _gptError = '';
     });
-    appLog('[GPT] start');
+    appLog('[Gemini] start');
     final localRequestId = _requestId;
     if (!_thinkingSoundPlayed) {
       _thinkingSoundPlayed = true;
-      await _playThinkingCue();
-      await _vibrateThinking();
+      unawaited(_playThinkingCue());
+      unawaited(_vibrateThinking());
     }
     _setCircleState(CircleState.thinking);
-    await Future.delayed(const Duration(milliseconds: 450));
 
     try {
       final personalizationContext = _personalizationReady
-          ? OpenAiPersonalizationContext(
+          ? LlmPersonalizationContext(
               responseLength: _personalizationController
                   .snapshot
                   .profile
@@ -6425,18 +6434,22 @@ class _JanarymHomeState extends State<JanarymHome>
                   _personalizationController.snapshot.activeFearTexts,
             )
           : null;
-      final mergedSystemPrompt = _openAi.buildSystemPrompt(
+      final mergedSystemPrompt = _gemini.buildSystemPrompt(
         basePrompt: systemPrompt,
         personalization: personalizationContext,
       );
-      final rawAnswer = await _openAi.askTextOnly(
+      final rawAnswer = await _gemini.askTextOnly(
         text,
         systemPrompt: mergedSystemPrompt,
-        history: _dialogHistoryMessages(),
+        history: _dialogHistoryMessages(
+          maxTurns: _interactiveLlmMaxContextTurns,
+        ),
         contextMode: _assistantModeContextKey(_assistantMode),
         safetyContext: _activeSafetyContext(),
         sceneSummary: _sceneSummaryForPrompt(),
         maxOutputTokens: _maxTextOutputTokens(),
+        requestTimeout: const Duration(seconds: 12),
+        maxAttempts: 2,
       );
       final answer = _postprocessDialogAnswer(rawAnswer);
       if (!mounted) return;
@@ -6446,7 +6459,7 @@ class _JanarymHomeState extends State<JanarymHome>
         _lastAnswer = answer;
       });
       _rememberDialogTurn(text, answer);
-      appLog('[GPT] ok');
+      appLog('[Gemini] ok');
       _setCircleState(CircleState.speaking);
       await _speak(answer);
       if (_micGranted) {
@@ -6461,7 +6474,7 @@ class _JanarymHomeState extends State<JanarymHome>
         _gptStatus = GptStatus.error;
         _gptError = e.message;
       });
-      appLog('[GPT] rate limit: ${e.message}');
+      appLog('[Gemini] rate limit: ${e.message}');
       await _speak(_llmRateLimitMessage());
     } catch (e) {
       if (!mounted) return;
@@ -6470,7 +6483,7 @@ class _JanarymHomeState extends State<JanarymHome>
         _gptStatus = GptStatus.error;
         _gptError = e.toString();
       });
-      appLog('[GPT] error: $e');
+      appLog('[Gemini] error: $e');
       await _speak(_voiceL10n.commandProcessingFailed);
     }
     _thinkingSoundPlayed = false;
@@ -6486,37 +6499,41 @@ class _JanarymHomeState extends State<JanarymHome>
       _gptStatus = GptStatus.loading;
       _gptError = '';
     });
-    appLog('[GPT] vision start');
+    appLog('[Gemini] vision start');
     final localRequestId = _requestId;
     if (!_thinkingSoundPlayed) {
       _thinkingSoundPlayed = true;
-      await _playThinkingCue();
-      await _vibrateThinking();
+      unawaited(_playThinkingCue());
+      unawaited(_vibrateThinking());
     }
     _setCircleState(CircleState.thinking);
 
     try {
       final allowNumbers = _userRequestedNumericDetails(text);
-      final mergedSystemPrompt = _openAi.buildSystemPrompt(
+      final mergedSystemPrompt = _gemini.buildSystemPrompt(
         basePrompt: systemPrompt,
       );
-      final rawAnswer = await _openAi.askWithImage(
+      final rawAnswer = await _gemini.askWithImage(
         text,
         imageBytes,
         systemPrompt: mergedSystemPrompt,
-        history: _dialogHistoryMessages(),
+        history: _dialogHistoryMessages(
+          maxTurns: _interactiveLlmMaxContextTurns,
+        ),
         taskMode: _assistantModeContextKey(_assistantMode),
         perceptionSnapshot: _buildPerceptionSnapshot(),
         maxOutputTokens: _maxVisionOutputTokens(),
+        requestTimeout: const Duration(seconds: 10),
+        maxAttempts: 2,
       );
-      appLog('[GPT] vision raw: ${_truncateForLog(rawAnswer)}');
+      appLog('[Gemini] vision raw: ${_truncateForLog(rawAnswer)}');
       var answer = _postprocessVisionAnswer(
         rawAnswer,
         allowNumbers: allowNumbers,
       );
       answer = _postprocessDialogAnswer(answer);
       appLog(
-        '[GPT] vision final (allowNumbers=$allowNumbers): '
+        '[Gemini] vision final (allowNumbers=$allowNumbers): '
         '${_truncateForLog(answer)}',
       );
       if (!mounted) return;
@@ -6526,7 +6543,7 @@ class _JanarymHomeState extends State<JanarymHome>
         _lastAnswer = answer;
       });
       _rememberDialogTurn(text, answer);
-      appLog('[GPT] vision ok');
+      appLog('[Gemini] vision ok');
       _setCircleState(CircleState.speaking);
       await _speak(answer);
       if (_micGranted) {
@@ -6541,7 +6558,7 @@ class _JanarymHomeState extends State<JanarymHome>
         _gptStatus = GptStatus.error;
         _gptError = e.message;
       });
-      appLog('[GPT] vision rate limit: ${e.message}');
+      appLog('[Gemini] vision rate limit: ${e.message}');
       await _speak(_llmRateLimitMessage());
     } catch (e) {
       if (!mounted) return;
@@ -6550,7 +6567,7 @@ class _JanarymHomeState extends State<JanarymHome>
         _gptStatus = GptStatus.error;
         _gptError = e.toString();
       });
-      appLog('[GPT] vision error: $e');
+      appLog('[Gemini] vision error: $e');
       await _speak(_voiceL10n.commandProcessingFailed);
     }
     _thinkingSoundPlayed = false;
@@ -7723,13 +7740,19 @@ class _JanarymHomeState extends State<JanarymHome>
     }
   }
 
-  List<OpenAiChatMessage> _dialogHistoryMessages() {
+  List<LlmChatMessage> _dialogHistoryMessages({int? maxTurns}) {
     if (_dialogHistory.isEmpty || _dialogContextTurns <= 0) return const [];
-    final messages = <OpenAiChatMessage>[];
-    for (final turn in _dialogHistory) {
-      messages.add(OpenAiChatMessage(role: 'user', content: turn.userText));
+    final effectiveMaxTurns = maxTurns == null
+        ? _dialogContextTurns
+        : maxTurns.clamp(1, _dialogContextTurns).toInt();
+    final startIndex = _dialogHistory.length > effectiveMaxTurns
+        ? _dialogHistory.length - effectiveMaxTurns
+        : 0;
+    final messages = <LlmChatMessage>[];
+    for (final turn in _dialogHistory.skip(startIndex)) {
+      messages.add(LlmChatMessage(role: 'user', content: turn.userText));
       messages.add(
-        OpenAiChatMessage(role: 'assistant', content: turn.assistantText),
+        LlmChatMessage(role: 'assistant', content: turn.assistantText),
       );
     }
     return messages;
